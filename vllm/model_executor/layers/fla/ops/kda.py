@@ -42,7 +42,9 @@ def fused_recurrent_kda_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    query_len: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    assert query_len > 0, "`query_len` must be > 0."
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
@@ -84,6 +86,7 @@ def fused_recurrent_kda_fwd(
         scale=scale,
         N=N,
         T=T,
+        query_len=query_len,
         B=B,
         H=H,
         HV=HV,

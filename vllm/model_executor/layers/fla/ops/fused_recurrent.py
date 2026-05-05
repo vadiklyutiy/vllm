@@ -39,6 +39,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
+    query_len: tl.constexpr,  # per-sequence query length (specialized)
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -69,11 +70,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         )
         all = T
         T = eos - bos
+        NEW_T: tl.constexpr = query_len
     else:
         bos, eos = i_n * T, i_n * T + T
         all = B * T
+        NEW_T = T
 
-    if T == 0:
+    if NEW_T == 0:
         # no tokens to process for this sequence
         return
 
@@ -119,7 +122,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for i_t in range(0, T):
+    for i_t in range(0, NEW_T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
@@ -182,6 +185,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
+    query_len: int,
     initial_state: torch.Tensor,
     inplace_final_state: bool = True,
     cu_seqlens: torch.Tensor | None = None,
@@ -230,6 +234,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         scale=scale,
         N=N,
         T=T,
+        query_len=query_len,
         B=B,
         H=H,
         HV=HV,
