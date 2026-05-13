@@ -274,7 +274,9 @@ def run_multi_api_server(args: argparse.Namespace):
 
     from vllm.v1.engine.utils import get_engine_zmq_addresses
 
-    addresses = get_engine_zmq_addresses(vllm_config, num_api_servers)
+    addresses = get_engine_zmq_addresses(
+        vllm_config, num_api_servers, defer_api_server_ports=True
+    )
 
     with launch_core_engines(
         vllm_config, executor_class, log_stats, addresses, num_api_servers
@@ -294,7 +296,15 @@ def run_multi_api_server(args: argparse.Namespace):
             output_addresses=addresses.outputs,
             stats_update_address=stats_update_address,
             tensor_queue=tensor_queue,
+            defer_addresses=True,
         )
+
+        # Collect actual ports the children bound and mutate `addresses`
+        # in place; the engine handshake (run on `with` exit) ships these
+        # to every engine on every DP node.
+        actual_inputs, actual_outputs = api_server_manager.gather_actual_addresses()
+        addresses.inputs = actual_inputs
+        addresses.outputs = actual_outputs
 
     # Wait for API servers.
     try:
