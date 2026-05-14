@@ -111,7 +111,6 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
-        self._iteration_index = 0
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -366,6 +365,7 @@ class EngineCore:
         ):
             yield
             return
+        self._iteration_index = getattr(self, "_iteration_index", 0)
         # In DP mode, an engine without local work still performs a dummy
         # forward pass so all DP peers participate in collectives. Pass
         # scheduler_output=None for those iterations so the index stays in
