@@ -977,6 +977,19 @@ class CompilationConfig:
         ):
             self.custom_ops.append("+rotary_embedding")
 
+        import torch._inductor.config as inductor_config
+
+        # The modes documented as reproducible need Inductor's deterministic
+        # mode, or each process picks reduction block sizes, and so their
+        # summation order, by timing. TORCHINDUCTOR_DETERMINISTIC=1 is carried
+        # here too, since Dynamo resets the global flag while tracing.
+        if not self.inductor_compile_config.get("benchmark_combo_kernel") and (
+            inductor_config.deterministic
+            or envs.VLLM_BATCH_INVARIANT
+            or not envs.VLLM_ENABLE_V1_MULTIPROCESSING
+        ):
+            self.inductor_compile_config.setdefault("deterministic", True)
+
         if (
             is_torch_equal_or_newer("2.9.0.dev")
             and "combo_kernels" not in self.inductor_compile_config
@@ -987,7 +1000,10 @@ class CompilationConfig:
             # use horizontal fusion, which is useful for fusing qk-norm and
             # qk-rope when query and key have different shapes.
             self.inductor_compile_config["combo_kernels"] = True
-            self.inductor_compile_config["benchmark_combo_kernel"] = True
+            # Deterministic mode forbids benchmarking during compilation.
+            self.inductor_compile_config[
+                "benchmark_combo_kernel"
+            ] = not self.inductor_compile_config.get("deterministic", False)
 
         if self.use_inductor_graph_partition and not is_torch_equal_or_newer(
             "2.9.0.dev"

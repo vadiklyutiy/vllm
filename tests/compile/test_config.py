@@ -1363,3 +1363,49 @@ def test_inductor_asserts_user_override(monkeypatch):
     assert config.inductor_compile_config.get("size_asserts") is True
     if not _is_torch_equal_or_newer(torch.__version__, "2.12.0.dev"):
         assert config.inductor_compile_config.get("alignment_asserts") is False
+
+
+@pytest.mark.skipif(current_platform.is_cpu(), reason="No combo kernels on CPU")
+@pytest.mark.parametrize(
+    "env, user_config, deterministic, benchmark_combo_kernel",
+    [
+        ({}, {}, None, True),
+        ({"VLLM_ENABLE_V1_MULTIPROCESSING": "0"}, {}, True, False),
+        ({"VLLM_BATCH_INVARIANT": "1"}, {}, True, False),
+        (
+            {"VLLM_ENABLE_V1_MULTIPROCESSING": "0"},
+            {"deterministic": False},
+            False,
+            True,
+        ),
+        (
+            {"VLLM_ENABLE_V1_MULTIPROCESSING": "0"},
+            {"combo_kernels": True, "benchmark_combo_kernel": True},
+            None,
+            True,
+        ),
+        ({}, {"deterministic": True}, True, False),
+    ],
+)
+def test_inductor_deterministic_in_reproducible_modes(
+    monkeypatch, env, user_config, deterministic, benchmark_combo_kernel
+):
+    """Reproducible modes must not pick reduction configs by timing (#58899),
+    and deterministic mode must not get the combo-kernel benchmark it forbids."""
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    import importlib
+
+    import vllm.envs
+
+    importlib.reload(vllm.envs)
+
+    config = CompilationConfig(inductor_compile_config=user_config)
+    assert config.inductor_compile_config.get("deterministic") == deterministic
+    assert (
+        config.inductor_compile_config.get("benchmark_combo_kernel")
+        == benchmark_combo_kernel
+    )
