@@ -50,3 +50,31 @@ def test_non_gated_moe_keeps_w3_unscaled():
     )
     assert packed.scaling[:2] == pytest.approx([RSLORA_SCALING] * 2)
     assert packed.scaling[2] == 1.0
+
+
+@pytest.mark.parametrize(
+    "packer,stacked",
+    [
+        (PackedLoRALayerWeights.pack_moe, False),
+        (PackedLoRALayerWeights.pack_moe_stacked, True),
+    ],
+)
+def test_moe_packing_keeps_per_projection_scaling(packer, stacked: bool):
+    """w1, w2 and w3 can have different scaling, e.g. from alpha_pattern."""
+    loras = moe_loras(RSLORA_SCALING, stacked)
+    loras[1].scaling = 2 * RSLORA_SCALING
+    packed = packer(loras, "experts")
+    assert packed.scaling == pytest.approx(
+        [RSLORA_SCALING, 2 * RSLORA_SCALING, RSLORA_SCALING]
+    )
+
+
+def test_moe_packing_keeps_per_expert_scaling():
+    """Experts of one projection can have different scaling, e.g. from
+    alpha_pattern."""
+    loras = moe_loras(RSLORA_SCALING) + moe_loras(RSLORA_SCALING)
+    loras[4].scaling = 2 * RSLORA_SCALING  # w2 of expert 1
+    expected = [lora.lora_b * lora.scaling for lora in loras]
+    packed = PackedLoRALayerWeights.pack_moe(loras, "experts").optimize()
+    for i, lora_b in enumerate(packed.lora_b):
+        torch.testing.assert_close(lora_b, torch.stack(expected[i::3]))

@@ -9,11 +9,21 @@ import os
 from dataclasses import MISSING, dataclass, field, fields
 from typing import Literal
 
+import regex as re
+
 from vllm.config.lora import LoRAConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 
 logger = init_logger(__name__)
+
+
+def _get_pattern_value(pattern: dict[str, int], module_name: str, default: int) -> int:
+    # Same matching as PEFT's `get_pattern_key`.
+    for key, value in pattern.items():
+        if re.match(rf"(.*\.)?({key})$", module_name):
+            return value
+    return default
 
 
 @dataclass
@@ -34,6 +44,9 @@ class PEFTHelper:
     use_rslora: bool = field(default=False)
     # True to use Weight-Decomposed Low-Rank Adaptation (DoRA, see: https://arxiv.org/abs/2402.09353)
     use_dora: bool = field(default=False)
+    # Per-module overrides of `r` and `lora_alpha`, keyed by module name pattern
+    rank_pattern: dict[str, int] = field(default_factory=dict)
+    alpha_pattern: dict[str, int] = field(default_factory=dict)
     # Extra vllm field, start with 'vllm_' to avoid conflict
     vllm_lora_scaling_factor: float = field(default=1.0)
     vllm_max_position_embeddings: int | None = field(default=False)
@@ -60,9 +73,25 @@ class PEFTHelper:
             raise ValueError(f"LoRA rank `r` must be a positive integer, got {self.r}.")
         if self.use_rslora:
             logger.info_once("Loading LoRA weights trained with rsLoRA.")
-            self.vllm_lora_scaling_factor = self.lora_alpha / math.sqrt(self.r)
-        else:
-            self.vllm_lora_scaling_factor = self.lora_alpha / self.r
+        self.vllm_lora_scaling_factor = self.get_scaling_factor(self.r, self.lora_alpha)
+
+    def get_scaling_factor(self, r: int, lora_alpha: int) -> float:
+        if self.use_rslora:
+            return lora_alpha / math.sqrt(r)
+        return lora_alpha / r
+
+    def get_module_rank_and_alpha(self, module_name: str) -> tuple[int, int]:
+        """Return the rank and alpha of a module after applying `rank_pattern`
+        and `alpha_pattern`.
+
+        Args:
+            module_name: The PEFT module name, e.g. `model.layers.0.mlp.up_proj`.
+
+        """
+        return (
+            _get_pattern_value(self.rank_pattern, module_name, self.r),
+            _get_pattern_value(self.alpha_pattern, module_name, self.lora_alpha),
+        )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PEFTHelper":

@@ -151,8 +151,9 @@ class LoRAModel:
                 continue
 
             if module_name not in loras:
+                peft_module_name, _ = parse_fine_tuned_lora_name(tensor_name)
                 loras[module_name] = LoRALayerWeights.from_config(
-                    module_name, peft_helper
+                    module_name, peft_helper, peft_module_name
                 )
 
             if is_lora_a:

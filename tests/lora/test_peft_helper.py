@@ -6,8 +6,10 @@ import math
 import shutil
 
 import pytest
+import torch
 
 from vllm.config.lora import LoRAConfig
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 
 ERROR_CASES = [
@@ -114,3 +116,33 @@ def test_peft_helper_invalid_rank_direct(bad_rank: int):
     """
     with pytest.raises(ValueError, match="must be a positive integer"):
         PEFTHelper(r=bad_rank, lora_alpha=16, target_modules=["q_proj"])
+
+
+@pytest.mark.skip_global_cleanup
+def test_rank_and_alpha_pattern_scaling():
+    """Modules matched by rank_pattern/alpha_pattern get PEFT's per-module
+    alpha / r scaling."""
+    peft_helper = PEFTHelper.from_dict(
+        {
+            "r": 16,
+            "lora_alpha": 32,
+            "target_modules": ["q_proj", "v_proj"],
+            "rank_pattern": {"q_proj": 4},
+            "alpha_pattern": {"layers.1.self_attn.v_proj": 8},
+        }
+    )
+    tensors = {}
+    for layer in (0, 1):
+        for module, rank in (("q_proj", 4), ("v_proj", 16)):
+            prefix = f"base_model.model.model.layers.{layer}.self_attn.{module}"
+            tensors[f"{prefix}.lora_A.weight"] = torch.zeros(rank, 8)
+            tensors[f"{prefix}.lora_B.weight"] = torch.zeros(8, rank)
+
+    lora_model = LoRAModel.from_lora_tensors(1, tensors, peft_helper, device="cpu")
+
+    assert {name: lora.scaling for name, lora in lora_model.loras.items()} == {
+        "model.layers.0.self_attn.q_proj": 32 / 4,
+        "model.layers.0.self_attn.v_proj": 32 / 16,
+        "model.layers.1.self_attn.q_proj": 32 / 4,
+        "model.layers.1.self_attn.v_proj": 8 / 16,
+    }
