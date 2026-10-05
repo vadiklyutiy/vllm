@@ -89,3 +89,30 @@ def test_swap_exchanges_two_budgeted_states():
     )
     assert h._state[0]["thinking_token_budget"] == b1
     assert h._state[1]["thinking_token_budget"] == b0
+
+
+def test_unidirectional_move_of_unbudgeted_clears_destination():
+    """Moving an unbudgeted request must not inherit the destination's state."""
+    h = _make_holder()
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=2,
+            removed=(),
+            added=[
+                (0, SamplingParams(thinking_token_budget=5), None, []),
+                (1, SamplingParams(), None, []),
+            ],
+            moved=(),
+        )
+    )
+    assert list(h._state.keys()) == [0]
+
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=(),
+            moved=[(1, 0, MoveDirectionality.UNIDIRECTIONAL)],
+        )
+    )
+    assert not h._state
