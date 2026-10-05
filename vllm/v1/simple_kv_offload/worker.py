@@ -68,8 +68,9 @@ class SimpleCPUOffloadWorker:
         # Metadata for the current step
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
-        # Compute-done event recorded before each store; reused across steps
-        # (get_finished runs once per step, copy queue is FIFO).
+        # Compute-done events recorded before each load and store; reused
+        # across steps (get_finished runs once per step, copy queue is FIFO).
+        self._load_compute_done: torch.Event | None = None
         self._store_compute_done: torch.Event | None = None
 
         # Pending event index sets, populated in bind_connector_metadata
@@ -262,12 +263,18 @@ class SimpleCPUOffloadWorker:
         if metadata is not None and metadata.load_cpu_blocks:
             backend = self._backend
             assert backend is not None
+            # Load targets can be freed blocks that queued compute still reads
+            # (e.g. a finished request's in-flight MTP draft steps).
+            if self._load_compute_done is None:
+                self._load_compute_done = torch.Event()
+            self._load_compute_done.record(torch.cuda.current_stream())
             backend.launch_copy(
                 metadata.load_cpu_blocks,
                 metadata.load_gpu_blocks,
                 is_store=False,
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
+                wait_event=self._load_compute_done,
             )
 
     def wait_for_save(self) -> None:

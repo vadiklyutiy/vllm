@@ -258,6 +258,44 @@ def test_store_orders_after_compute_write():
     assert fixed == 0, f"store raced compute even with the barrier: {fixed} corrupt"
 
 
+def test_load_orders_after_queued_compute_read():
+    """A load must not overwrite blocks that queued compute still reads.
+
+    Blocks freed by a finished request can become load targets while that
+    request's last step (e.g. its MTP draft kernels) is still on the compute
+    stream.
+    """
+    backend, gpu, cpu = _make_backend()
+    worker = _make_worker(None, 0)
+    worker._backend = backend
+    block_ids = list(range(NUM_BLOCKS))
+    try:
+        for it in range(ITERS):
+            stale = (it % 126) + 1
+            cpu.fill_(-stale)
+            gpu.fill_(stale)
+            torch.cuda._sleep(SLEEP_CYCLES)
+            read_by_compute = gpu.clone()
+
+            worker._connector_metadata = SimpleCPUOffloadMetadata(
+                load_event=it, load_gpu_blocks=block_ids, load_cpu_blocks=block_ids
+            )
+            worker.start_load_kv()
+            deadline = time.monotonic() + 10
+            while not worker._load_events and time.monotonic() < deadline:
+                time.sleep(0.0005)
+            assert worker._load_events, "background load was never enqueued"
+            worker._load_events.pop()[1].synchronize()
+            torch.cuda.current_stream().synchronize()
+
+            assert torch.all(read_by_compute == stale), (
+                f"load overwrote blocks before queued compute read them (iter {it})"
+            )
+            assert torch.all(gpu == -stale)
+    finally:
+        backend.shutdown()
+
+
 class _RecordingBackend:
     """Captures launch_copy calls without touching the GPU."""
 
