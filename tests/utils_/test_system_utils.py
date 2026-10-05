@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
-from vllm.utils.system_utils import _maybe_force_spawn, unique_filepath
+from vllm.utils.system_utils import (
+    _maybe_force_spawn,
+    suppress_stdout,
+    unique_filepath,
+)
 
 
 def test_unique_filepath():
@@ -25,3 +30,15 @@ def test_numa_bind_forces_spawn(monkeypatch):
     monkeypatch.setattr("sys.argv", ["vllm", "serve", "--numa-bind"])
     _maybe_force_spawn()
     assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
+def test_suppress_stdout_keeps_stderr_when_stdout_is_rebound(capfd, monkeypatch):
+    """Only fd 1 is silenced, even when sys.stdout writes to fd 2."""
+    with open(2, "w", closefd=False) as stderr, monkeypatch.context() as m:
+        m.setattr(sys, "stdout", stderr)
+        with suppress_stdout():
+            os.write(1, b"c library noise\n")
+            os.write(2, b"error message\n")
+    out, err = capfd.readouterr()
+    assert out == ""
+    assert err == "error message\n"
