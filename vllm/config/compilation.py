@@ -977,6 +977,19 @@ class CompilationConfig:
         ):
             self.custom_ops.append("+rotary_embedding")
 
+        # Outside deterministic mode, Inductor picks reduction configs
+        # (R0_BLOCK, num_warps) by timing them on the device. They sum in a
+        # different order, so outputs could change between restarts in the
+        # settings that docs/usage/reproducibility.md calls reproducible.
+        from torch._inductor import config as inductor_config
+
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            or not envs.VLLM_ENABLE_V1_MULTIPROCESSING
+            or inductor_config.deterministic
+        ):
+            self.inductor_compile_config.setdefault("deterministic", True)
+
         if (
             is_torch_equal_or_newer("2.9.0.dev")
             and "combo_kernels" not in self.inductor_compile_config
@@ -987,7 +1000,9 @@ class CompilationConfig:
             # use horizontal fusion, which is useful for fusing qk-norm and
             # qk-rope when query and key have different shapes.
             self.inductor_compile_config["combo_kernels"] = True
-            self.inductor_compile_config["benchmark_combo_kernel"] = True
+            # Deterministic mode forbids this on-device benchmarking.
+            deterministic = self.inductor_compile_config.get("deterministic", False)
+            self.inductor_compile_config["benchmark_combo_kernel"] = not deterministic
 
         if self.use_inductor_graph_partition and not is_torch_equal_or_newer(
             "2.9.0.dev"

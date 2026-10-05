@@ -1349,6 +1349,31 @@ def test_get_inductor_factors_includes_configs():
     assert baseline != patched, "functorch config change was not reflected"
 
 
+@pytest.mark.skipif(current_platform.is_cpu(), reason="No combo kernels on CPU")
+@pytest.mark.parametrize(
+    "multiprocessing, batch_invariant, inductor_deterministic, deterministic",
+    [
+        ("1", "0", False, False),
+        ("0", "0", False, True),
+        ("1", "1", False, True),
+        ("1", "0", True, True),
+    ],
+)
+def test_inductor_deterministic_when_reproducible(
+    monkeypatch, multiprocessing, batch_invariant, inductor_deterministic, deterministic
+):
+    """The reproducible settings must not let Inductor pick reduction configs
+    by timing. Deterministic mode forbids benchmark_combo_kernel."""
+    from torch._inductor import config as inductor_config
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", multiprocessing)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", batch_invariant)
+    monkeypatch.setattr(inductor_config, "deterministic", inductor_deterministic)
+    config = CompilationConfig().inductor_compile_config
+    assert config.get("deterministic", False) is deterministic
+    assert config["benchmark_combo_kernel"] is not deterministic
+
+
 def test_inductor_asserts_user_override(monkeypatch):
     """Test that explicit inductor_compile_config overrides the
     debug-logging default."""

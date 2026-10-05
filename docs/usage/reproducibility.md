@@ -7,6 +7,8 @@ reproducible results:
   or enable [batch invariance](../features/batch_invariance.md) to make the outputs insensitive to scheduling.
 - In online mode, you can only enable [batch invariance](../features/batch_invariance.md).
 
+With these settings, vLLM also turns on Inductor's deterministic mode (`inductor_compile_config["deterministic"]`). Inductor then does not pick reduction or GEMM kernel configs by timing them on the GPU, so some compiled kernels can be slower. Set it to `False` to get the tuned kernels back.
+
 Example: [examples/features/batch_invariance/reproducibility_offline.py](../../examples/features/batch_invariance/reproducibility_offline.py)
 
 !!! warning
