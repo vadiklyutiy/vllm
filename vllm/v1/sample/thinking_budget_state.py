@@ -490,6 +490,9 @@ class ThinkingBudgetStateHolder:
         if self._state:
             n_layout = max(n_layout, max(self._state.keys()) + 1)
 
+        # A step without draft tokens goes through the plain sampler, which
+        # has one logits row per request even when spec decoding is enabled.
+        has_draft_tokens = any(spec_token_ids_for_layout)
         for index in range(n_layout):
             self.cu_num_tokens[index] = cumulative_total
             spec_tokens = (
@@ -497,7 +500,7 @@ class ThinkingBudgetStateHolder:
                 if index < len(spec_token_ids_for_layout)
                 else []
             )
-            if self.in_spec_mode:
+            if self.in_spec_mode and has_draft_tokens:
                 cumulative_total += len(spec_tokens) if not predict_bonus_token else 1
             else:
                 cumulative_total += 1

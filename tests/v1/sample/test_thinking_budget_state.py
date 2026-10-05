@@ -89,3 +89,33 @@ def test_swap_exchanges_two_budgeted_states():
     )
     assert h._state[0]["thinking_token_budget"] == b1
     assert h._state[1]["thinking_token_budget"] == b0
+
+
+def test_spec_mode_step_without_drafts_forces_each_request_row():
+    """A draft-less step in spec mode has one logits row per request; each
+    request's forced end token must land in its own row, not all in row 0."""
+    start, end, filler, vocab = 1, 2, 3, 8
+    h = ThinkingBudgetStateHolder(
+        create_mock_reasoning_config([start], [end]),
+        8,
+        3,
+        torch.device("cpu"),
+        False,
+    )
+    outputs: list[list[int]] = [[start, filler, filler], [start, filler, filler]]
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=2,
+            removed=(),
+            added=[
+                (i, SamplingParams(thinking_token_budget=2), [], outputs[i])
+                for i in range(2)
+            ],
+            moved=(),
+        )
+    )
+    h.update_state(outputs, [[], []])
+    logits = torch.zeros(2, vocab)
+    logits[:, filler] = 1.0
+    h.apply_to_logits(logits, predict_bonus_token=False, spec_token_ids=[[], []])
+    assert logits.argmax(dim=-1).tolist() == [end, end]
