@@ -1245,8 +1245,11 @@ def test_mismatched_mla_kernel_page_rejected_for_mla_hybrid():
         worker.add_remote_agent(meta_r, remote_tp_rank=0, remote_tp_size=2)
 
 
-def _make_csa_linear_ple_worker(scratch_aliases: str = "compressed"):
-    """``scratch_aliases`` selects which pages the compressor ring overlays."""
+def _make_csa_linear_ple_worker(
+    scratch_aliases: str = "compressed", mla_shares_ple_region: bool = False
+):
+    """``scratch_aliases`` selects which pages the compressor ring overlays.
+    ``mla_shares_ple_region`` puts a shorter MLA page at the PLE's address."""
     from unittest.mock import MagicMock
 
     from vllm.config import set_current_vllm_config
@@ -1279,7 +1282,7 @@ def _make_csa_linear_ple_worker(scratch_aliases: str = "compressed"):
         f"compressed.{index}": MLAAttentionSpec(
             block_size=4,
             num_kv_heads=1,
-            head_size=64,
+            head_size=32 if mla_shares_ple_region and index == 0 else 64,
             dtype=torch.float16,
             tokens_per_state=2,
         )
@@ -1338,6 +1341,13 @@ def _make_csa_linear_ple_worker(scratch_aliases: str = "compressed"):
             ("main_kv.1", "compressor_state.1"),
             ("compressed.0",),
             ("compressed.1",),
+        )
+    if mla_shares_ple_region:
+        tensor_regions = (
+            (*tensor_regions[0], "compressed.0"),
+            tensor_regions[1],
+            ("compressor_state.0",),
+            tensor_regions[3],
         )
     region_size = 512
     page_size = 256
@@ -1542,6 +1552,47 @@ def test_csa_linear_remote_ple_is_copied_whole():
             tp_ratio=-2,
             transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
         )
+
+
+@pytest.mark.cpu_test
+def test_csa_linear_ple_is_copied_whole_when_mla_shares_its_region():
+    """An MLA page sharing the PLE's base address sets the region block_len to
+    its own, shorter length. The PLE state must still be copied whole, or D
+    reads stale channels past the MLA page length (issue #59642)."""
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    worker = _make_csa_linear_ple_worker(mla_shares_ple_region=True)
+    mla_page_len = 128
+    assert worker.block_len_per_layer[worker._ple_region_index] == mla_page_len
+    bases = [0x10000, 0x20000, 0x30000, 0x40000]
+
+    local = worker._build_mamba_local(bases)
+    assert local[-2:, 1].tolist() == [256, 256]
+
+    metadata = NixlAgentMetadata(
+        engine_id="remote",
+        agent_metadata=b"agent",
+        kv_caches_base_addr=bases,
+        device_id=0,
+        num_blocks=2,
+        block_lens=[mla_page_len, 256, 256, 256],
+        block_strides=[256] * 4,
+        kv_cache_layout="HND",
+        block_size=4,
+        ssm_sizes=(24, 32),
+        attn_backend_name="test",
+        physical_blocks_per_logical_kv_block=1,
+    )
+    remote = worker._build_mamba_remote(
+        metadata,
+        tp_ratio=1,
+        transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
+    )
+    assert remote[-2:, 1].tolist() == [256, 256]
 
 
 def _make_ring_worker():

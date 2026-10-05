@@ -918,6 +918,9 @@ class NixlBaseConnectorWorker:
         # page it overlays, so its regions cannot be recovered from spec type.
         self._scratch_region_indices = list[int]()
         self._ple_region_index: int | None = None
+        # The PLE region can be shared with layers of another page length (e.g.
+        # an MLA indexer cache), so its block_len_per_layer entry may not be the PLE's.
+        self._ple_block_len = 0
 
         # Enable different block lengths for different layers *only* when MLA is used.
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
@@ -1734,6 +1737,7 @@ class NixlBaseConnectorWorker:
                         assert self._is_csa_linear
                         assert self._ple_region_index in (None, region_index)
                         self._ple_region_index = region_index
+                        self._ple_block_len = block_len
                     elif region_index not in self._ssm_region_indices:
                         self._ssm_region_indices.append(region_index)
                 elif (
@@ -1940,7 +1944,7 @@ class NixlBaseConnectorWorker:
             parts.append(self._stack_descs(blk_addrs + conv_size, ssm_size, device_id))
 
         if (region_index := self._ple_region_index) is not None:
-            block_len = self.block_len_per_layer[region_index] * physical_per_logical
+            block_len = self._ple_block_len * physical_per_logical
             block_stride = (
                 self.block_stride_per_layer[region_index] * physical_per_logical
             )
@@ -2018,7 +2022,10 @@ class NixlBaseConnectorWorker:
                 nixl_agent_meta.kv_caches_base_addr[region_index]
                 + block_arange * remote_block_stride
             )
-            parts.append(self._stack_descs(block_addrs, remote_block_len, device_id))
+            ple_block_len = (
+                self._ple_block_len * self._physical_blocks_per_logical_kv_block
+            )
+            parts.append(self._stack_descs(block_addrs, ple_block_len, device_id))
 
         return np.concatenate(parts)
 
