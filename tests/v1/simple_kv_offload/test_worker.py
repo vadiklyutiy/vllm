@@ -258,6 +258,37 @@ def test_store_orders_after_compute_write():
     assert fixed == 0, f"store raced compute even with the barrier: {fixed} corrupt"
 
 
+def test_load_orders_after_compute_stream():
+    """The load must not overwrite GPU blocks before queued compute is done.
+
+    Under async scheduling, a finished request's blocks can become load
+    targets while a step still in flight on the compute stream uses them.
+    """
+    backend, gpu, cpu = _make_backend()
+    worker = _make_worker(None, 0)
+    worker._backend = backend
+    block_ids = list(range(NUM_BLOCKS))
+    worker.bind_connector_metadata(
+        SimpleCPUOffloadMetadata(
+            load_event=0, load_gpu_blocks=block_ids, load_cpu_blocks=block_ids
+        )
+    )
+    try:
+        cpu.fill_(7)
+        torch.cuda._sleep(SLEEP_CYCLES)
+        gpu.fill_(91)
+        worker.start_load_kv()
+
+        deadline = time.monotonic() + 10
+        while not worker._load_events and time.monotonic() < deadline:
+            time.sleep(0.0005)
+        assert worker._load_events, "background copy was never enqueued"
+        worker._load_events[0][1].synchronize()
+        assert torch.equal(gpu.cpu(), cpu), "load landed before the compute write"
+    finally:
+        backend.shutdown()
+
+
 class _RecordingBackend:
     """Captures launch_copy calls without touching the GPU."""
 
