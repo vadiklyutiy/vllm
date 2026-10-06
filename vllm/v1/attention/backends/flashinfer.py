@@ -35,6 +35,9 @@ from vllm.distributed.parallel_state import (
     get_dcp_world_size_and_rank,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+    _e2m1_inline,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
@@ -281,6 +284,174 @@ def trtllm_prefill_attn_kvfp8_dequant(
         head_stride,
         head_size,
         num_kv_heads,
+    )
+    return mock_kv_cache, mock_block_table
+
+
+def nvfp4_prefill_needs_dequant(kv_cache_dtype: str, head_size: int) -> bool:
+    """Whether NVFP4 prefill must read a dequantized copy of the KV cache.
+
+    The trtllm-gen NVFP4-KV context kernel for head_dim 256 (flashinfer
+    0.7.0.post1) reads the V block scales of dims 128-255 at the wrong offset
+    of the 4-token swizzled scale tile, so its prefill output is wrong. The
+    decode kernel reads the same cache correctly.
+    """
+    return kv_cache_dtype.startswith("nvfp4") and head_size == 256
+
+
+@triton.jit
+def _dequant_nvfp4_page(
+    data_ptr,
+    sf_ptr,
+    dst_ptr,
+    data_stride_token,
+    sf_stride_token,
+    SWIZZLED_SF: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+):
+    NUM_SF: tl.constexpr = HEAD_SIZE // 16
+    TOKENS_PER_ITER: tl.constexpr = 16
+    cols = tl.arange(0, HEAD_SIZE // 2)
+    sf_col = cols // 8
+    for t0 in range(0, BLOCK_SIZE, TOKENS_PER_ITER):
+        t = t0 + tl.arange(0, TOKENS_PER_ITER)[:, None]
+        packed = tl.load(data_ptr + t * data_stride_token + cols[None, :]).to(tl.int32)
+        if SWIZZLED_SF:
+            # V scales use TRT-LLM's 4-token interleaved layout.
+            pos = (
+                ((t // 4) * 4 + sf_col[None, :] // (NUM_SF // 4)) * NUM_SF
+                + (sf_col[None, :] % (NUM_SF // 4)) * 4
+                + t % 4
+            )
+            sf_off = (pos // NUM_SF) * sf_stride_token + pos % NUM_SF
+        else:
+            sf_off = t * sf_stride_token + sf_col[None, :]
+        sf = tl.load(sf_ptr + sf_off).to(tl.float32)
+        lo = _e2m1_inline(packed & 0xF) * sf
+        hi = _e2m1_inline(packed >> 4) * sf
+        dst = dst_ptr + t * HEAD_SIZE + 2 * cols[None, :]
+        tl.store(dst, lo.to(dst_ptr.dtype.element_ty))
+        tl.store(dst + 1, hi.to(dst_ptr.dtype.element_ty))
+
+
+@triton.jit(
+    do_not_specialize=["block_table_stride"],
+    do_not_specialize_on_alignment=["block_tables_prefill_ptr", "page_indptr_ptr"],
+)
+def _trtllm_prefill_attn_kvfp4_dequant(
+    k_data_ptr,
+    v_data_ptr,
+    k_sf_ptr,
+    v_sf_ptr,
+    block_tables_prefill_ptr,
+    block_table_stride,
+    page_indptr_ptr,
+    mock_kv_cache_ptr,
+    data_stride_page,
+    data_stride_head,
+    data_stride_token,
+    sf_stride_page,
+    sf_stride_head,
+    sf_stride_token,
+    NUM_KV_HEADS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    mock_block_table_idx = tl.program_id(1).to(tl.int64)
+    page_start = tl.load(page_indptr_ptr + batch_idx).to(tl.int64)
+    page_end = tl.load(page_indptr_ptr + batch_idx + 1).to(tl.int64)
+    if mock_block_table_idx >= page_end - page_start:
+        return
+    orig_page_num = tl.load(
+        block_tables_prefill_ptr + batch_idx * block_table_stride + mock_block_table_idx
+    ).to(tl.int64)
+    if orig_page_num <= 0:
+        return
+
+    head_stride = BLOCK_SIZE * HEAD_SIZE
+    mock_page_idx = page_start + mock_block_table_idx + 1
+    mock_page_ptr = mock_kv_cache_ptr + mock_page_idx * 2 * NUM_KV_HEADS * head_stride
+    for h in range(NUM_KV_HEADS):
+        data_off = orig_page_num * data_stride_page + h * data_stride_head
+        sf_off = orig_page_num * sf_stride_page + h * sf_stride_head
+        _dequant_nvfp4_page(
+            k_data_ptr + data_off,
+            k_sf_ptr + sf_off,
+            mock_page_ptr + h * head_stride,
+            data_stride_token,
+            sf_stride_token,
+            False,
+            BLOCK_SIZE,
+            HEAD_SIZE,
+        )
+        _dequant_nvfp4_page(
+            v_data_ptr + data_off,
+            v_sf_ptr + sf_off,
+            mock_page_ptr + (NUM_KV_HEADS + h) * head_stride,
+            data_stride_token,
+            sf_stride_token,
+            True,
+            BLOCK_SIZE,
+            HEAD_SIZE,
+        )
+
+
+def trtllm_prefill_attn_kvfp4_dequant(
+    kv_data: tuple[torch.Tensor, torch.Tensor],
+    kv_block_scales: tuple[torch.Tensor, torch.Tensor],
+    block_tables_prefill: torch.Tensor,
+    page_indptr: torch.Tensor,
+    num_pages: int,
+    dequant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize the NVFP4 pages of a prefill into a contiguous mock cache.
+
+    Request i owns mock pages page_indptr[i] + 1 .. page_indptr[i + 1];
+    num_pages is a host-side upper bound of page_indptr[-1].
+    Values are FP4 data times the FP8 block scales; the global K/V scales stay
+    in bmm1_scale/bmm2_scale, as for the NVFP4 kernel.
+    """
+    k_data, v_data = kv_data
+    k_sf, v_sf = kv_block_scales
+    batch_size, num_of_page_per_token = block_tables_prefill.shape
+    _, num_kv_heads, block_size, packed_head_size = k_data.shape
+    head_size = 2 * packed_head_size
+    assert dequant_dtype in (torch.bfloat16, torch.float16)
+
+    mock_kv_cache = torch.empty(
+        (num_pages + 1, 2, num_kv_heads, block_size, head_size),
+        dtype=dequant_dtype,
+        device=k_data.device,
+    )
+    mock_block_table = torch.minimum(
+        page_indptr[:-1, None]
+        + 1
+        + torch.arange(
+            num_of_page_per_token, dtype=torch.int32, device=page_indptr.device
+        ),
+        page_indptr[1:, None],
+    )
+    grid = (batch_size, num_of_page_per_token)
+    _trtllm_prefill_attn_kvfp4_dequant[grid](
+        k_data,
+        v_data,
+        k_sf,
+        v_sf,
+        block_tables_prefill,
+        num_of_page_per_token,
+        page_indptr,
+        mock_kv_cache,
+        k_data.stride(0),
+        k_data.stride(1),
+        k_data.stride(2),
+        k_sf.stride(0),
+        k_sf.stride(1),
+        k_sf.stride(2),
+        num_kv_heads,
+        block_size,
+        head_size,
     )
     return mock_kv_cache, mock_block_table
 
@@ -606,6 +777,9 @@ class TRTLLMPrefill:
 
     max_seq_len: int
     """The maximum sequence length for KV Cache."""
+
+    num_dequant_pages: int = 0
+    """Host-side upper bound of cum_seq_lens_kv[-1] for the NVFP4 dequant."""
 
 
 @dataclass
@@ -1618,10 +1792,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 max_q_len_prefill = int(query_lens_prefill_cpu.max().item())
                 prefill_block_tables = block_table_tensor[prefill_start:]
+                num_dequant_pages = 0
                 if (
                     self.q_data_type_prefill != FP8_DTYPE
                     and self.cache_dtype.startswith("fp8")
-                ):
+                ) or nvfp4_prefill_needs_dequant(self.cache_dtype, self.head_dim):
                     seq_lens_cpu_upper_bound = (
                         common_attn_metadata.seq_lens_cpu_upper_bound
                     )
@@ -1639,6 +1814,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             :, : cdiv(max_prefill_seq_len, page_size)
                         ].contiguous()
                     )
+                    num_dequant_pages = prefill_block_tables.numel()
+                    if seq_lens_cpu_upper_bound is not None:
+                        prefill_seq_lens_cpu = seq_lens_cpu_upper_bound[
+                            prefill_start:num_reqs
+                        ]
+                        num_dequant_pages = int(
+                            ((prefill_seq_lens_cpu + page_size - 1) // page_size).sum()
+                        )
                 attn_metadata.prefill = TRTLLMPrefill(
                     block_tables=prefill_block_tables,
                     seq_lens=prefill_seq_lens,
@@ -1646,6 +1829,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     cum_seq_lens_kv=paged_kv_indptr_prefill_gpu,
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
+                    num_dequant_pages=num_dequant_pages,
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
@@ -1893,6 +2077,9 @@ class FlashInferImpl(AttentionImpl):
         self.is_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
         self.kv_cache_dtype = "nvfp4" if self.is_kvcache_nvfp4 else kv_cache_dtype
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
+        self.nvfp4_prefill_dequant = nvfp4_prefill_needs_dequant(
+            kv_cache_dtype, head_size
+        )
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
@@ -1968,8 +2155,11 @@ class FlashInferImpl(AttentionImpl):
             return False
         # XQA does not support FP8/NVFP4 output, so require trtllm-gen
         # (SM100+) here.  Without that we cannot fuse the output quant.
+        # The dequantized NVFP4 prefill runs a BF16/FP16 kernel, which has no
+        # quantized output.
         return (
             self.supports_xqa_or_trtllm_gen_decode
+            and not self.nvfp4_prefill_dequant
             and is_quantized_kv_cache(self.kv_cache_dtype)
             and current_platform.is_device_capability_family(100)
             and quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
@@ -2343,7 +2533,11 @@ class FlashInferImpl(AttentionImpl):
 
                 # NVFP4 trtllm kernel only supports FP8 output.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                needs_fp8_out = (
+                    self.is_kvcache_nvfp4
+                    and not self.nvfp4_prefill_dequant
+                    and output.dtype != FP8_DTYPE
+                )
                 if needs_fp8_out:
                     out = self._nvfp4_fp8_out[:num_prefill_tokens]
 
@@ -2355,9 +2549,26 @@ class FlashInferImpl(AttentionImpl):
                         "trtllm-gen prefill. Set "
                         "disable_flashinfer_q_quantization=False."
                     )
-                    mock_kv_cache = nvfp4_kv_data
-                    mock_block_table = block_tables_prefill
-                    prefill_kv_block_scales = nvfp4_kv_block_scales
+                    if self.nvfp4_prefill_dequant:
+                        assert nvfp4_kv_data is not None
+                        assert nvfp4_kv_block_scales is not None
+                        # FP8 query and FP4 x FP8-block-scale KV are exact in
+                        # the model dtype, so bmm1/bmm2 scales stay unchanged.
+                        prefill_query = prefill_query.to(output.dtype)
+                        mock_kv_cache, mock_block_table = (
+                            trtllm_prefill_attn_kvfp4_dequant(
+                                nvfp4_kv_data,
+                                nvfp4_kv_block_scales,
+                                block_tables_prefill,
+                                attn_metadata.prefill.cum_seq_lens_kv,
+                                attn_metadata.prefill.num_dequant_pages,
+                                output.dtype,
+                            )
+                        )
+                    else:
+                        mock_kv_cache = nvfp4_kv_data
+                        mock_block_table = block_tables_prefill
+                        prefill_kv_block_scales = nvfp4_kv_block_scales
                 elif (
                     attn_metadata.q_data_type_prefill != FP8_DTYPE
                     and self.kv_cache_dtype.startswith("fp8")

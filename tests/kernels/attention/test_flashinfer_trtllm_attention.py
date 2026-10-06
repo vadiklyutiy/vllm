@@ -645,3 +645,98 @@ def test_flashinfer_trtllm_prefill_with_baseline(
         torch.testing.assert_close(output, output_trtllm, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - output_trtllm))}",
     )
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+@pytest.mark.parametrize("block_size", [16, 128])
+@torch.inference_mode
+def test_flashinfer_trtllm_prefill_nvfp4_kv_dequant(
+    num_kv_heads: int, block_size: int
+) -> None:
+    """NVFP4 prefill over a dequantized KV copy must match the BF16 baseline."""
+    from vllm.v1.attention.backends.flashinfer import (
+        trtllm_prefill_attn_kvfp4_dequant,
+    )
+
+    dtype = torch.bfloat16
+    head_size, num_qo_heads = 256, 8
+    num_blocks = 256
+    torch.set_default_device("cuda")
+    set_random_seed(42)
+    sm_scale = float(1.0 / (head_size**0.5))
+
+    q_lens = torch.tensor([37, 300, 129], dtype=torch.int32)
+    seq_lens = q_lens + torch.tensor([0, 100, 500], dtype=torch.int32)
+    batch_size = len(q_lens)
+    max_seq_len = int(seq_lens.max())
+    q_indptr = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32),
+            torch.cumsum(q_lens, dim=0, dtype=torch.int32),
+        ]
+    )
+    query, q_scale = to_float8(
+        torch.randn(int(q_lens.sum()), num_qo_heads, head_size, dtype=dtype)
+    )
+    ref_query = query.to(dtype) * q_scale
+
+    kv_cache = torch.randn(
+        (num_blocks, 2, num_kv_heads, block_size, head_size), dtype=dtype
+    )
+    kv_data, kv_cache_sf, kv_scale, ref_kv_cache = make_nvfp4_kv_cache(
+        kv_cache, block_size, head_size
+    )
+
+    # Block 0 is the null block and never holds request KV.
+    max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
+    block_tables = (
+        (torch.randperm(num_blocks - 1)[: batch_size * max_num_blocks_per_seq] + 1)
+        .to(torch.int32)
+        .view(batch_size, max_num_blocks_per_seq)
+    )
+    kv_indptr, kv_indices, kv_last_page_lens = build_paged_kv_metadata(
+        seq_lens, block_tables, block_size
+    )
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.int8)
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        float_workspace_buffer=workspace_buffer, kv_layout="HND", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr=q_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_indices=kv_indices,
+        paged_kv_last_page_len=kv_last_page_lens,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_size,
+        page_size=block_size,
+        causal=True,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    output = torch.empty(ref_query.shape, dtype=dtype)
+    wrapper.run(ref_query, ref_kv_cache, out=output)
+
+    mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp4_dequant(
+        kv_data, kv_cache_sf, block_tables, kv_indptr, int(kv_indptr[-1]), dtype
+    )
+    output_trtllm = torch.empty(query.shape, dtype=dtype)
+    flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+        query=query.to(dtype),
+        kv_cache=mock_kv_cache,
+        workspace_buffer=workspace_buffer,
+        block_tables=mock_block_table,
+        seq_lens=seq_lens,
+        max_q_len=int(q_lens.max()),
+        max_kv_len=max_seq_len,
+        bmm1_scale=q_scale.item() * kv_scale * sm_scale,
+        bmm2_scale=kv_scale,
+        batch_size=batch_size,
+        cum_seq_lens_q=q_indptr,
+        cum_seq_lens_kv=kv_indptr,
+        out=output_trtllm,
+    )
+
+    torch.testing.assert_close(output, output_trtllm, atol=3e-2, rtol=2e-2)
