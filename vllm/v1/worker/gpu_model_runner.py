@@ -3821,11 +3821,22 @@ class GPUModelRunner(
         )
 
     @staticmethod
+    def _has_prefill(
+        num_computed_tokens: np.ndarray, num_new_tokens: np.ndarray
+    ) -> bool:
+        """Checks if any request computes more than one new (non-draft) token,
+        or a first token without prior context. Such a step can still have a
+        decode batch's shape.
+        """
+        return bool(((num_new_tokens > 1) | (num_computed_tokens == 0)).any())
+
+    @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
         uniform_decode_query_len: int,
         num_tokens: int,
         num_reqs: int,
+        has_prefill: bool = False,
         force_uniform_decode: bool | None = None,
     ) -> bool:
         """Checks if it's a decode batch with same amount scheduled tokens
@@ -3833,7 +3844,8 @@ class GPUModelRunner(
         """
         return (
             (
-                (max_num_scheduled_tokens == uniform_decode_query_len)
+                not has_prefill
+                and (max_num_scheduled_tokens == uniform_decode_query_len)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
             )
             if force_uniform_decode is None
@@ -3892,6 +3904,7 @@ class GPUModelRunner(
         num_scheduled_tokens_np: np.ndarray,
         max_num_scheduled_tokens: int,
         use_cascade_attn: bool,
+        has_prefill: bool = False,
         allow_microbatching: bool = True,
         force_eager: bool = False,
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
@@ -3912,6 +3925,7 @@ class GPUModelRunner(
             uniform_decode_query_len=self.uniform_decode_query_len,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            has_prefill=has_prefill,
             force_uniform_decode=force_uniform_decode,
         )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
@@ -4224,6 +4238,15 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                has_prefill=self._has_prefill(
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    num_scheduled_tokens_np
+                    - (
+                        spec_decode_metadata.num_draft_tokens
+                        if spec_decode_metadata is not None
+                        else 0
+                    ),
+                ),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np

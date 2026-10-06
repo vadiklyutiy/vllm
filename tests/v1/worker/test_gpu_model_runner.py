@@ -1855,6 +1855,41 @@ def test_is_uniform_decode() -> None:
     )
 
 
+def _has_prefill(states: list[tuple[int, int]]) -> bool:
+    """Classify [(num_computed_tokens, num_new_tokens)]."""
+    num_computed, num_new = (
+        np.array(column, dtype=np.int32) for column in zip(*states)
+    )
+    return GPUModelRunner._has_prefill(num_computed, num_new)
+
+
+def test_decode_shaped_prefill_is_not_uniform_decode() -> None:
+    """A prefill step with a decode batch's shape must not replay the FULL
+    decode cudagraph: mamba/GDN builders only stage pure decodes into it
+    (issue #53051)."""
+    # A fresh 3-token prompt with 2 speculative tokens, and alongside decodes.
+    assert _has_prefill([(0, 3)])
+    assert _has_prefill([(16, 1), (0, 3)])
+    # A 3-token chunk of a longer prompt.
+    assert _has_prefill([(16, 1), (120, 3)])
+    # A 3-token recompute chunk past the prompt of a resumed request.
+    assert _has_prefill([(16, 1), (1072, 3)])
+    # A fresh 1-token prompt without speculative decoding.
+    assert _has_prefill([(16, 1), (0, 1)])
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=3,
+        uniform_decode_query_len=3,
+        num_tokens=3,
+        num_reqs=1,
+        has_prefill=True,
+    )
+
+    # Decodes, and one new prompt token over prior context, compute like
+    # decodes.
+    assert not _has_prefill([(16, 1), (20, 1)])
+    assert not _has_prefill([(16, 1), (128, 1)])
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="Attention backend FLASHINFER is only supported on CUDA.",
