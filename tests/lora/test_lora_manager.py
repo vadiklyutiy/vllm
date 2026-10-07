@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers import (
     ColumnParallelLinearWithLoRA,
+    FusedMoEWithLoRA,
     MergedColumnParallelLinearWithLoRA,
     ReplicatedLinearWithLoRA,
     RowParallelLinearWithLoRA,
@@ -27,8 +29,10 @@ from vllm.lora.model_manager import (
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManager
-from vllm.model_executor.layers.fused_moe import GateLinear
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
+from vllm.model_executor.models.interfaces import SupportsLoRA
 from vllm.platforms import current_platform
+from vllm.v1.worker.workspace import init_workspace_manager
 
 from .utils import create_peft_lora
 
@@ -362,6 +366,47 @@ def test_get_dummy_lora_warmup_rank_for_fully_sharded_moe():
     }
 
     assert manager.get_dummy_lora_warmup_rank(8) == 32
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="Needs fused MoE.")
+def test_moe_shared_loras_on_3d_moe_model(default_vllm_config, dist_init):
+    """Only FusedMoEWithLoRA supports shared MoE adapters, so a model with 3D
+    expert weights must still get it when enable_moe_shared_loras is on.
+    Otherwise the warmup dummy LoRA fails on the 3D wrapper."""
+
+    class Dummy3DMoEModel(nn.Module, SupportsLoRA):
+        is_3d_moe_weight = True
+
+    lora_config = LoRAConfig(
+        max_lora_rank=8,
+        max_cpu_loras=1,
+        max_loras=1,
+        lora_dtype=torch.float16,
+        enable_moe_shared_loras=True,
+    )
+    default_vllm_config.lora_config = lora_config
+    init_workspace_manager(torch.accelerator.current_device_index())
+    experts = FusedMoEFactory(
+        num_experts=4,
+        top_k=2,
+        hidden_size=128,
+        intermediate_size=128,
+        params_dtype=torch.float16,
+        prefix="experts",
+    ).cuda()
+    experts._quant_method.process_weights_after_loading(experts.routed_experts)
+
+    model = Dummy3DMoEModel()
+    model.experts = experts
+    model.config = MagicMock()
+    manager = LoRAModelManager(
+        model, 1, 16, 1, lora_config, torch.device("cuda"), default_vllm_config
+    )
+
+    assert type(manager.modules["experts"]) is FusedMoEWithLoRA
+    dummy_lora = manager.create_dummy_lora(1, 8, model.embedding_modules)
+    assert manager.add_adapter(dummy_lora)
+    assert manager.activate_adapter(1)
 
 
 @pytest.mark.parametrize("device", DEVICES)
