@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from dataclasses import replace
+from itertools import product
 
 import torch
 
@@ -103,25 +104,39 @@ class OffloadingConnectorWorker:
                 byte_offset = ref.storage_offset() * elem_size
                 # Packed layouts (e.g. DSv4) interleave layers per block, so the
                 # attention tensor's stride(0) (the manager-block stride) exceeds
-                # page_size_bytes; other layouts have stride(0) == page_size_bytes.
+                # page_size_bytes.
                 block_stride_bytes = (
                     ref.stride(0) * elem_size
                     if isinstance(layer_kv_cache_spec, AttentionSpec)
                     else page
                 )
-                tensors_per_block[layer_name] = (
+                # Dims laid out outside the block dim (KV heads under LHBNC) split
+                # each page into regions, each strided by the block stride.
+                outer_dims = [
+                    d
+                    for d in range(1, ref.ndim)
+                    if ref.stride(d) * elem_size > block_stride_bytes
+                ]
+                region_offsets = [
+                    sum(i * ref.stride(d) * elem_size for i, d in zip(idx, outer_dims))
+                    for idx in product(*(range(ref.shape[d]) for d in outer_dims))
+                ]
+                region_page = page // len(region_offsets)
+                tensors_per_block[layer_name] = tuple(
                     torch.tensor([], dtype=torch.int8, device=ref.device).set_(
                         ref.untyped_storage(),
-                        byte_offset,
-                        (num_blocks, page),
+                        byte_offset + region_offset,
+                        (num_blocks, region_page),
                         (block_stride_bytes, 1),
-                    ),
+                    )
+                    for region_offset in region_offsets
                 )
-                page_size_bytes[layer_name] = page
+                page_size_bytes[layer_name] = region_page
 
                 if isinstance(layer_kv_cache_spec, AttentionSpec):
                     unpadded_page_size_bytes[layer_name] = (
                         layer_kv_cache_spec.unpadded_page_size_bytes
+                        // len(region_offsets)
                     )
                 elif isinstance(layer_kv_cache_spec, MambaSpec):
                     unpadded_page_size_bytes[layer_name] = replace(
@@ -136,8 +151,8 @@ class OffloadingConnectorWorker:
         packed_layer_name = next(
             (
                 layer_name
-                for layer_name, (tensor,) in tensors_per_block.items()
-                if tensor.stride(0) != tensor.shape[1]
+                for layer_name, tensors in tensors_per_block.items()
+                if tensors[0].stride(0) != tensors[0].shape[1]
             ),
             None,
         )

@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
+    compute_layout_strides,
 )
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
@@ -560,6 +561,60 @@ def test_register_packed_kv_caches_skips_scratch_group():
     assert len(canonical.tensors) == 1
     assert canonical.tensors[0].tensor.shape == (NUM_BLOCKS, 2 * page)
     assert canonical.group_data_refs == [[CanonicalKVCacheRef(0, 2 * page)]]
+
+
+def test_register_kv_caches_lhbnc_offloads_whole_pages():
+    """LHBNC places a layer's KV heads a whole layer of blocks apart, so the
+    block stride is smaller than the page. The offloaded regions of a block must
+    still cover every head of every layer, and nothing else."""
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attn_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    page = attn_spec.page_size_bytes
+    layers = ["layer0", "layer1"]
+    layer_stride, block_stride, *_ = compute_layout_strides(
+        attn_spec, NUM_BLOCKS, len(layers), KVCacheLayout.LHBNC
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=len(layers) * page * NUM_BLOCKS,
+                layers=layers,
+                layer_stride=layer_stride,
+                block_stride=block_stride,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layers, attn_spec)],
+    )
+    kv_caches = allocate_kv_cache(
+        kv_cache_config,
+        torch.device(f"{DEVICE_TYPE}:0"),
+        KVCacheLayout.LHBNC,
+        [BLOCK_SIZE],
+    )
+    block_id = 3
+    for kv_cache in kv_caches.values():
+        kv_cache[block_id].view(torch.int8).fill_(1)
+
+    worker, spec = _make_worker(kv_cache_config)
+    worker.register_kv_caches(kv_caches)
+
+    canonical = spec.get_worker.call_args[0][0]
+    assert all(t.page_size_bytes == t.tensor.shape[1] for t in canonical.tensors)
+    offloaded = [t.tensor[block_id] for t in canonical.tensors]
+    assert all(bool((row == 1).all()) for row in offloaded)
+    assert sum(row.numel() for row in offloaded) == len(layers) * page
+    for row in offloaded:
+        row.zero_()
+    assert not any(kv_cache.view(torch.int8).any() for kv_cache in kv_caches.values())
+    (group_refs,) = canonical.group_data_refs
+    assert sum(ref.page_size_bytes for ref in group_refs) == len(layers) * page
 
 
 @pytest.mark.parametrize("backend", ATTN_BACKENDS)
