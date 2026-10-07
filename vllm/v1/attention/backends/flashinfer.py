@@ -75,6 +75,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_flashinfer_layout_string,
+    get_flashinfer_view_order,
     get_num_attention_heads_from_layers,
     get_per_layer_parameters,
     infer_global_hyperparameters,
@@ -2146,7 +2147,7 @@ class FlashInferImpl(AttentionImpl):
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
             assert attn_metadata.cascade_wrapper is not None
-            stride_order = kv_cache_layout.layer_view_order
+            stride_order = get_flashinfer_view_order(kv_cache_layout)
             if self.is_kvcache_nvfp4:
                 kv_cache_views = tuple(
                     cache.permute(*stride_order)
@@ -2166,8 +2167,8 @@ class FlashInferImpl(AttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
-        stride_order = kv_cache_layout.layer_view_order
-        kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
+        stride_order = get_flashinfer_view_order(kv_cache_layout)
+        kv_cache_permute = kv_cache.permute(*stride_order)
         # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
         # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;
         # CUDA TMA requires ≥16-byte alignment on all non-outermost strides.
@@ -2183,6 +2184,13 @@ class FlashInferImpl(AttentionImpl):
                 fixed.stride(),
             )
         kv_cache_permute = fixed
+        # FlashInfer's paged_kv_t keeps strides as uint32; LHBNC's head stride
+        # grows with the number of blocks.
+        assert kv_cache_permute.stride(1) < 2**32, (
+            f"The {kv_cache_layout.name} KV cache has a head stride of "
+            f"{kv_cache_permute.stride(1)} elements, which FlashInfer cannot "
+            "address. Use a smaller KV cache or another VLLM_KV_CACHE_LAYOUT."
+        )
 
         # Split K/V — zero-copy views. NVFP4 stores K/V as separate head
         # groups; other dtypes pack K/V in the content dim.

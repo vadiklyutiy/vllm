@@ -175,6 +175,7 @@ def fill_mm_prefix_query_ranges(
 _FLASHINFER_LAYOUT_NAMES = {
     "LBNHC": "NHD",
     "LBHNC": "HND",
+    "LHBNC": "HND",
     "BLHNC": "HND",
     "BLNHC": "NHD",
     "BHLNC": "HND",
@@ -188,6 +189,16 @@ def get_flashinfer_layout_string(layout: KVCacheLayout) -> str:
         "rejects it in supported_kv_cache_layouts"
     )
     return _FLASHINFER_LAYOUT_NAMES[layout.name]
+
+
+_FLASHINFER_VIEW_ORDERS = {"NHD": (0, 2, 1, 3), "HND": (0, 1, 2, 3)}
+
+
+def get_flashinfer_view_order(layout: KVCacheLayout) -> tuple[int, ...]:
+    """Permutation of the logical ``[B, H, N, C]`` per-layer cache view into the
+    axis order of ``get_flashinfer_layout_string(layout)``, which is not always
+    the physical order (``layout.layer_view_order``)."""
+    return _FLASHINFER_VIEW_ORDERS[get_flashinfer_layout_string(layout)]
 
 
 # Preference order when no backend declares a supported set; LBNHC (NHD)

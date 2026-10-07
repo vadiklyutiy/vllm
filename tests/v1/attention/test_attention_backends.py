@@ -770,6 +770,38 @@ def test_flashinfer_cross_layer_layout(
     )
 
 
+@pytest.mark.parametrize("batch_spec_name", ["small_decode", "small_prefill"])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_flashinfer_head_outer_layout(
+    default_vllm_config,
+    batch_spec_name: str,
+    kv_cache_dtype: str,
+):
+    """LHBNC puts the head dim outside the block dim within a layer; FlashInfer
+    must still read it as HND pages through strides."""
+    if AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST:
+        pytest.skip("FlashInfer is not installed")
+
+    def causal_mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+        *,
+        context_len: int,
+    ):
+        return (q_idx + context_len) >= kv_idx
+
+    _test_backend_correctness(
+        batch_spec=BATCH_SPECS[batch_spec_name],
+        model="meta-llama/Meta-Llama-3-8B",
+        backend_to_test=[AttentionBackendEnum.FLASHINFER],
+        mask_mod=causal_mask_mod,
+        kv_cache_dtype=kv_cache_dtype,
+        layout=KVCacheLayout.LHBNC,
+    )
+
+
 @pytest.mark.parametrize(
     "batch_spec_name",
     [
