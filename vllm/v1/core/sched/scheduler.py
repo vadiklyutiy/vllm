@@ -693,11 +693,13 @@ class Scheduler(SchedulerInterface):
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
+            # Pooling requests sample no tokens, so they need no room for one.
+            num_sampled_tokens = (
+                0 if request.pooling_params else self.num_sampled_tokens_per_step
+            )
             num_new_tokens = min(
                 num_new_tokens,
-                self.max_model_len
-                - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
+                self.max_model_len - request.num_computed_tokens - num_sampled_tokens,
             )
 
             # Apply Mamba alignment before encoder caps.

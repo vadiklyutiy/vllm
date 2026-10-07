@@ -35,6 +35,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -483,6 +484,27 @@ def test_encoder_only_prompt_longer_than_budget_is_chunked():
 
     third = scheduler.schedule()
     assert third.num_scheduled_tokens[request.request_id] == 452
+
+
+def test_chunked_pooling_prompt_of_max_model_len_is_fully_scheduled():
+    """A pooling request samples no token, so a prompt of exactly max_model_len
+    must have all its chunks scheduled, including the last token."""
+    scheduler = create_scheduler(max_num_batched_tokens=64, max_model_len=128)
+    request = Request(
+        request_id="pooling",
+        prompt_token_ids=[0] * 128,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="token_embed"),
+    )
+    scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[request.request_id] == 64
+    _model_output(scheduler, first, [[]])
+
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens[request.request_id] == 64
+    assert request.num_computed_tokens == 128
 
 
 @pytest.mark.parametrize("has_running", [True, False])
