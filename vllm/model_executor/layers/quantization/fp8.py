@@ -15,6 +15,9 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+    HummingFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
@@ -407,6 +410,9 @@ class Fp8LinearMethod(LinearMethodBase):
             # Update layer with new values.
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, "weight_scale", weight_scale.data)
+            # The helper returns (K, N); retag so layout-aware kernels see it.
+            layer.weight.input_dim = 0
+            layer.weight.output_dim = 1
 
         if input_scale is not None:
             replace_parameter(layer, "input_scale", input_scale)
@@ -432,7 +438,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias,
                 )
             else:
-                if isinstance(self.fp8_linear, CutlassFP8ScaledMMLinearKernel):
+                if isinstance(
+                    self.fp8_linear,
+                    (CutlassFP8ScaledMMLinearKernel, HummingFP8ScaledMMLinearKernel),
+                ):
                     return self.fp8_linear.apply_weights(layer, x, bias)
 
                 # per-tensor/channel: dequant to BF16 and run GEMM

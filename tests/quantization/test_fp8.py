@@ -20,6 +20,9 @@ from vllm.config.cache import CacheConfig
 from vllm.config.kernel import KernelConfig
 from vllm.config.model import ModelConfig
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+    HummingFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
@@ -612,6 +615,45 @@ def test_model_load_and_run(
         set_forward_context(None, vllm_config, num_tokens=input_ids.numel()),
     ):
         model(input_ids, positions, None)
+
+
+@pytest.mark.skipif(
+    not HummingFP8ScaledMMLinearKernel.is_supported()[0],
+    reason="Humming FP8 linear kernel is not supported on this platform.",
+)
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_fp8_checkpoint_humming_linear_matches_marlin(
+    batch_invariant: bool, monkeypatch, dist_init, workspace_init
+) -> None:
+    """Per-tensor FP8 checkpoints hand the kernel a transposed (K, N) weight.
+    Humming must read that layout and also serve the batch-invariant apply
+    path."""
+    model_id = "neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV"
+    model_config_kwargs = {"hf_overrides": {"num_hidden_layers": 1}}
+    ref_model, ref_config = load_model_without_vllm_runner(
+        model_id,
+        model_config_kwargs=model_config_kwargs,
+        vllm_config_kwargs={"kernel_config": KernelConfig(linear_backend="marlin")},
+    )
+    ref_proj = ref_model.model.layers[0].mlp.down_proj
+    torch.manual_seed(0)
+    x = torch.randn(8, ref_proj.input_size, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    with set_current_vllm_config(ref_config):
+        ref, _ = ref_proj(x)
+
+    # Marlin opts out of batch-invariant mode, so it is only the reference.
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    model, vllm_config = load_model_without_vllm_runner(
+        model_id,
+        model_config_kwargs=model_config_kwargs,
+        vllm_config_kwargs={"kernel_config": KernelConfig(linear_backend="humming")},
+    )
+    proj = model.model.layers[0].mlp.down_proj
+    assert isinstance(proj.quant_method, Fp8LinearMethod)
+    assert isinstance(proj.quant_method.fp8_linear, HummingFP8ScaledMMLinearKernel)
+    with set_current_vllm_config(vllm_config):
+        out, _ = proj(x)
+    assert (out.float() - ref.float()).norm() / ref.float().norm() < 0.02
 
 
 @pytest.mark.skipif(

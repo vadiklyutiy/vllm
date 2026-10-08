@@ -22,6 +22,9 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+    HummingFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
@@ -221,6 +224,9 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
         # Update layer with new values.
         replace_parameter(layer, "weight", qweight.t().data)
         replace_parameter(layer, "weight_scale", weight_scale.data)
+        # The weight is now (K, N); retag so layout-aware kernels see it.
+        layer.weight.input_dim = 0
+        layer.weight.output_dim = 1
 
         if self.use_marlin and hasattr(self.fp8_linear, "marlin_input_dtype"):
             self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
@@ -237,7 +243,10 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
     ) -> torch.Tensor:
         # if batch invariant mode is enabled, use BF16 dequant
         if envs.VLLM_BATCH_INVARIANT:
-            if isinstance(self.fp8_linear, CutlassFP8ScaledMMLinearKernel):
+            if isinstance(
+                self.fp8_linear,
+                (CutlassFP8ScaledMMLinearKernel, HummingFP8ScaledMMLinearKernel),
+            ):
                 return self.fp8_linear.apply_weights(layer, x, bias)
 
             weight_fp8 = layer.weight.to(torch.bfloat16)
@@ -404,6 +413,9 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
 
         replace_parameter(layer, "weight", qweight.t())
         replace_parameter(layer, "weight_scale", weight_scale)
+        # The weight is now (K, N); retag so layout-aware kernels see it.
+        layer.weight.input_dim = 0
+        layer.weight.output_dim = 1
 
         self.fp8_linear.process_weights_after_loading(layer)
         expose_input_quant_key(layer, self.fp8_linear)
@@ -419,7 +431,10 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
         # if batch invariant mode is enabled dequant
         if (
             envs.VLLM_BATCH_INVARIANT
-            and not isinstance(self.fp8_linear, CutlassFP8ScaledMMLinearKernel)
+            and not isinstance(
+                self.fp8_linear,
+                (CutlassFP8ScaledMMLinearKernel, HummingFP8ScaledMMLinearKernel),
+            )
             and not isinstance(x, QuantizedActivation)
         ):
             weight_dequant = (
