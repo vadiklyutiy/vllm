@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
+from typing import Any
+
 import pytest
 
 from tests.tool_parsers.common_tests import (
     ToolParserTestConfig,
     ToolParserTests,
 )
+from tests.tool_parsers.utils import run_tool_extraction
 from vllm.tokenizers import TokenizerLike, get_tokenizer
 
 
@@ -90,3 +94,27 @@ class TestDeepSeekV3ToolParser(ToolParserTests):
                 ),
             },
         )
+
+    def test_multiline_json_arguments(self, tool_parser: Any, streaming: bool):
+        """Tool calls whose JSON arguments span several lines are not dropped."""
+        calls = [
+            ("get_weather", {"city": "Tokyo", "unit": "celsius"}),
+            ("search_hotels", {"location": "Tokyo", "check_in": "2025-01-15"}),
+        ]
+        model_output = (
+            "<｜tool▁calls▁begin｜>"
+            + "".join(
+                f"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\n"
+                f"```json\n{json.dumps(args, indent=2)}\n```<｜tool▁call▁end｜>"
+                for name, args in calls
+            )
+            + "<｜tool▁calls▁end｜>"
+        )
+
+        _, tool_calls = run_tool_extraction(
+            tool_parser, model_output, streaming=streaming
+        )
+
+        assert [
+            (tc.function.name, json.loads(tc.function.arguments)) for tc in tool_calls
+        ] == calls
