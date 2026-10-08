@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+
 import pytest
 import torch
 from torch import nn
+from transformers import LlamaConfig, Qwen2Config
 
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
@@ -284,3 +287,40 @@ def test_conditional_compile_enable_if(use_inductor_graph_partition, monkeypatch
         # num_cudagraph_sizes * num cudagraphable graphs to capture
     ):
         run_model(vllm_config, mod_A, cudagraph_runtime_mode)
+
+
+def test_positional_args_type_check():
+    """Each positional arg is checked against its own parameter's annotation.
+    Config annotations, those that isinstance cannot check, and `*args` are
+    skipped."""
+
+    @support_torch_compile
+    class M(nn.Module):
+        def __init__(
+            self,
+            config: LlamaConfig,
+            dim: int,
+            act: Callable[[torch.Tensor], torch.Tensor],
+            name: str = "",
+        ) -> None:
+            super().__init__()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    @support_torch_compile
+    class VarArgs(nn.Module):
+        def __init__(self, *dims: int, enabled: bool = False) -> None:
+            super().__init__()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    vllm_config = VllmConfig(
+        compilation_config=CompilationConfig(mode=CompilationMode.NONE)
+    )
+    with set_current_vllm_config(vllm_config):
+        M(Qwen2Config(), 8, torch.relu, "m")
+        VarArgs(1, 2)
+        with pytest.raises(TypeError, match="positional argument of type 'str'"):
+            M(LlamaConfig(), "8", torch.relu)

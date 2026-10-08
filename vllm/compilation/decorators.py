@@ -7,12 +7,13 @@ import inspect
 import os
 import sys
 from collections.abc import Callable, Generator
-from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar, overload
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar, get_origin, overload
 from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 from torch._dynamo.symbolic_convert import InliningInstructionTranslator
+from transformers import PreTrainedConfig
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
@@ -375,10 +376,24 @@ def _support_torch_compile(
         # NOTE: to support multimodal models (such as encoder),
         # we may not have vllm_config so we may need to patch it
         sig = inspect.signature(old_init)
-        # Check that any positional arguments match the old_init method signature
-        annotations = [p.annotation for p in sig.parameters.values()]
+        # Check that any positional arguments match the old_init method signature.
+        # old_init is unbound, so skip `self`. Arguments that go to `*args` are not
+        # checked. isinstance can only check classes, not generics such as
+        # `list[int]`, which isclass accepts on Python 3.10.
+        # Configs are not checked: vLLM may pass its own config class, or another
+        # copy of a remote-code config class, in place of the annotated one.
+        annotations = [
+            p.annotation
+            for p in list(sig.parameters.values())[1:]
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
         for arg, annotation in zip(args, annotations):
-            if annotation is inspect._empty:
+            if (
+                annotation is inspect._empty
+                or not inspect.isclass(annotation)
+                or get_origin(annotation) is not None
+                or issubclass(annotation, PreTrainedConfig)
+            ):
                 continue
             if not isinstance(arg, annotation):
                 init = f"'{type(self).__name__}.__init__'"
