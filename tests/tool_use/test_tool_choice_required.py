@@ -19,6 +19,9 @@ from vllm.tool_parsers.utils import (
     find_tool_properties,
     get_json_schema_from_tools,
 )
+from vllm.v1.structured_output.backend_xgrammar import (
+    has_xgrammar_unsupported_json_features,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -212,6 +215,16 @@ def test_structured_outputs_json(sample_output, should_match):
         sample_output=sample_output,
         should_match=should_match,
     )
+
+
+def test_structured_outputs_json_supported_by_xgrammar():
+    schema = get_json_schema_from_tools(
+        tools=TypeAdapter(list[ChatCompletionToolsParam]).validate_python(
+            EXAMPLE_TOOLS
+        ),
+        tool_choice="required",
+    )
+    assert not has_xgrammar_unsupported_json_features(schema)
 
 
 def update_parameters_none(tool: ChatCompletionToolsParam) -> ChatCompletionToolsParam:

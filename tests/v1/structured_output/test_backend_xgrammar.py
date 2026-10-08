@@ -406,6 +406,123 @@ class TestHasXGrammarUnsupportedJsonFeatures:
         def test_supported_list_type_json_features(self, schema):
             assert not has_xgrammar_unsupported_json_features(schema)
 
+    class TestIssue60237Regressions:
+        @pytest.mark.parametrize(
+            "schema",
+            [
+                {
+                    "type": "object",
+                    "properties": {"modifier": {"enum": ["", "dark"]}},
+                    "anyOf": [{"required": ["modifier"]}],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}},
+                    "required": ["a"],
+                    "additionalProperties": False,
+                    "allOf": [{"required": ["a"]}],
+                },
+                {"type": "integer", "oneOf": [{"minimum": 0}, {"maximum": -10}]},
+                {"enum": [1, "x"], "anyOf": [{"type": "integer"}]},
+                {
+                    "anyOf": [{"type": "integer"}, {"type": "string"}],
+                    "oneOf": [{"type": "integer"}],
+                },
+                {"type": "object", "anyOf": [{"required": ["a"]}, {"required": ["b"]}]},
+                {"type": "string", "anyOf": [{"type": "string"}, {"type": "integer"}]},
+                {"type": "string", "anyOf": [{"const": "a"}, {"const": 1}]},
+                {"type": "integer", "anyOf": [{"const": True}, {"const": 2}]},
+                {
+                    "$defs": {"I": {"type": "integer"}},
+                    "type": "object",
+                    "anyOf": [{"$ref": "#/$defs/I"}],
+                },
+            ],
+        )
+        def test_combinator_beside_constraint_is_unsupported(self, schema):
+            """Xgrammar compiles only one side of such a node."""
+            assert has_xgrammar_unsupported_json_features(schema)
+
+        @pytest.mark.parametrize(
+            "schema",
+            [
+                {
+                    "anyOf": [{"type": "integer"}, {"type": "null"}],
+                    "default": None,
+                    "title": "Count",
+                    "description": "Optional[int] field from Pydantic",
+                },
+                {
+                    "$defs": {
+                        "A": {
+                            "type": "object",
+                            "properties": {"k": {"const": "a"}},
+                            "required": ["k"],
+                        },
+                        "B": {
+                            "type": "object",
+                            "properties": {"k": {"const": "b"}},
+                            "required": ["k"],
+                        },
+                    },
+                    "oneOf": [{"$ref": "#/$defs/A"}, {"$ref": "#/$defs/B"}],
+                    "discriminator": {
+                        "propertyName": "k",
+                        "mapping": {"a": "#/$defs/A", "b": "#/$defs/B"},
+                    },
+                    "title": "Union",
+                },
+                {
+                    "$defs": {"A": {"type": "integer"}},
+                    "allOf": [{"$ref": "#/$defs/A"}],
+                    "default": 1,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "anyOf": {"type": "string"},
+                        "type": {"type": "string"},
+                    },
+                },
+            ],
+        )
+        def test_combinator_without_constraint_sibling_is_supported(self, schema):
+            assert not has_xgrammar_unsupported_json_features(schema)
+
+        @pytest.mark.parametrize(
+            "schema",
+            [
+                {
+                    "type": "object",
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "integer"}}},
+                        {"type": "object", "properties": {"b": {"type": "string"}}},
+                    ],
+                },
+                {
+                    "type": ["object", "null"],
+                    "anyOf": [{"type": "object"}, {"type": "null"}],
+                },
+                {"type": "integer", "allOf": [{"type": "integer", "minimum": 0}]},
+                {
+                    "$defs": {"A": {"type": "object"}},
+                    "type": "object",
+                    "oneOf": [{"$ref": "#/$defs/A"}],
+                },
+                {
+                    "type": "string",
+                    "oneOf": [
+                        {"const": "#FF0000", "title": "Red"},
+                        {"enum": ["#00FF00", "#0000FF"], "title": "Other"},
+                    ],
+                },
+            ],
+        )
+        def test_type_narrowed_by_every_branch_is_supported(self, schema):
+            """Dropping the outer type loses nothing here."""
+            assert not has_xgrammar_unsupported_json_features(schema)
+
 
 class TestIsGrammarAcceptString:
     class TestPR42904Support:

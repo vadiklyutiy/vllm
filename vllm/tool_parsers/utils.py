@@ -350,6 +350,7 @@ def _get_tool_schema_from_name_and_params(
     name: str, params: dict[str, Any] | None
 ) -> dict:
     return {
+        "type": "object",
         "properties": {
             "name": {"type": "string", "enum": [name]},
             "parameters": _params_or_empty_object(params),

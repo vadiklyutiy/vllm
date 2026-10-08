@@ -245,6 +245,60 @@ STRING_SUPPORTED_FORMATS = {
     "relative-json-pointer",
 }
 
+COMBINATOR_KEYWORDS = ("allOf", "anyOf", "oneOf")
+
+# Keywords that constrain an instance, unlike annotations such as title,
+# description, default, $defs or discriminator.
+CONSTRAINT_KEYWORDS = {
+    *COMBINATOR_KEYWORDS,
+    "$ref",
+    "type",
+    "enum",
+    "const",
+    "not",
+    "if",
+    "multipleOf",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "items",
+    "prefixItems",
+    "additionalItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "unevaluatedItems",
+    "properties",
+    "patternProperties",
+    "additionalProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+    "required",
+    "dependentRequired",
+    "dependentSchemas",
+    "dependencies",
+    "minProperties",
+    "maxProperties",
+}
+
+JSON_VALUE_TYPES = {
+    type(None): "null",
+    bool: "boolean",
+    int: "integer",
+    float: "number",
+    str: "string",
+    list: "array",
+    dict: "object",
+}
+
 
 def _has_pattern_and_length_bounds(schema: dict[str, Any]) -> bool:
     return ("pattern" in schema or "format" in schema) and (
@@ -262,6 +316,28 @@ def _schema_types(schema: dict[str, Any]) -> set[str]:
     if isinstance(schema_type, list):
         return {item for item in schema_type if isinstance(item, str)}
     return set()
+
+
+def _resolve_local_ref(root: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """Follow a bare local `$ref` such as `#/$defs/A` within `root`."""
+    ref = schema.get("$ref")
+    if "type" in schema or not isinstance(ref, str) or not ref.startswith("#/"):
+        return schema
+    node: Any = root
+    for part in ref[2:].split("/"):
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(part.replace("~1", "/").replace("~0", "~"))
+    return node if isinstance(node, dict) else {}
+
+
+def _branch_types(root: dict[str, Any], branch: dict[str, Any]) -> set[str]:
+    """Types a branch admits, from its `type` or its `const`/`enum` values."""
+    branch = _resolve_local_ref(root, branch)
+    values = [branch["const"]] if "const" in branch else branch.get("enum")
+    if "type" in branch or not isinstance(values, list):
+        return _schema_types(branch)
+    return {JSON_VALUE_TYPES.get(type(value), "") for value in values}
 
 
 def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
@@ -352,6 +428,27 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
         allof = obj.get("allOf")
         if isinstance(allof, list) and len(allof) >= 2:
             return True
+
+        # FIXME: a combinator next to other constraint keywords on the same
+        # node. xgrammar compiles only one of them and silently drops the rest,
+        # e.g. {"type": "object", "properties": ..., "anyOf": [...]} keeps only
+        # the anyOf. https://github.com/mlc-ai/xgrammar/issues/858
+        combinators = [
+            obj[key] for key in COMBINATOR_KEYWORDS if isinstance(obj.get(key), list)
+        ]
+        if combinators:
+            constraints = obj.keys() & CONSTRAINT_KEYWORDS
+            # Dropping "type" loses nothing when every branch narrows it.
+            if all(
+                isinstance(branch, dict)
+                and (branch_types := _branch_types(schema, branch))
+                and branch_types <= schema_types
+                for branches in combinators
+                for branch in branches
+            ):
+                constraints.discard("type")
+            if len(constraints) > 1:
+                return True
 
         # Recursively check all nested objects and arrays
         for value in obj.values():
