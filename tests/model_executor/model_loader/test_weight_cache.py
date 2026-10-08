@@ -356,6 +356,33 @@ def test_weight_cache_key_distinguishes_dp_ranks():
     assert key.mismatched_fields(replace(key, pp_rank=0)) == ["pp_rank"]
 
 
+@pytest.mark.parametrize(
+    ("hf_overrides", "expected_dp_keys"),
+    [({}, [(1, 0), (1, 0)]), ({"num_experts": 4}, [(2, 0), (2, 1)])],
+    ids=["dense", "moe"],
+)
+def test_daemon_keys_dp_ranks_like_the_engine(hf_overrides, expected_dp_keys):
+    """The engine runs each DP rank of a dense model as an independent DP=1
+    engine, so the daemon must key those ranks as DP=1 for them to match; MoE
+    engines keep the real DP placement."""
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader.weight_cache.daemon import (
+        WeightCacheDaemon,
+        plan_local_ranks,
+    )
+
+    vllm_config = EngineArgs(
+        model="Qwen/Qwen3-0.6B", data_parallel_size=2, hf_overrides=hf_overrides
+    ).create_engine_config()
+    keys = [
+        WeightCacheDaemon(
+            vllm_config, dp_rank, local_rank, "tcp://127.0.0.1:0", dp_rank=dp_rank
+        ).cache_config
+        for local_rank, dp_rank, _, _ in plan_local_ranks(vllm_config.parallel_config)
+    ]
+    assert [(key.dp_size, key.dp_rank) for key in keys] == expected_dp_keys
+
+
 def test_ipc_loader_copy_mode_reports_no_external_weight_memory():
     """Copy mode clones the weights into the engine, so nothing is external
     (vllm_config is never touched)."""

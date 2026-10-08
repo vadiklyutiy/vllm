@@ -224,15 +224,18 @@ class WeightCacheDaemon:
         self.role = format_daemon_role(is_draft)
         self.model: torch.nn.Module | None = None
         # Fingerprint before loading: process_weights_after_loading may
-        # mutate hf_config.quantization_config.
+        # mutate hf_config.quantization_config. The engine runs each DP rank
+        # of a non-MoE model as an independent DP=1 engine
+        # (reconfigure_for_independent_dp_rank), so key those ranks as DP=1.
+        dp_independent = not vllm_config.model_config.is_moe
         self.cache_config = WeightCacheKey.from_model_config(
             self.model_config,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             pp_size=self.pp_size,
             pp_rank=self.pp_rank,
-            dp_size=self.dp_size,
-            dp_rank=dp_rank,
+            dp_size=1 if dp_independent else self.dp_size,
+            dp_rank=0 if dp_independent else dp_rank,
             is_draft=is_draft,
         )
 
