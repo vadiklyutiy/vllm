@@ -344,8 +344,16 @@ def _check_unsupported(parsed) -> None:
             for branch in tval[1]:
                 _check_unsupported(branch)
 
+        # tval is (group, add_flags, del_flags, subpattern)
+        elif ttype == sre_parse.SUBPATTERN:
+            _check_unsupported(tval[3])
+
         # tval is (min, max, subpattern)
-        elif ttype == sre_parse.MAX_REPEAT:
+        elif ttype in (
+            sre_parse.MAX_REPEAT,
+            sre_parse.MIN_REPEAT,
+            getattr(sre_parse, "POSSESSIVE_REPEAT", None),  # Python 3.11+
+        ):
             _check_unsupported(tval[2])
 
 

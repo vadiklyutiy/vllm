@@ -3,6 +3,7 @@
 """Request-time validation of structured output requests."""
 
 import json
+import sys
 
 import pytest
 
@@ -234,6 +235,34 @@ def test_unsupported_grammar_is_a_client_error(backend, structured_outputs):
         params._validate_structured_outputs(
             _StubModelConfig(is_diffusion=False),
             StructuredOutputsConfig(backend=backend),
+            tokenizer=object(),
+        )
+
+
+@pytest.mark.parametrize(
+    "regex",
+    [
+        r"(a\b)",
+        r"((a)\2)",
+        r"(?:a\b)*?",
+        pytest.param(
+            r"(?:a\b)*+",
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 11),
+                reason="possessive repeats need Python 3.11+",
+            ),
+        ),
+    ],
+)
+def test_outlines_rejects_unsupported_regex_feature_when_nested(regex):
+    """outlines_core cannot build a DFA for word boundaries or backreferences,
+    so they must be rejected at validation even inside a group or a lazy or
+    possessive repeat, instead of failing later in the engine core."""
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(regex=regex))
+    with pytest.raises(VLLMValidationError, match="unsupported feature"):
+        params._validate_structured_outputs(
+            _StubModelConfig(is_diffusion=False),
+            StructuredOutputsConfig(backend="outlines"),
             tokenizer=object(),
         )
 
