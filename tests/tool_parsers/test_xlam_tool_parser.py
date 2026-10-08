@@ -555,3 +555,28 @@ def test_extract_tool_calls_non_ascii(xlam_tool_parser, xlam_tokenizer, streamin
 
     assert "北京" in args
     assert "\\u" not in args
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"filter": {"geo": {"city": "Dallas"}}},
+        {"text": "use } to close"},
+    ],
+    ids=["deeply_nested", "brace_in_string"],
+)
+def test_extract_tool_calls_streaming_arguments_match_json(
+    xlam_tool_parser, xlam_tokenizer, arguments
+):
+    """Streamed arguments must be the whole JSON object, however it is nested."""
+    model_output = json.dumps([{"name": "search", "arguments": arguments}])
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+    args = "".join(
+        delta.tool_calls[0].function.arguments
+        for delta in stream_delta_message_generator(
+            xlam_tool_parser, xlam_tokenizer, model_output, request
+        )
+        if delta.tool_calls and delta.tool_calls[0].function.arguments
+    )
+
+    assert json.loads(args) == arguments

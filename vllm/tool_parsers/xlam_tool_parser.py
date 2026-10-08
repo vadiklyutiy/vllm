@@ -453,12 +453,23 @@ class xLAMToolParser(ToolParser):
 
                                 return delta
 
-                # Extract arguments for current tool using regex for non-empty arguments
-                args_pattern = r'"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*(\{(?:[^{}]|(?:\{[^{}]*\}))*\})'
-                args_matches = list(re.finditer(args_pattern, search_text))
+                # Collect the complete arguments object of each tool, in order
+                args_start_pattern = re.compile(
+                    r'"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*(?=\{)'
+                )
+                args_texts: list[str] = []
+                pos = 0
+                while args_start := args_start_pattern.search(search_text, pos):
+                    try:
+                        _, pos = json.JSONDecoder().raw_decode(
+                            search_text, args_start.end()
+                        )
+                    except json.JSONDecodeError:
+                        break
+                    args_texts.append(search_text[args_start.end() : pos])
 
-                if current_idx < len(args_matches):
-                    args_text = args_matches[current_idx].group(1)
+                if current_idx < len(args_texts):
+                    args_text = args_texts[current_idx]
 
                     # Handle transition between tools
                     is_last_tool = current_idx == tool_count - 1
