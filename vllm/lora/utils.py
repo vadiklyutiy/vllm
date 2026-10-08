@@ -208,10 +208,11 @@ def parse_fine_tuned_lora_name(
         if parts[-2] in ["lora_A", "lora_B"]:
             new_name = ".".join(parts[start_index:-2])
             return new_name, parts[-2] == "lora_A"
-        # For modules_to_save in classification.
-        elif parts[-2] in ["score", "classifier"]:
-            new_name = parts[-2]
-            return new_name, False
+        # For modules_to_save in classification. The head may hold several
+        # linear layers, e.g. RoBERTa's classifier.dense/classifier.out_proj.
+        for i, part in enumerate(parts[:-1]):
+            if part in ["score", "classifier"]:
+                return ".".join(parts[i:-1]), False
 
     if parts[-1] == "lora_embedding_A" or parts[-1] == "lora_embedding_B":
         new_name = ".".join(parts[start_index:-1])

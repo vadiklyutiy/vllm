@@ -100,6 +100,36 @@ def test_native_classification_model_with_modules_to_save(
     cleanup_dist_env_and_memory()
 
 
+def test_multi_layer_classification_head_with_modules_to_save(
+    bge_reranker_v2_m3_lora_files: str,
+) -> None:
+    """RoBERTa's head is two linears; each request must use its own head."""
+    prompt = "Paris is the capital of France."
+    llm = LLM(
+        model="BAAI/bge-reranker-v2-m3",
+        runner="pooling",
+        dtype="float16",
+        enable_lora=True,
+        max_lora_rank=16,
+        enforce_eager=True,
+        max_model_len=512,
+        gpu_memory_utilization=0.5,
+    )
+    actual = _classify_logits(
+        llm,
+        [prompt, prompt],
+        [LoRARequest("bge-reranker", 1, bge_reranker_v2_m3_lora_files), None],
+    )
+
+    # Transformers fp32 logits for the adapter and for the base model.
+    torch.testing.assert_close(
+        actual, torch.tensor([[-2.0539], [2.4277]]), atol=2e-2, rtol=2e-2
+    )
+
+    del llm
+    cleanup_dist_env_and_memory()
+
+
 def _test_batched_loras(
     qwen3_guard_star_trek_lora_files: str,
     qwen3_guard_new_zealand_lora_files: str,

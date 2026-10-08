@@ -276,6 +276,14 @@ def skywork_qwen3_reward_lora_files():
 
 
 @pytest.fixture(scope="session")
+def bge_reranker_v2_m3_lora_files():
+    return hf_api().snapshot_download(
+        repo_id="minhnv7/bge-reranker-v2m3-lora",
+        allow_patterns=["adapter_config.json", "adapter_model.safetensors"],
+    )
+
+
+@pytest.fixture(scope="session")
 def deepseekv2_lora_files():
     return hf_api().snapshot_download(repo_id="wuchen01/DeepSeek-V2-Lite-Chat-All-LoRA")
 

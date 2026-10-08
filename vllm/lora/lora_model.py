@@ -143,7 +143,7 @@ class LoRAModel:
             module_name, is_lora_a = parse_fine_tuned_lora_name(
                 tensor_name, weights_mapper
             )
-            if module_name in modules_to_save_names:
+            if module_name.split(".", 1)[0] in modules_to_save_names:
                 full_parameters.setdefault(module_name, {})[
                     tensor_name.split(".")[-1]
                 ] = tensor.to(device=device)
@@ -183,7 +183,7 @@ class LoRAModel:
                 weight=weight,
                 bias=parameters.get("bias"),
             )
-        if len(modules_to_save) > 1:
+        if len({name.split(".", 1)[0] for name in modules_to_save}) > 1:
             raise ValueError(
                 "Only one full classification module is supported per "
                 f"adapter, received {sorted(modules_to_save)}."
@@ -256,6 +256,7 @@ class LoRAModel:
                     continue
                 module_name, _ = parse_fine_tuned_lora_name(lora_module, weights_mapper)
                 base_name = module_name.rsplit(".", 1)[-1]
+                head_name = module_name.split(".", 1)[0]
                 # Case for expert lora weights
                 if ".experts" in module_name:
                     expert_idx = module_name.find(".experts")
@@ -263,7 +264,7 @@ class LoRAModel:
                     if expert_suffix not in expected_lora_modules:
                         unexpected_modules.append(module_name)
 
-                elif base_name not in expected_lora_modules and base_name not in (
+                elif base_name not in expected_lora_modules and head_name not in (
                     peft_helper.modules_to_save or ()
                 ):
                     unexpected_modules.append(module_name)

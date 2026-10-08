@@ -74,6 +74,37 @@ def test_from_lora_tensors(qwen3_lora_files, device):
         assert lora.lora_a.shape[0] == 8
 
 
+def test_from_lora_tensors_multi_layer_classification_head():
+    """PEFT saves each linear of RoBERTa's classifier head via modules_to_save."""
+    peft_helper = PEFTHelper.from_dict(
+        {
+            "r": 2,
+            "lora_alpha": 16,
+            "target_modules": ["query", "value"],
+            "modules_to_save": ["classifier", "score"],
+        }
+    )
+    tensors = {
+        "base_model.model.classifier.dense.weight": torch.rand(8, 8),
+        "base_model.model.classifier.dense.bias": torch.rand(8),
+        "base_model.model.classifier.out_proj.weight": torch.rand(3, 8),
+        "base_model.model.classifier.out_proj.bias": torch.rand(3),
+    }
+    lora_model = LoRAModel.from_lora_tensors(
+        1, tensors, peft_helper=peft_helper, device="cpu"
+    )
+
+    assert not lora_model.loras
+    assert sorted(lora_model.modules_to_save) == [
+        "classifier.dense",
+        "classifier.out_proj",
+    ]
+    for module_name, full_module in lora_model.modules_to_save.items():
+        prefix = f"base_model.model.{module_name}"
+        torch.testing.assert_close(full_module.weight, tensors[f"{prefix}.weight"])
+        torch.testing.assert_close(full_module.bias, tensors[f"{prefix}.bias"])
+
+
 def create_lora(
     lora_id: int, model: nn.Module, sub_modules: list[str], device: torch.device
 ) -> LoRAModel:

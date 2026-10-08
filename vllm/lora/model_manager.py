@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import math
 from collections.abc import Callable
 from typing import TypeVar
@@ -37,7 +38,9 @@ from vllm.lora.utils import (
     process_packed_modules_mapping,
     replace_submodule,
 )
+from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe import MoERunner
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import (
     SupportsLoRA,
     SupportsMultiModal,
@@ -170,19 +173,24 @@ class LoRAModelManager:
         self._init_punica_wrapper(max_num_batched_tokens, vllm_config)
         self._create_lora_modules()
 
-        self._classification_head: tuple[str, ClassificationHeadWithLoRA] | None = None
+        # Linear layers of the classification head in module order, so a
+        # multi-layer head (e.g. RoBERTa) has its output layer last.
+        self._classification_head_layers: list[
+            tuple[str, ClassificationHeadWithLoRA]
+        ] = []
         if self.is_pooling_model:
-            classification_heads = [
+            self._classification_head_layers = [
                 (module_name, module)
                 for module_name, module in self.modules.items()
                 if isinstance(module, ClassificationHeadWithLoRA)
             ]
-            if classification_heads:
-                assert len(classification_heads) == 1, (
-                    "Expected 1 classification head, but found "
-                    f"{len(classification_heads)}."
-                )
-                self._classification_head = classification_heads[0]
+            head_names = {
+                module_name.split(".", 1)[0]
+                for module_name, _ in self._classification_head_layers
+            }
+            assert len(head_names) <= 1, (
+                f"Expected 1 classification head, but found {sorted(head_names)}."
+            )
 
         self.moe_ep_load_spec: MoEEPLoadSpec | None = self._build_moe_ep_load_spec()
 
@@ -451,15 +459,14 @@ class LoRAModelManager:
             self.vocab_size,
         )
 
-        if self._classification_head is not None:
-            _, classification_head = self._classification_head
-            if classification_head.punica_wrapper is punica_wrapper:
-                classification_head.set_output_mapping(
-                    tuple(
-                        self.lora_index_to_id.index(lora_id) if lora_id > 0 else -1
-                        for lora_id in mapping.prompt_mapping
-                    )
-                )
+        if self._classification_head_layers:
+            slot_indices = tuple(
+                self.lora_index_to_id.index(lora_id) if lora_id > 0 else -1
+                for lora_id in mapping.prompt_mapping
+            )
+            for _, layer in self._classification_head_layers:
+                if layer.punica_wrapper is punica_wrapper:
+                    layer.set_output_mapping(slot_indices)
 
     def remove_all_adapters(self):
         """Remove all LoRAModels from the manager."""
@@ -478,12 +485,18 @@ class LoRAModelManager:
             return module_name.rpartition(".")[0]
 
         wrapped_by_id: dict[int, BaseLayerWithLoRA] = {}
+        classify_head_copied = False
 
         for module_name, module in self.model.named_modules(remove_duplicate=False):
             if isinstance(module, PPMissingLayer):
                 continue
 
-            is_classifier_head = module_name in self.supported_modules_to_save
+            head_name = module_name.split(".", 1)[0]
+            is_classifier_head = head_name in self.supported_modules_to_save
+            if is_classifier_head and not isinstance(
+                module, maybe_get_oot_by_class(ReplicatedLinear)
+            ):
+                continue
 
             if self.lora_config.target_modules is None:
                 if not is_supported_lora_module(
@@ -560,9 +573,22 @@ class LoRAModelManager:
                     packed_moduled_lst,
                     self.model.config,
                 )
+            if (
+                is_classifier_head
+                and module_name != head_name
+                and not classify_head_copied
+            ):
+                # The token_classify pooler shares this head. Wrap the layers
+                # in a copy that only the classify pooler uses.
+                head = self.model.get_submodule(head_name)
+                head_copy = copy.copy(head)
+                head_copy._modules = head._modules.copy()
+                replace_submodule(self.model, head_name, head_copy)
+                self.model.pooler.replace_classifier(head_copy)
+                classify_head_copied = True
             new_module = replace_submodule(self.model, module_name, new_module)
 
-            if is_classifier_head:
+            if is_classifier_head and module_name == head_name:
                 self.model.pooler.replace_classifier(new_module)
             if isinstance(new_module, BaseLayerWithLoRA):
                 wrapped_by_id[id(module)] = new_module
@@ -1258,66 +1284,70 @@ class LoRAModelManager:
         if not lora_model.modules_to_save:
             return
         saved_module_name = next(iter(lora_model.modules_to_save))
-        if self._classification_head is None:
+        if not self._classification_head_layers:
             raise ValueError(
                 f"Cannot load full module {saved_module_name!r}: the model does "
                 "not expose a unique ClassificationHeadWithLoRA."
             )
 
-        module_name, wrapper = self._classification_head
-        full_module = self._get_module_to_save_weights(lora_model, module_name)
-        if full_module is None:
-            raise ValueError(
-                f"Full module {saved_module_name!r} does not match the model's "
-                f"classification head {module_name!r}."
-            )
+        output_module_name, _ = self._classification_head_layers[-1]
+        for module_name, wrapper in self._classification_head_layers:
+            full_module = self._get_module_to_save_weights(lora_model, module_name)
+            if full_module is None:
+                raise ValueError(
+                    "Adapter has no full module for classification head layer "
+                    f"{module_name!r}; received {sorted(lora_model.modules_to_save)}."
+                )
 
-        received_weight_shape = tuple(full_module.weight.shape)
-        if (
-            full_module.weight.ndim != 2
-            or full_module.weight.size(0) < 1
-            or full_module.weight.size(0) > wrapper.max_lora_cls_labels
-            or full_module.weight.size(1) != wrapper.input_size
-        ):
-            raise ValueError(
-                f"Full module {saved_module_name!r} for {module_name!r} has "
-                "an incompatible weight shape: expected "
-                f"(1..{wrapper.max_lora_cls_labels}, {wrapper.input_size}), "
-                f"received {received_weight_shape}."
-            )
+            # Only the output layer of the head may change the number of labels.
+            if module_name == output_module_name:
+                min_rows, max_rows = 1, wrapper.max_lora_cls_labels
+            else:
+                min_rows = max_rows = wrapper.output_size
+            received_weight_shape = tuple(full_module.weight.shape)
+            if (
+                full_module.weight.ndim != 2
+                or full_module.weight.size(0) < min_rows
+                or full_module.weight.size(0) > max_rows
+                or full_module.weight.size(1) != wrapper.input_size
+            ):
+                raise ValueError(
+                    f"Full module {full_module.module_name!r} for {module_name!r} has "
+                    "an incompatible weight shape: expected "
+                    f"({min_rows}..{max_rows}, {wrapper.input_size}), "
+                    f"received {received_weight_shape}."
+                )
 
-        if full_module.bias is None:
-            return
-        expected_bias_shape = (full_module.weight.size(0),)
-        received_bias_shape = tuple(full_module.bias.shape)
-        if received_bias_shape != expected_bias_shape:
-            raise ValueError(
-                f"Full module {saved_module_name!r} for {module_name!r} has "
-                "an incompatible bias shape: expected "
-                f"{expected_bias_shape}, received {received_bias_shape}."
-            )
+            if full_module.bias is None:
+                continue
+            expected_bias_shape = (full_module.weight.size(0),)
+            received_bias_shape = tuple(full_module.bias.shape)
+            if received_bias_shape != expected_bias_shape:
+                raise ValueError(
+                    f"Full module {full_module.module_name!r} for {module_name!r} has "
+                    "an incompatible bias shape: expected "
+                    f"{expected_bias_shape}, received {received_bias_shape}."
+                )
 
     def _validate_token_classification_lora(self, lora_model: LoRAModel) -> None:
         if self._pooling_task != "token_classify":
             return
-        if self._classification_head is None:
-            return
 
-        module_name, _ = self._classification_head
-        has_full_module = (
-            self._get_module_to_save_weights(lora_model, module_name) is not None
-        )
-        has_lora_weights = (
-            self._get_lora_layer_weights(lora_model, module_name) is not None
-        )
-        if not has_full_module and not has_lora_weights:
-            return
+        for module_name, _ in self._classification_head_layers:
+            has_full_module = (
+                self._get_module_to_save_weights(lora_model, module_name) is not None
+            )
+            has_lora_weights = (
+                self._get_lora_layer_weights(lora_model, module_name) is not None
+            )
+            if not has_full_module and not has_lora_weights:
+                continue
 
-        raise ValueError(
-            f"LoRA adapter {lora_model.id} contains weights for classification "
-            f"head {module_name!r}, but token_classify only supports LoRA on "
-            "the model backbone."
-        )
+            raise ValueError(
+                f"LoRA adapter {lora_model.id} contains weights for classification "
+                f"head {module_name!r}, but token_classify only supports LoRA on "
+                "the model backbone."
+            )
 
     def deactivate_adapter(self, adapter_id: int) -> bool:
         if adapter_id not in self._active_adapters:
