@@ -249,3 +249,49 @@ def test_regex_timeout_handling(streaming: bool, default_tokenizer: TokenizerLik
         assert content == fake_problematic_input
         assert len(tool_calls) == 0
         mock_regex.match.assert_called_once()
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize(
+    "model_output, expected_tool_calls",
+    [
+        pytest.param(
+            '<function_calls>write_file(path="a.py", '
+            'content="""import os\n\nprint(1)\n""")</function_calls>',
+            [
+                FunctionCall(
+                    name="write_file",
+                    arguments='{"path": "a.py", '
+                    '"content": "import os\\n\\nprint(1)\\n"}',
+                )
+            ],
+            id="newlines_in_triple_quoted_string",
+        ),
+        pytest.param(
+            f"<function_calls>{PARAMETERLESS_FUNCTION_OUTPUT}\nget_weather(\n"
+            "    city='San Francisco',\n"
+            "    metric='celsius'\n"
+            ")</function_calls>",
+            [PARAMETERLESS_FUNCTION_CALL, SIMPLE_FUNCTION_CALL],
+            id="call_split_across_lines",
+        ),
+    ],
+)
+def test_newlines_inside_a_call_are_not_call_separators(
+    streaming: bool,
+    model_output: str,
+    expected_tool_calls: list[FunctionCall],
+    default_tokenizer: TokenizerLike,
+):
+    """Only newlines between calls separate them; newlines inside a call's
+    parentheses or string arguments are kept as they are."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+
+    content, tool_calls = run_tool_extraction(
+        tool_parser, model_output, streaming=streaming
+    )
+
+    assert content is None
+    assert [tool_call.function for tool_call in tool_calls] == expected_tool_calls

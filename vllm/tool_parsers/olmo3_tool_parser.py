@@ -30,6 +30,42 @@ from vllm.tool_parsers.utils import (
 logger = init_logger(__name__)
 
 
+def _split_top_level_lines(text: str) -> list[str]:
+    """Split text at newlines that are outside brackets and string literals.
+
+    Newlines inside a call (between its parentheses or inside a string
+    argument, e.g. a triple-quoted one) are part of that call, not call
+    separators.
+    """
+    if "\n" not in text and "\r" not in text:
+        return [text]
+    lines: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if char == "\\":
+                index += 1
+            elif text.startswith(quote, index):
+                index += len(quote) - 1
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char * 3 if text.startswith(char * 3, index) else char
+            index += len(quote) - 1
+        elif char in {"(", "[", "{"}:
+            depth += 1
+        elif char in {")", "]", "}"}:
+            depth -= 1
+        elif char in {"\n", "\r"} and depth == 0:
+            lines.append(text[start:index])
+            start = index + 1
+        index += 1
+    lines.append(text[start:])
+    return lines
+
+
 class Olmo3PythonicToolParser(ToolParser):
     """Tool call parser for Olmo 3 models that produce tool calls as
     newline-separated pythonic strings.
@@ -47,7 +83,7 @@ class Olmo3PythonicToolParser(ToolParser):
     # Llama3.2 models more reliable.
 
     TOOL_CALL_REGEX = re.compile(
-        r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
+        r"\[([a-zA-Z]+\w*\(\s*([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(\s*([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
         re.DOTALL,
     )
 
@@ -80,7 +116,11 @@ class Olmo3PythonicToolParser(ToolParser):
             model_output = match.group(1).strip()
         # Make the newline separated function calls into a list.
         model_output = ", ".join(
-            [line.strip() for line in model_output.splitlines() if line.strip()]
+            [
+                line.strip()
+                for line in _split_top_level_lines(model_output)
+                if line.strip()
+            ]
         )
         model_output = f"[{model_output}]"
 
@@ -155,7 +195,11 @@ class Olmo3PythonicToolParser(ToolParser):
 
             # Make the newline separated function calls into a list.
             valid_text = ", ".join(
-                [line.strip() for line in valid_text.splitlines() if line.strip()]
+                [
+                    line.strip()
+                    for line in _split_top_level_lines(valid_text)
+                    if line.strip()
+                ]
             )
             valid_text = f"[{valid_text}]"
             module = ast.parse(valid_text)
