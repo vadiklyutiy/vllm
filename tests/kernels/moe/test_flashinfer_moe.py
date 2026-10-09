@@ -28,6 +28,9 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import 
     is_valid_flashinfer_cutlass_fused_moe,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_type,
+)
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.utils.math_utils import next_power_of_2
@@ -244,6 +247,94 @@ def test_flashinfer_fp4_moe_no_graph(
         torch.testing.assert_close(
             torch_output, flashinfer_output, atol=1e-1, rtol=1e-1
         )
+
+
+@torch.inference_mode()
+def test_flashinfer_fp4_moe_scratch_from_workspace_manager(workspace_init):
+    """FlashInfer's scratch must come from the workspace manager.
+
+    Allocating it on every call (many GiB for large batches) fragments the
+    caching allocator once the KV cache is allocated, and the call OOMs.
+    """
+    from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
+
+    m, n, k, e, topk = 4096, 1024, 1024, 64, 8
+    dtype = torch.bfloat16
+    activation = MoEActivation.SILU
+    set_random_seed(7)
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        w1_q, w2_q, quant_config = make_test_quant_config(
+            e,
+            n,
+            k,
+            in_dtype=dtype,
+            quant_dtype="nvfp4",
+            block_shape=None,
+            per_act_token_quant=False,
+            make_gate=True,
+        )
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        topk_weights, topk_ids, _ = fused_topk(a, score, topk, renormalize=False)
+        moe_config = FusedMoEConfig(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            num_local_experts=e,
+            num_logical_experts=e,
+            activation=activation,
+            device="cuda",
+            moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+            in_dtype=dtype,
+            routing_method=RoutingMethodType.TopK,
+            max_num_tokens=m,
+        )
+        kernel = FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=moe_config,
+                quant_config=quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            FlashInferExperts(moe_config=moe_config, quant_config=quant_config),
+        )
+
+        def run():
+            kernel.apply(
+                hidden_states=a,
+                w1=w1_q,
+                w2=w2_q,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=e,
+                expert_map=None,
+                apply_router_weight_on_input=False,
+            )
+
+        # The first call sizes the workspace manager, like the profile run.
+        run()
+        torch.accelerator.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        allocated_before = torch.accelerator.memory_allocated()
+        run()
+        per_call_bytes = torch.accelerator.max_memory_allocated() - allocated_before
+
+    scratch_bytes = cutlass_fused_moe_workspace_size(
+        m,
+        k,
+        n,
+        e,
+        topk,
+        x_dtype=torch.uint8,
+        weight_dtype=torch.long,
+        output_dtype=dtype,
+        activation_type=activation_to_flashinfer_type(activation),
+    )
+    assert per_call_bytes < scratch_bytes
 
 
 if __name__ == "__main__":

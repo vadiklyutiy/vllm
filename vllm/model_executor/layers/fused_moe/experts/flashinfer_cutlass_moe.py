@@ -29,8 +29,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_cutlass_fused_moe,
+    flashinfer_cutlass_fused_moe_workspace_size,
     has_flashinfer_cutlass_fused_moe,
 )
+from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
@@ -234,13 +236,59 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
           of each tuple must be the number of tokens.
         """
         workspace1 = (M, K)
-        workspace2 = (0,)
         # For NVFP4, the output is stored in a packed int8 format,
         # so the actual hidden dim is 2x the size of K here.
-        output_shape = (M, K * 2 if self.quant_dtype == "nvfp4" else K)
+        hidden_dim = K * 2 if self.quant_dtype == "nvfp4" else K
+        # FlashInfer's scratch lives in workspace2 so the workspace manager
+        # reserves it once instead of FlashInfer allocating it on every call.
+        scratch_bytes = flashinfer_cutlass_fused_moe_workspace_size(
+            M,
+            hidden_dim,
+            self.adjust_N_for_activation(N, activation),
+            local_num_experts * self.ep_size,
+            topk,
+            output_dtype=self.out_dtype,
+            activation_type=activation_to_flashinfer_type(activation),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            device=self.device,
+            **self._flashinfer_runner_kwargs(),
+        )
+        workspace2 = (cdiv(scratch_bytes, self.out_dtype.itemsize),)
+        output_shape = (M, hidden_dim)
         # The workspace is determined by `aq`, since it comes after any
         # potential communication op and is involved in the expert computation.
         return (workspace1, workspace2, output_shape)
+
+    def _flashinfer_runner_kwargs(self) -> dict[str, torch.dtype | bool]:
+        """FlashInfer runner selection matching the arguments passed by `apply`."""
+        x_dtype = weight_dtype = self.out_dtype
+        use_w4_group_scaling = use_mxfp8_act_scaling = False
+        if (
+            self.quant_dtype == torch.float8_e4m3fn
+            and not self.use_deepseek_fp8_block_scale
+        ):
+            x_dtype = weight_dtype = torch.float8_e4m3fn
+        elif self.quant_dtype == "nvfp4":
+            x_dtype, weight_dtype = torch.uint8, torch.long
+        elif self.weight_quant_dtype == "mxfp4":
+            if self.quant_dtype == "mxfp8":
+                x_dtype, weight_dtype = torch.float8_e4m3fn, torch.long
+                use_mxfp8_act_scaling = True
+            else:
+                weight_dtype = torch.uint8
+                use_w4_group_scaling = True
+        elif self.use_deepseek_fp8_block_scale:
+            weight_dtype = torch.float8_e4m3fn
+        return {
+            "x_dtype": x_dtype,
+            "weight_dtype": weight_dtype,
+            "use_deepseek_fp8_block_scale": self.use_deepseek_fp8_block_scale,
+            "use_w4_group_scaling": use_w4_group_scaling,
+            "use_mxfp8_act_scaling": use_mxfp8_act_scaling,
+        }
 
     def apply(
         self,
@@ -386,6 +434,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
+            workspace_buffer=(
+                workspace2.view(torch.uint8) if workspace2 is not None else None
+            ),
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

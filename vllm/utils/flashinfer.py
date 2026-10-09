@@ -266,6 +266,9 @@ flashinfer_trtllm_fp8_per_tensor_scale_moe = _lazy_import_wrapper(
 flashinfer_cutlass_fused_moe = _lazy_import_wrapper(
     "flashinfer.fused_moe", "cutlass_fused_moe"
 )
+flashinfer_cutlass_fused_moe_workspace_size = functools.lru_cache(maxsize=1024)(
+    _lazy_import_wrapper("flashinfer.fused_moe", "cutlass_fused_moe_workspace_size")
+)
 flashinfer_cutedsl_grouped_gemm_nt_masked = _lazy_import_wrapper(
     "flashinfer.cute_dsl.blockscaled_gemm", "grouped_gemm_nt_masked"
 )
@@ -1301,6 +1304,7 @@ __all__ = [
     "is_flashinfer_cutedsl_bf16_gemm_supported",
     "flashinfer_trtllm_fp8_block_scale_moe",
     "flashinfer_cutlass_fused_moe",
+    "flashinfer_cutlass_fused_moe_workspace_size",
     "flashinfer_cutedsl_grouped_gemm_nt_masked",
     "flashinfer_prepare_bf16_fp4_weights",
     "flashinfer_fp4_quantize",
