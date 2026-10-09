@@ -18,6 +18,7 @@ from unittest.mock import PropertyMock, patch
 import pytest
 
 from vllm.config import VllmConfig
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
@@ -483,6 +484,46 @@ def test_non_async_abort_defers_via_last_sched_seq():
     scheduler.update_from_output(out0, _make_model_runner_output(out0))
     assert not scheduler.deferred_frees
     assert pool.get_num_free_blocks() == num_free_initially
+
+
+def test_reset_running_requests_with_inflight_step():
+    """Resetting with reset_running_requests preempts the requests while a
+    step is in flight, so their blocks land in the deferred frees. No request
+    holds them anymore, so the reset must succeed instead of raising.
+    """
+    scheduler = create_scheduler(
+        model=MODEL, async_scheduling=True, enable_prefix_caching=True
+    )
+    scheduler.defer_block_free = True
+    pool = scheduler.kv_cache_manager.block_pool
+    num_free_initially = pool.get_num_free_blocks()
+
+    request, out0, out1 = _setup_request_with_inflight_step(scheduler)
+    num_free_running = pool.get_num_free_blocks()
+    assert pool.cached_block_hash_to_block
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert request.status == RequestStatus.PREEMPTED
+    assert not pool.cached_block_hash_to_block
+    # The reset does not return the blocks early.
+    assert len(scheduler.deferred_frees) == 1
+    assert pool.get_num_free_blocks() == num_free_running
+
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    assert not scheduler.deferred_frees
+    assert pool.get_num_free_blocks() == num_free_initially
+
+
+def test_reset_prefix_cache_blocked_by_block_shared_with_deferred_free():
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    pending_free_blocks = pool.get_new_blocks(2)
+    # A request still holds one of the deferred blocks.
+    pool.touch(pending_free_blocks[1:])
+    assert not pool.reset_prefix_cache(pending_free_blocks)
+
+    pool.free_blocks(pending_free_blocks[1:])
+    assert pool.reset_prefix_cache(pending_free_blocks)
 
 
 def test_cow_retentions_deferred_until_copy_step_processed():

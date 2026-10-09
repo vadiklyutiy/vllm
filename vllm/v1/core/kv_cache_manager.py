@@ -671,17 +671,23 @@ class KVCacheManager:
         """
         self.block_pool.evict_blocks(block_ids)
 
-    def reset_prefix_cache(self) -> bool:
+    def reset_prefix_cache(
+        self, pending_free_blocks: Sequence[KVCacheBlock] = ()
+    ) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,
         or used for resetting prefix caching status for benchmarking.
+
+        Args:
+            pending_free_blocks: Blocks whose return to the pool is deferred.
+                See `BlockPool.reset_prefix_cache`.
 
         Returns:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
 
         """
-        if not self.coordinator.reset_prefix_cache():
+        if not self.coordinator.reset_prefix_cache(pending_free_blocks):
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None

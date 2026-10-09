@@ -1363,6 +1363,78 @@ def test_request_preemption(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_reset_running_requests_resumes_with_load(
+    request_runner, async_scheduling: bool
+):
+    """reset_prefix_cache(reset_running_requests=True) preempts outside of
+    schedule(), so the next step both reports the request as preempted and
+    resumes it with a load from the CPU.
+    """
+    block_size = 4
+    blocks_per_chunk = 3
+    tokens_per_chunk = block_size * blocks_per_chunk
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        blocks_per_chunk=blocks_per_chunk,
+    )
+
+    # 2 blocks, store all
+    # blocks = [0, 1, 2], [3, 4, 5]
+    runner.new_request(token_ids=[0] * tokens_per_chunk * 2)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+    runner.run(decoded_tokens=[0], expected_stored=(0, 1, 2, 3, 4, 5))
+
+    assert runner.scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 2
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(0, 1, 2, 3, 4, 5),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_reset_running_requests_during_load(request_runner, async_scheduling: bool):
+    """A request loading from the CPU holds its blocks, so the reset reports
+    failure (the caller may retry) instead of raising.
+    """
+    block_size = 4
+    blocks_per_chunk = 3
+    tokens_per_chunk = block_size * blocks_per_chunk
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        blocks_per_chunk=blocks_per_chunk,
+    )
+
+    token_ids = [0] * tokens_per_chunk * 2
+    runner.new_request(token_ids=token_ids)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2, 3, 4, 5))
+    assert runner.scheduler.reset_prefix_cache()
+
+    runner.new_request(token_ids=token_ids)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 2
+    runner.run(decoded_tokens=[], complete_transfers=False)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert not runner.scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2, 3, 4, 5))
+    assert runner.scheduler.reset_prefix_cache(reset_running_requests=True)
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_on_request_finished_not_deferred_until_store_completion(
     request_runner, async_scheduling: bool
 ):

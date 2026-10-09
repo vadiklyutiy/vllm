@@ -1859,7 +1859,10 @@ class OffloadingConnectorScheduler:
             if req_status is None or not req_status.transfer_jobs:
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
-            assert self._jobs[any_jid].is_store
+            if not self._jobs[any_jid].is_store:
+                # Preempted outside schedule() (reset_prefix_cache) and resumed
+                # in this step. A load is only issued with no other job pending.
+                continue
             self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
 
         # Flush jobs that contain re-allocated blocks.

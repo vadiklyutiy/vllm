@@ -2861,14 +2861,11 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
-        reset_successful = self.kv_cache_manager.reset_prefix_cache()
-        if reset_running_requests and not reset_successful:
-            raise RuntimeError(
-                "Failed to reset KV cache even when all the running requests are "
-                "preempted and moved to the waiting queue. This is likely due to "
-                "the presence of running requests waiting for remote KV transfer, "
-                "which is not supported yet."
-            )
+        # Deferred frees (e.g. of the requests preempted above while a step is
+        # in flight) keep blocks out of the pool, but no request holds them.
+        reset_successful = self.kv_cache_manager.reset_prefix_cache(
+            [block for _, blocks in self.deferred_frees for block in blocks]
+        )
 
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
