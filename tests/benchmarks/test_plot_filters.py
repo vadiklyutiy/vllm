@@ -79,6 +79,25 @@ class TestPlotFilters:
         assert len(result) == 3
 
     @pytest.mark.parametrize(
+        "param_values,filter_str,expected_values",
+        [
+            ([True, False], "param==true", [10]),
+            ([True, False], "param==false", [20]),
+            ([True, False], "param==True", [10]),
+            ([True, False], "param!=true", [20]),
+            ([True, False], "param!=false", [10]),
+            ([True, None], "param==true", [10]),
+            (["true", "false"], "param==true", [10]),
+            (["true", "false"], "param!=true", [20]),
+        ],
+    )
+    def test_equality_bool(self, param_values, filter_str, expected_values):
+        """Test that `true`/`false` match JSON booleans and string labels."""
+        df = pd.DataFrame({"param": param_values, "value": [10, 20]})
+        result = PlotFilters.parse_str(filter_str).apply(df)
+        assert result["value"].tolist() == expected_values
+
+    @pytest.mark.parametrize(
         "target,expected_count",
         [
             ("10.0", 2),  # 1.0, 5.0

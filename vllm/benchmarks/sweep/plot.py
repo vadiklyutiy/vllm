@@ -42,6 +42,22 @@ class PlotFilterBase(ABC):
                 f"Valid operators are: {sorted(PLOT_FILTERS)}",
             )
 
+    def _parse_target(self, col: "pd.Series") -> float | bool | str:
+        try:
+            return float(self.target)
+        except ValueError:
+            pass
+
+        import pandas as pd
+
+        target = self.target.lower()
+        if target in ("true", "false") and (
+            pd.api.types.infer_dtype(col, skipna=True) == "boolean"
+        ):
+            return target == "true"
+
+        return self.target
+
     @abstractmethod
     def apply(self, df: "pd.DataFrame") -> "pd.DataFrame":
         """Applies this filter to a DataFrame."""
@@ -52,26 +68,16 @@ class PlotFilterBase(ABC):
 class PlotEqualTo(PlotFilterBase):
     @override
     def apply(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        target: float | str
-        try:
-            target = float(self.target)
-        except ValueError:
-            target = self.target
-
-        return df[df[self.var] == target]
+        col = df[self.var]
+        return df[col == self._parse_target(col)]
 
 
 @dataclass
 class PlotNotEqualTo(PlotFilterBase):
     @override
     def apply(self, df: "pd.DataFrame") -> "pd.DataFrame":
-        target: float | str
-        try:
-            target = float(self.target)
-        except ValueError:
-            target = self.target
-
-        return df[df[self.var] != target]
+        col = df[self.var]
+        return df[col != self._parse_target(col)]
 
 
 @dataclass
