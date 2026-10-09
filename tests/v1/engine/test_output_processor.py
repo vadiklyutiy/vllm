@@ -334,6 +334,47 @@ def test_request_stream_interval_raises_but_not_below_engine_default(
     assert not output_processor.has_unfinished_requests()
 
 
+def test_stream_interval_batches_cumulative_outputs():
+    """CUMULATIVE outputs follow stream_interval like DELTA: sent on the first
+    token, then once per stream_interval tokens, then on finish."""
+    output_processor = OutputProcessor(None, log_stats=False, stream_interval=4)
+    generated = list(range(100, 110))
+    output_processor.add_request(
+        EngineCoreRequest(
+            request_id="request-0-int",
+            external_req_id="request-0",
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            sampling_params=SamplingParams(
+                detokenize=False, output_kind=RequestOutputKind.CUMULATIVE
+            ),
+            pooling_params=None,
+        ),
+        prompt=None,
+    )
+
+    sent_token_ids = []
+    for idx, token_id in enumerate(generated):
+        finish_reason = FinishReason.LENGTH if idx == len(generated) - 1 else None
+        processed = output_processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="request-0-int",
+                    new_token_ids=[token_id],
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
+        for request_output in processed.request_outputs:
+            sent_token_ids.append(list(request_output.outputs[0].token_ids))
+
+    assert sent_token_ids == [generated[:end] for end in (1, 5, 9, 10)]
+
+
 def _validate_logprobs(
     gen_tokens: dict[str, list[int]],
     gen_logprobs: dict[str, SampleLogprobs | None],
