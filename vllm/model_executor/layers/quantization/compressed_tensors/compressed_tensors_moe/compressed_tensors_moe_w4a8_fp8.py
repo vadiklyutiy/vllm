@@ -66,10 +66,12 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
-        # requirement for CUTLASS reorder_tensor
-        assert hidden_size % 256 == 0, f"{hidden_size=} must be divisible by 256"
-        assert intermediate_size_per_partition % 256 == 0, (
-            f"{intermediate_size_per_partition=} must be divisible by 256"
+        assert hidden_size % self.group_size == 0, (
+            f"{hidden_size=} must be divisible by group size {self.group_size}"
+        )
+        assert intermediate_size_per_partition % self.group_size == 0, (
+            f"{intermediate_size_per_partition=} must be divisible by "
+            f"group size {self.group_size}"
         )
         # storage type, pack 8xint4 into int32
         params_dtype = torch.int32

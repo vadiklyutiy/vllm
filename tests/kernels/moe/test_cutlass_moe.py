@@ -40,6 +40,10 @@ from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
 )
 from vllm.model_executor.layers.fused_moe.oracle import nvfp4 as nvfp4_oracle
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8DynamicTokenSym,
+    kInt4Static,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -132,6 +136,30 @@ def test_nvfp4_clamp_allows_shared_activation_backends(
     )
 
     assert selected == expected
+
+
+@pytest.mark.parametrize(
+    ("hidden_dim", "intermediate_size"), [(2560, 640), (2880, 512)]
+)
+def test_cutlass_w4a8_rejects_shapes_not_divisible_by_256(
+    hidden_dim: int, intermediate_size: int
+):
+    """The W4A8 oracle must skip CUTLASS for shapes its weight reorder cannot
+    handle, so that another backend is picked instead."""
+    moe_config = make_dummy_moe_config(
+        hidden_dim=hidden_dim, intermediate_size=intermediate_size
+    )
+
+    supported, reason = CutlassExpertsW4A8Fp8.is_supported_config(
+        CutlassExpertsW4A8Fp8,
+        moe_config,
+        kInt4Static,
+        kFp8DynamicTokenSym,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+
+    assert not supported
+    assert reason is not None and "divisible by 256" in reason
 
 
 @pytest.mark.skipif(
