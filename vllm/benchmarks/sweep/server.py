@@ -4,6 +4,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import threading
 import time
 from types import TracebackType
 
@@ -95,28 +96,33 @@ class ServerProcess:
 
         return f"http://{host}:{port}"
 
-    def is_server_ready(self) -> bool:
+    def is_server_ready(self, timeout: float | None = None) -> bool:
         server_address = self._get_vllm_server_address()
         try:
-            response = requests.get(f"{server_address}/health")
+            response = requests.get(f"{server_address}/health", timeout=timeout)
             return response.status_code == 200
         except requests.RequestException:
             return False
 
     def wait_until_ready(self, timeout: int) -> None:
-        start_time = time.monotonic()
-        while not self.is_server_ready():
+        # Larger socket timeouts overflow
+        deadline = time.monotonic() + min(timeout, threading.TIMEOUT_MAX)
+        while not (
+            (remaining := deadline - time.monotonic()) > 0
+            and self.is_server_ready(timeout=remaining)
+            and time.monotonic() <= deadline
+        ):
             # Check if server process has crashed
             if self._server_process.poll() is not None:
                 returncode = self._server_process.returncode
                 raise RuntimeError(
                     f"Server process crashed with return code {returncode}"
                 )
-            if time.monotonic() - start_time > timeout:
+            if (remaining := deadline - time.monotonic()) <= 0:
                 raise TimeoutError(
                     f"Server failed to become ready within {timeout} seconds."
                 )
-            time.sleep(1)
+            time.sleep(min(1, remaining))
 
     def reset_caches(self) -> None:
         server_cmd = self.server_cmd
