@@ -310,9 +310,14 @@ def _try_load_aot_compiled_fn(
             if not ds_config.evaluate_guards:
                 loaded_fn.disable_guard_check()
             # Eagerly load compiled artifacts now that traced_files
-            # is populated by _verify_source_unchanged.
-            with maybe_use_cudagraph_partition_wrapper(model.vllm_config):
-                loaded_fn._artifacts.compiled_fn.finalize_loading(model.vllm_config)
+            # is populated by _verify_source_unchanged. Artifacts from
+            # stock torch backends are already loaded.
+            finalize_loading = getattr(
+                loaded_fn._artifacts.compiled_fn, "finalize_loading", None
+            )
+            if finalize_loading is not None:
+                with maybe_use_cudagraph_partition_wrapper(model.vllm_config):
+                    finalize_loading(model.vllm_config)
             compilation_counter.num_aot_artifacts_loaded += 1
             tag = getattr(model, "_compile_tag", "")
             log_prefix = f"[{tag}] " if tag else ""

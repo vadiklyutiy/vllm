@@ -192,6 +192,44 @@ def test_save_and_load(monkeypatch: pytest.MonkeyPatch):
             assert torch.allclose(ret, expected)
 
 
+@pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")
+def test_save_and_load_dynamo_trace_once(
+    monkeypatch: pytest.MonkeyPatch, vllm_tmp_cache: Path
+):
+    """DYNAMO_TRACE_ONCE saves a stock torch artifact, not a
+    VllmSerializableFunction; loading it must still succeed."""
+    args = (torch.randn(10, 10),)
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
+    disable_envs_cache()
+
+    def make_config() -> VllmConfig:
+        return VllmConfig(
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.DYNAMO_TRACE_ONCE,
+                backend="inductor",
+            )
+        )
+
+    vllm_config = make_config()
+    with (
+        use_vllm_config(vllm_config),
+        compilation_counter.expect(num_aot_compiles=1, num_aot_artifacts_saved=1),
+    ):
+        expected = CompiledMod(vllm_config=vllm_config)(*args)
+
+    monkeypatch.setenv("VLLM_FORCE_AOT_LOAD", "1")
+    disable_envs_cache()
+    vllm_config = make_config()
+    with (
+        use_vllm_config(vllm_config),
+        compilation_counter.expect(num_aot_compiles=0, num_aot_artifacts_loaded=1),
+    ):
+        cached_mod = CompiledMod(vllm_config=vllm_config)
+        ret = cached_mod(*args)
+    assert cached_mod.was_aot_compile_fn_loaded_from_disk
+    assert torch.allclose(ret, expected)
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda() or not is_torch_equal_or_newer("2.10.0"),
     reason="requires CUDA and torch 2.10",
