@@ -140,6 +140,35 @@ def create_edit_list_trimmed_video(
     return buf.getvalue(), num_frames - trim_start_frame
 
 
+def create_piped_video(src: bytes, container_format: str) -> bytes:
+    """Remux the video in ``src`` into ``container_format`` through a
+    non-seekable sink, like ``ffmpeg ... -f <format> pipe:1``: the muxer cannot
+    go back to write a frame count or duration (``"h264"`` is a raw stream that
+    never has one).
+    """
+    import io
+
+    import av
+
+    class PipeSink(io.BytesIO):
+        def seekable(self):
+            return False
+
+    sink = PipeSink()
+    with (
+        av.open(io.BytesIO(src)) as source,
+        av.open(sink, mode="w", format=container_format) as out,
+    ):
+        in_stream = source.streams.video[0]
+        out_stream = out.add_stream_from_template(in_stream)
+        for packet in source.demux(in_stream):
+            if packet.dts is None:
+                continue
+            packet.stream = out_stream
+            out.mux(packet)
+    return sink.getvalue()
+
+
 def cosine_similarity(A: npt.NDArray, B: npt.NDArray, axis: int = -1) -> npt.NDArray:
     """Compute cosine similarity between two vectors."""
     return np.sum(A * B, axis=axis) / (

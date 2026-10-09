@@ -47,6 +47,7 @@ from vllm.transformers_utils.processor import get_video_processor_cls_name_from_
 from .utils import (
     create_edit_list_trimmed_video,
     create_long_gop_video,
+    create_piped_video,
     create_video_from_image,
 )
 
@@ -920,6 +921,48 @@ def test_video_backend_handles_edit_list_trimmed_video(
         qwen_frames, qwen_metadata = Qwen2VLVideoBackend.load_bytes(video_data)
         assert qwen_metadata["total_num_frames"] == num_visible
         assert qwen_frames.shape[0] >= 4
+
+
+@pytest.mark.parametrize("container_format", ["h264", "matroska"])
+def test_video_backend_handles_stream_without_frame_count(container_format: str):
+    """Raw H.264 and Matroska/WebM written to a pipe carry neither a frame
+    count nor a duration, so OpenCV reports a huge negative frame count. The
+    loader used to return a single frame with that count, and the Qwen
+    samplers raised on it; it must count the frames by decoding instead.
+    """
+    num_frames = 20
+    video_data = create_piped_video(
+        create_long_gop_video(num_frames=num_frames, fps=10), container_format
+    )
+
+    loader = VIDEO_LOADER_REGISTRY.load("opencv")
+    frames, metadata = loader.load_bytes(video_data, num_frames=-1, backend="opencv")
+    assert metadata["total_num_frames"] == num_frames
+    assert metadata["duration"] > 0
+    assert frames.shape[0] == num_frames
+    # The green channel encodes the source frame index.
+    mean_green = frames[..., 1].reshape(num_frames, -1).mean(axis=1)
+    assert mean_green[0] <= 5
+    assert abs(mean_green[-1] - (num_frames - 1)) <= 5
+
+    for qwen_loader in (Qwen2VLVideoBackend, Qwen3VLVideoBackend):
+        qwen_frames, qwen_metadata = qwen_loader.load_bytes(video_data)
+        assert qwen_metadata["total_num_frames"] == num_frames, qwen_loader
+        assert qwen_frames.shape[0] >= 4, qwen_loader
+
+
+def test_video_backend_counts_past_broken_frame_without_frame_count():
+    """A broken frame must not end the frame count of a stream without one:
+    the frames after it are still sampled, as for the same packets in mp4.
+    """
+    mp4_data = (ASSETS_DIR / "corrupted.mp4").read_bytes()
+    piped_data = create_piped_video(mp4_data, "matroska")
+
+    loader = VIDEO_LOADER_REGISTRY.load("opencv")
+    _, mp4_metadata = loader.load_bytes(mp4_data, backend="opencv")
+    _, piped_metadata = loader.load_bytes(piped_data, backend="opencv")
+    assert piped_metadata["total_num_frames"] == mp4_metadata["total_num_frames"]
+    assert piped_metadata["frames_indices"] == mp4_metadata["frames_indices"]
 
 
 # ============================================================================

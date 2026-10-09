@@ -39,6 +39,9 @@ def decode_opencv(
         int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
     )
     source = loader_cls._prepare_source(OpenCVVideoBackendMixin.get_video_metadata(cap))
+    if cap.get(cv2.CAP_PROP_POS_FRAMES) > 0:
+        # get_video_metadata counted the frames by decoding to the end.
+        cap = OpenCVVideoBackendMixin.open_video_capture(data)
     frame_idx = loader_cls.compute_frames_index_to_sample(
         source=source, target=target, **sampling_kwargs
     )
@@ -99,6 +102,22 @@ class OpenCVVideoBackendMixin:
                     visible_frames,
                 )
                 total_frames_num = visible_frames
+        # Without a frame count in the container, the FFMPEG backend derives
+        # CAP_PROP_FRAME_COUNT from the duration. Streams lacking both (e.g.
+        # WebM/MKV written to a pipe, raw H.264) get a huge negative count,
+        # so count the frames by decoding instead. A broken frame fails grab()
+        # too but still takes an index when the frames are read, so only a
+        # run of failed grabs marks the end; past the end they fail at once.
+        # This leaves `cap` at the end of a stream that may not be seekable
+        # back to the start.
+        if total_frames_num <= 0:
+            total_frames_num = failed_grabs = 0
+            while failed_grabs < 16:
+                if cap.grab():
+                    total_frames_num += failed_grabs + 1
+                    failed_grabs = 0
+                else:
+                    failed_grabs += 1
         duration = total_frames_num / original_fps if original_fps > 0 else 0
         return VideoSourceMetadata(
             total_frames_num=total_frames_num,
