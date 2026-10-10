@@ -195,6 +195,13 @@ class NoulQuestion(QuestionType):
     def reply_line(self, label: str, option: Option) -> str | None:
         return f"{label}: {option.description}" if option.description else None
 
+    def prompt(self, question: Question) -> str:
+        if any(map(self.reply_line, question.labels, question.options)):
+            return super().prompt(question)
+        # Without the labels in the prompt, models reply "Yes" or "No" instead.
+        lines = [f"Question: {question.instructions}"] if question.instructions else []
+        return "\n".join([*lines, *question.labels, self.reply_instruction])
+
     def answer(
         self, question: Question, probs: list[float], label_mass: float
     ) -> dict[str, Any]:

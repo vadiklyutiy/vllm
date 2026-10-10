@@ -116,6 +116,20 @@ def test_noul_labels_and_prompt():
     )
 
 
+@pytest.mark.parametrize(
+    "criteria,lines",
+    [
+        (None, "yes\nno\n"),
+        ({"false": "later"}, "no: later\n"),
+    ],
+)
+def test_noul_prompt_lists_bare_labels_only_when_none_is_described(criteria, lines):
+    q = noul(criteria=criteria)
+    assert q.type.prompt(q) == (
+        f"Question: Reply within the hour?\n{lines}Answer with yes or no only."
+    )
+
+
 def test_noul_answer_shape():
     q = noul()
     answer = q.type.answer(q, [0.8, 0.2], 0.5)
