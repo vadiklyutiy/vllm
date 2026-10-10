@@ -1655,13 +1655,15 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         """
         # Current streaming input behaviour: Keep only computed output tokens
-        # (discard final sampled output token).
-        num_computed_tokens = session.num_computed_tokens
+        # (discard final sampled output token). A session released by
+        # reset_prefix_cache has no computed tokens; _release_session_kv
+        # already discarded it.
+        num_kept_tokens = session.num_computed_tokens or session.num_tokens
         kept_output_tokens = session._all_token_ids[
-            session.num_prompt_tokens : num_computed_tokens
+            session.num_prompt_tokens : num_kept_tokens
         ]
-        del session._all_token_ids[num_computed_tokens:]
-        del session.block_hashes[num_computed_tokens // self.hash_block_size :]
+        del session._all_token_ids[num_kept_tokens:]
+        del session.block_hashes[num_kept_tokens // self.hash_block_size :]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -1689,6 +1691,25 @@ class Scheduler(SchedulerInterface):
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _release_session_kv(self, session: Request) -> None:
+        """Free the KV blocks of a session waiting between input chunks.
+
+        The session recomputes its tokens when it is scheduled again.
+        """
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            # Discard the final sampled output token now, while the number of
+            # computed tokens still tells it apart (see
+            # _update_request_as_session).
+            num_computed_tokens = session.num_computed_tokens
+            del session._output_token_ids[
+                num_computed_tokens - session.num_prompt_tokens :
+            ]
+            del session._all_token_ids[num_computed_tokens:]
+            del session.block_hashes[num_computed_tokens // self.hash_block_size :]
+        self._free_request_blocks(session)
+        session.num_computed_tokens = 0
+        self.reset_preempted_req_ids.add(session.request_id)
 
     def _make_cached_request_data(
         self,
@@ -2444,8 +2465,8 @@ class Scheduler(SchedulerInterface):
     def _holds_kv_blocks(request: Request) -> bool:
         # Whether a request currently has kv blocks allocated.
         # While always the case when status is WAITING_FOR_REMOTE_KVS
-        # or WAITING_FOR_STREAMING_REQ, there are such cases where it's
-        # WAITING or PREEMPTED.
+        # or WAITING_FOR_STREAMING_REQ (unless reset_prefix_cache released
+        # the session), there are such cases where it's WAITING or PREEMPTED.
         return (
             request.num_computed_tokens > 0
             # num_computed_tokens is reset to 0 if kv transfer fails for requests in
@@ -2804,8 +2825,12 @@ class Scheduler(SchedulerInterface):
             return 0
         num_running, num_waiting = self.get_request_counts()
         if self._pause_state == PauseState.PAUSED_NEW:
-            # Requests holding KV blocks still drain; queued ones stay queued.
-            num_waiting = len(self.kv_holding_waiting)
+            # Requests holding KV blocks still drain; queued ones stay queued,
+            # as do sessions waiting for input.
+            return num_running + sum(
+                request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+                for request in self.kv_holding_waiting
+            )
         num_waiting -= self.num_waiting_for_streaming_input
         return num_waiting + num_running
 
@@ -2842,11 +2867,27 @@ class Scheduler(SchedulerInterface):
         """Reset the KV prefix cache.
 
         If reset_running_requests is True, all the running requests will be
-        preempted and moved to the waiting queue.
+        preempted and moved to the waiting queue. Streaming-input sessions
+        waiting between input chunks also release their KV blocks and recompute
+        them on their next turn.
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
         if reset_running_requests:
+            # Streaming sessions between input chunks hold KV blocks outside of
+            # the running queue. Release them first, so that the preempted
+            # running requests are queued ahead of them.
+            sessions = [
+                request
+                for request in self.kv_holding_waiting
+                if request.resumable
+                and request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+            ]
+            self.kv_holding_waiting.remove_requests(sessions)
+            for session in sessions:
+                self._release_session_kv(session)
+            self.waiting.prepend_requests(reversed(sessions))
+
             # For logging.
             timestamp = time.monotonic()
             # Invalidate all the current running requests KV's by pushing them to

@@ -2664,6 +2664,83 @@ def test_pause_new_ignores_streaming_session_waiting_for_input():
 
 
 @pytest.mark.parametrize(
+    "chunk_queued", [False, True], ids=["waiting-for-input", "chunk-queued"]
+)
+def test_reset_prefix_cache_releases_streaming_session(chunk_queued: bool):
+    """A session between input chunks holds KV blocks outside of the running
+    queue. A reset with reset_running_requests must release them, as
+    pause_generation(mode="keep", clear_cache=True) relies on, while the session
+    keeps its tokens and recomputes them."""
+    stop_token = 7
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    session, chunk = create_requests(
+        num_requests=2, num_tokens=4, stop_token_ids=[stop_token], req_ids=["s", "s"]
+    )
+    session.resumable = chunk.resumable = True
+    scheduler.add_request(session)
+    for sampled in (5, stop_token):
+        output = scheduler.schedule()
+        if sampled == stop_token and chunk_queued:
+            scheduler.add_request(chunk)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=["s"], req_id_to_index={"s": 0}, sampled_token_ids=[[sampled]]
+            ),
+        )
+    assert session in scheduler.kv_holding_waiting
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert list(scheduler.waiting) == [session]
+    assert not scheduler.kv_holding_waiting
+    assert session.num_computed_tokens == 0
+    assert not scheduler.kv_cache_manager.get_block_ids("s")[0]
+
+    if not chunk_queued:
+        assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.add_request(chunk)
+    # The computed output token is kept; the final sampled one is discarded.
+    expected_tokens = [0, 0, 0, 0, 5, 1, 1, 1, 1]
+    assert session.prompt_token_ids == expected_tokens
+    assert list(session.all_token_ids) == expected_tokens
+    output = scheduler.schedule()
+    assert output.preempted_req_ids == {"s"}
+    assert output.num_scheduled_tokens == {"s": len(expected_tokens)}
+
+
+def test_pause_new_waits_for_running_request_after_session_release():
+    """A session released by a reset still waits for input but no longer holds
+    KV blocks. It must stay behind the preempted running request and must not
+    hide that request from a later PAUSED_NEW (pause mode="wait") drain."""
+    stop_token = 7
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    session, request = create_requests(
+        num_requests=2, num_tokens=4, stop_token_ids=[stop_token], req_ids=["s", "r"]
+    )
+    session.resumable = True
+    scheduler.add_request(session)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["s", "r"],
+            req_id_to_index={"s": 0, "r": 1},
+            sampled_token_ids=[[stop_token], [5]],
+        ),
+    )
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert list(scheduler.waiting) == [request, session]
+    output = scheduler.schedule()
+    assert list(output.num_scheduled_tokens) == ["r"]
+
+    scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    assert scheduler.get_num_unfinished_requests() == 1
+
+
+@pytest.mark.parametrize(
     ("load_modes", "expected_has_sync_loads"),
     [
         ((True,), False),
