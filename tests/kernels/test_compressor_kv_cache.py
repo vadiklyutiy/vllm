@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.config import CUDAGraphMode
 from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
@@ -28,7 +29,11 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _launch_two_stage_sparse_attn_compressor,
     compress_norm_rope_store_triton,
 )
-from vllm.models.deepseek_v4.compressor import _get_c128_boundary
+from vllm.models.deepseek_v4.compressor import (
+    CompressorMetadata,
+    DeepseekCompressor,
+    _get_c128_boundary,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -1203,6 +1208,89 @@ def test_get_c128_boundary(starts, query_start_loc, expected):
         query_start_loc_cpu=query_start_loc_tensor,
     )
     assert _get_c128_boundary(metadata) is expected
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.parametrize(
+    "runtime_mode",
+    # PIECEWISE: breakable graph; NONE: the V2 runner's FULL graph capture.
+    [CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE],
+)
+@pytest.mark.parametrize("capture", [False, True])
+def test_c128_compressor_store_survives_graph_capture(
+    monkeypatch, runtime_mode, capture
+):
+    """The no-boundary C128 skip may only apply eagerly.
+
+    CUDA graphs are captured on dummy batches with no 128-token boundary; a
+    skip recorded there drops every compressed-KV store on replay (#60905).
+    """
+    pytest.importorskip("cutlass")
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    num_stores = torch.zeros(1, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.compressor._SAVE_PARTIAL_STATES_KERNEL",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl."
+        "_SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL",
+        lambda **kwargs: num_stores.add_(1),
+    )
+    state_metadata = CompressorMetadata(
+        block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        block_size=8,
+        c128_boundary=False,
+    )
+    forward_context = ForwardContext(
+        {},
+        {"state_cache": state_metadata, "attn": None},
+        {},
+        cudagraph_runtime_mode=runtime_mode,
+    )
+    compressor = SimpleNamespace(
+        coff=1,
+        head_dim=512,
+        compress_ratio=128,
+        ape=None,
+        state_cache=SimpleNamespace(
+            prefix="state_cache",
+            kv_cache=torch.zeros(1, 8, 2 * 512, device="cuda"),
+        ),
+        k_cache_prefix="attn",
+        _static_forward_context={
+            "attn": SimpleNamespace(
+                kv_cache=torch.zeros(1, dtype=torch.uint8, device="cuda")
+            )
+        },
+        norm=SimpleNamespace(weight=None),
+        rms_norm_eps=1e-6,
+        rope_head_dim=64,
+        overlap=False,
+        use_fp4_cache=False,
+        _quant_block=64,
+        _token_stride=576,
+        _scale_dim=8,
+    )
+    kv_score = torch.zeros(1, 2 * 512, device="cuda")
+    positions = torch.zeros(1, dtype=torch.int64, device="cuda")
+    rotary_emb = SimpleNamespace(cos_sin_cache=None)
+
+    def forward() -> None:
+        with override_forward_context(forward_context):
+            DeepseekCompressor.forward(compressor, kv_score, positions, rotary_emb)
+
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+        graph.replay()
+    else:
+        forward()
+
+    assert num_stores.item() == int(capture)
 
 
 # ── Test A: DeepseekV4 Attention path ──────────────────────────────────────────────
