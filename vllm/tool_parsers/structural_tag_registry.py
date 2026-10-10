@@ -350,6 +350,7 @@ def _hermes_tool_tags(
     tools: list[FunctionToolParam],
     start_tag: str,
     end_tag: str,
+    newline_after_call: bool = False,
 ) -> list[TagFormat]:
     arguments_field_prefix = '", "arguments": '
     formats = [
@@ -367,7 +368,7 @@ def _hermes_tool_tags(
             content=JSONSchemaFormat(
                 json_schema=get_function_parameters(tool.function)
             ),
-            end=end,
+            end=[end, end + "\n"] if newline_after_call else end,
         )
         for tool in tools
         for begin, end in formats
@@ -380,7 +381,10 @@ def _hermes_style_structural_tag(
     start_tag: str,
     end_tag: str,
 ) -> StructuralTag:
-    tags = _hermes_tool_tags(tools, start_tag, end_tag)
+    # Hermes templates join parallel calls with "\n", LongCat's with nothing.
+    tags = _hermes_tool_tags(
+        tools, start_tag, end_tag, newline_after_call=tool_choice == "required"
+    )
     if tool_choice == "auto":
         suffix_tag = (
             TriggeredTagsFormat(triggers=[start_tag], tags=tags)

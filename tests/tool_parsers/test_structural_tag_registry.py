@@ -419,6 +419,37 @@ def test_hermes_required_tool_calls_use_empty_separator():
     assert tag.format.separator == ""
 
 
+@pytest.mark.parametrize(
+    "model,start_tag,end_tag",
+    [
+        ("hermes", "<tool_call>", "</tool_call>"),
+        ("longcat", "<longcat_tool_call>", "</longcat_tool_call>"),
+    ],
+)
+@pytest.mark.parametrize("separator", ["\n", ""])
+def test_hermes_style_required_accepts_template_call_separators(
+    sample_tools: list[ChatCompletionToolsParam],
+    model: str,
+    start_tag: str,
+    end_tag: str,
+    separator: str,
+):
+    """Hermes templates join parallel calls with "\\n", LongCat's with nothing."""
+    tag = get_model_structural_tag(
+        model=model, tools=sample_tools, tool_choice="required", reasoning=False
+    )
+    paris, tokyo = (
+        f'{start_tag}\n{{"name": "get_weather", "arguments": {{"city": "{city}"}}}}'
+        f"\n{end_tag}"
+        for city in ("Paris", "Tokyo")
+    )
+
+    assert tag is not None
+    grammar = Grammar.from_structural_tag(json.dumps(tag.model_dump()))
+    assert _is_grammar_accept_string(grammar, paris + separator + tokyo)
+    assert not _is_grammar_accept_string(grammar, paris + separator + "text")
+
+
 def _plamo3_call(name: str, arguments: str) -> str:
     return (
         BEGIN_TOOL_REQUEST
