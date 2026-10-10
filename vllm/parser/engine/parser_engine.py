@@ -794,6 +794,7 @@ class ParserEngine(Parser):
 
         carried_deferred = self._deferred_content
         seen_tool_event = False
+        seen_before_call = False
         suppress = self._suppress_tool_calls
         for event in events:
             match event.type:
@@ -808,8 +809,20 @@ class ParserEngine(Parser):
                     self._reasoning_ended = True
                 case EventType.TOOL_CALL_START:
                     if not suppress:
+                        idx = event.tool_index
+                        if idx < len(self._tool_slots):
+                            # Reopened before its name ended: the earlier
+                            # opener and the name read so far become text.
+                            seen_tool_event = seen_before_call
+                            text = event.value + self._tool_slots[idx].name
+                            self._tool_slots[idx] = ToolCallSlot()
+                            if seen_tool_event:
+                                self._deferred_content += text
+                            else:
+                                content_parts.append(text)
+                        seen_before_call = seen_tool_event
                         seen_tool_event = True
-                        self._ensure_slot(event.tool_index)
+                        self._ensure_slot(idx)
                 case EventType.TOOL_NAME:
                     if not suppress:
                         seen_tool_event = True

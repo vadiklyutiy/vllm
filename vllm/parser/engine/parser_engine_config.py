@@ -40,6 +40,10 @@ class Transition:
     next_state: ParserState
     events: tuple[EventType, ...] = field(default_factory=tuple)
     skip_in_token_id_mode: bool = False
+    # For a TOOL_NAME transition on the call's own opener: TOOL_CALL_START
+    # restarts the open call instead of opening a new one. The call keeps its
+    # index, and the earlier opener and the name read so far become content.
+    reopen_tool_call: bool = False
 
 
 @dataclass(frozen=True)

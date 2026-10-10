@@ -187,6 +187,17 @@ class TestGlm47ExtractToolCalls:
         r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
         assert r.content is None
 
+    def test_stray_tool_call_tag_in_content(self, glm47_tool_parser, mock_request):
+        """A <tool_call> in prose must not swallow the text or the real call."""
+        out = (
+            "I will issue a <tool_call> for it.\n"
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        )
+        r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
+        assert [tc.function.name for tc in r.tool_calls] == ["get_weather"]
+        assert json.loads(r.tool_calls[0].function.arguments) == {"city": "Beijing"}
+        assert r.content == "I will issue a <tool_call> for it."
+
 
 def _reset(parser):
     parser.current_tool_name_sent = False
@@ -266,3 +277,53 @@ class TestGlm47Streaming:
         ]
         args = json.loads("".join(arguments))
         assert args["city"] == "Beijing"
+
+    def test_stray_tool_call_tag_in_content(self, glm47_tool_parser, mock_request):
+        """The real call after a <tool_call> in prose keeps index 0."""
+        _reset(glm47_tool_parser)
+        chunks = [
+            "I will issue a ",
+            "<tool_call>",
+            " for it.\n",
+            "<tool_call>",
+            "get_weather",
+            "<arg_key>city</arg_key>",
+            "<arg_value>",
+            "Beijing",
+            "</arg_value>",
+            "</tool_call>",
+        ]
+        current_text = ""
+        deltas = []
+        for chunk in chunks:
+            current_text += chunk
+            delta = glm47_tool_parser.extract_tool_calls_streaming(
+                previous_text="",
+                current_text=current_text,
+                delta_text=chunk,
+                previous_token_ids=[],
+                current_token_ids=[],
+                delta_token_ids=[],
+                request=mock_request,
+            )
+            if delta:
+                deltas.append(delta)
+        tool_calls = [
+            tool_call for delta in deltas for tool_call in (delta.tool_calls or [])
+        ]
+        names = [
+            tool_call.function.name
+            for tool_call in tool_calls
+            if tool_call.function and tool_call.function.name
+        ]
+        arguments = [
+            tool_call.function.arguments
+            for tool_call in tool_calls
+            if tool_call.function and tool_call.function.arguments
+        ]
+        assert "".join(delta.content or "" for delta in deltas) == (
+            "I will issue a <tool_call> for it.\n"
+        )
+        assert names == ["get_weather"]
+        assert {tool_call.index for tool_call in tool_calls} == {0}
+        assert json.loads("".join(arguments)) == {"city": "Beijing"}

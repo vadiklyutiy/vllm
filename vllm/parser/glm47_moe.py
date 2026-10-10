@@ -186,6 +186,13 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
+            # A name never contains <tool_call>: treat the earlier opener as
+            # text and reopen the call in place.
+            (ParserState.TOOL_NAME, "TOOL_START"): Transition(
+                ParserState.TOOL_NAME,
+                (EventType.TOOL_CALL_START,),
+                reopen_tool_call=True,
+            ),
             (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),

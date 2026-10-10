@@ -549,7 +549,10 @@ class StreamingParserEngine:
         self.state = transition.next_state
 
         for event_type in transition.events:
-            if event_type == EventType.TOOL_CALL_START:
+            if (
+                event_type == EventType.TOOL_CALL_START
+                and not transition.reopen_tool_call
+            ):
                 self.tool_index += 1
             event_value = (
                 message_header
