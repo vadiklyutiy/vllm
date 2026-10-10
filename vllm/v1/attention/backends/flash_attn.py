@@ -1302,6 +1302,25 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        if query.dtype != kv_cache.dtype and not is_quantized_kv_cache(
+            self.kv_cache_dtype
+        ):
+            # The KV cache is stored in a 16-bit float dtype other than the
+            # model's (e.g. kv_cache_dtype="float16" for a bf16 model), and
+            # FlashAttention takes q, k, v and out in one dtype.
+            kv_cache_dtype_output = torch.empty_like(output, dtype=kv_cache.dtype)
+            FlashAttentionImpl.forward(
+                self,
+                layer,
+                query.to(kv_cache.dtype),
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                kv_cache_dtype_output,
+            )
+            return output.copy_(kv_cache_dtype_output)
+
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
@@ -1525,6 +1544,14 @@ class FlashAttentionImpl(AttentionImpl):
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+
+        if key.dtype != kv_cache.dtype and not is_quantized_kv_cache(
+            self.kv_cache_dtype
+        ):
+            # reshape_and_cache_flash copies an unquantized key and value
+            # into the cache bit for bit, without converting their dtype.
+            key = key.to(kv_cache.dtype)
+            value = value.to(kv_cache.dtype)
 
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.

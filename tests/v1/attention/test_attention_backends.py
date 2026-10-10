@@ -1830,6 +1830,106 @@ def test_rocm_aiter_fa_unquantized_cache_ignores_kv_scales(
     )
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-specific test")
+@pytest.mark.parametrize(
+    "backend",
+    [
+        AttentionBackendEnum.FLASH_ATTN,
+        AttentionBackendEnum.FLASH_ATTN_DIFFKV,
+        AttentionBackendEnum.FLEX_ATTENTION,
+    ],
+)
+def test_float16_kv_cache_with_bfloat16_model(
+    default_vllm_config, monkeypatch, backend: AttentionBackendEnum
+):
+    """kv_cache_dtype="float16" on a bf16 model: the backend must store the
+    bf16 keys and values as fp16 values and attend with them (issue #60859)."""
+    set_random_seed(42)
+    batch_spec = BATCH_SPECS["small_prefill"]
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen2.5-0.5B-Instruct",
+        max_model_len=max(batch_spec.seq_lens),
+        dtype=torch.bfloat16,
+    )
+    vllm_config.cache_config.cache_dtype = "float16"
+    kv_cache_spec = replace(
+        create_standard_kv_cache_spec(vllm_config), dtype=torch.float16
+    )
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    num_q_heads = vllm_config.model_config.get_num_attention_heads(
+        vllm_config.parallel_config
+    )
+    num_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    head_size = vllm_config.model_config.get_head_size()
+    if backend == AttentionBackendEnum.FLASH_ATTN_DIFFKV:
+        # Equal K and V head sizes let the DiffKV impl run on any FA version.
+        monkeypatch.setattr(backend.get_class(), "head_size_v", head_size)
+
+    queries, new_keys, new_values, k_contexts, v_contexts, expected = (
+        [] for _ in range(6)
+    )
+    for seq_len, query_len in zip(batch_spec.seq_lens, batch_spec.query_lens):
+        context_len = seq_len - query_len
+        q = torch.randn(
+            query_len, num_q_heads, head_size, dtype=torch.bfloat16, device=device
+        )
+        k = torch.randn(
+            seq_len, num_kv_heads, head_size, dtype=torch.bfloat16, device=device
+        )
+        v = torch.randn_like(k)
+        causal_mask = torch.ones(
+            query_len, seq_len, dtype=torch.bool, device=device
+        ).tril(context_len)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1).float(),
+            k.transpose(0, 1).float(),
+            v.transpose(0, 1).float(),
+            attn_mask=causal_mask,
+            enable_gqa=True,
+        )
+        expected.append(ref.transpose(0, 1).to(torch.bfloat16))
+        queries.append(q)
+        new_keys.append(k[context_len:])
+        new_values.append(v[context_len:])
+        k_contexts.append(k[:context_len])
+        v_contexts.append(v[:context_len])
+
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec, kv_cache_spec.block_size, device
+    )
+    kv_cache = create_and_prepopulate_kv_cache(
+        k_contexts=k_contexts,
+        v_contexts=v_contexts,
+        block_size=kv_cache_spec.block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.float16,
+        device=device,
+        num_blocks=vllm_config.cache_config.num_gpu_blocks,
+        common_attn_metadata=common_attn_metadata,
+        layout=KVCacheLayout.LBNHC,
+    )
+
+    output = run_attention_backend(
+        backend,
+        kv_cache_spec,
+        ["placeholder"],
+        vllm_config,
+        device,
+        common_attn_metadata,
+        torch.cat(queries),
+        torch.cat(new_keys),
+        torch.cat(new_values),
+        kv_cache,
+        kv_cache_dtype="float16",
+    )
+
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(output, torch.cat(expected), atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "batch_spec_name",
     [
