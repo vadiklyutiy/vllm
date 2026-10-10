@@ -16,7 +16,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.import_utils import PlaceholderModule
 
 from .param_sweep import ParameterSweep, ParameterSweepItem
-from .utils import sanitize_filename
+from .utils import escape_filename
 
 try:
     import pandas as pd
@@ -122,7 +122,7 @@ def _get_comb_base_path(
     if startup_comb:
         parts.extend(("STARTUP-", startup_comb.name))
 
-    return experiment_dir / sanitize_filename("-".join(parts))
+    return experiment_dir / escape_filename("-".join(parts))
 
 
 def _get_comb_run_path(base_path: Path, run_number: int | None) -> Path:

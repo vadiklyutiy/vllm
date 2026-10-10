@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from vllm.benchmarks.sweep import serve as sweep_serve
+from vllm.benchmarks.sweep import startup as sweep_startup
 from vllm.benchmarks.sweep.param_sweep import ParameterSweep, ParameterSweepItem
 
 
@@ -373,3 +374,64 @@ def test_run_comb_warmup_default_is_backward_compatible(
 
     assert calls == [0]
     assert measured == [{"run_number": 0}]
+
+
+@pytest.mark.parametrize(
+    "get_comb_base_path",
+    [sweep_serve._get_comb_base_path, sweep_startup._get_comb_base_path],
+    ids=["serve", "startup"],
+)
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("experiment/a", "experiment_a"),
+        ("a..b", "a__b"),
+        ("a'", "a"),
+        ("a/b", "a%2Fb"),
+    ],
+)
+def test_comb_base_path_is_unique_per_name(
+    tmp_path: Path, get_comb_base_path, names: tuple[str, str]
+):
+    """Distinct combinations must not share (and reuse) cached results."""
+    serve_comb = ParameterSweepItem({"_benchmark_name": "serve/x"})
+    paths = {
+        get_comb_base_path(
+            tmp_path, serve_comb, ParameterSweepItem({"_benchmark_name": name})
+        )
+        for name in names
+    }
+
+    assert len(paths) == len(names)
+    assert all(path.parent == tmp_path for path in paths)
+
+
+def test_run_combs_keeps_failure_record_per_serve_comb(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Failures of distinct server combinations must not overwrite each other."""
+
+    def failing_server_ctx(*args, serve_comb, **kwargs):
+        raise RuntimeError(f"synthetic failure of {serve_comb.name}")
+
+    monkeypatch.setattr(sweep_serve, "server_ctx", failing_server_ctx)
+
+    sweep_serve.run_combs(
+        [],
+        [],
+        [],
+        show_stdout=False,
+        server_ready_timeout=0,
+        serve_params=ParameterSweep.read_from_dict(
+            {"experiment/a": {}, "experiment_a": {}}
+        ),
+        bench_params=ParameterSweep.from_records([{}]),
+        link_vars=[],
+        experiment_dir=tmp_path,
+        num_runs=1,
+        warmup_num_prompts=0,
+        dry_run=False,
+        continue_on_error=True,
+    )
+
+    assert len(list(tmp_path.glob("*failure.json"))) == 2

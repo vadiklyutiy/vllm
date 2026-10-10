@@ -15,7 +15,7 @@ from vllm.utils.import_utils import PlaceholderModule
 
 from .param_sweep import ParameterSweep, ParameterSweepItem
 from .server import ServerProcess
-from .utils import sanitize_filename
+from .utils import escape_filename
 
 try:
     import pandas as pd
@@ -151,7 +151,7 @@ def _get_comb_base_path(
     if extra_parts:
         parts.extend(extra_parts)
 
-    return experiment_dir / sanitize_filename("-".join(parts))
+    return experiment_dir / escape_filename("-".join(parts))
 
 
 def _get_comb_run_path(base_path: Path, run_number: int | None):
@@ -353,7 +353,7 @@ def run_combs(
         except Exception as exc:
             if not continue_on_error:
                 raise
-            failure_name = sanitize_filename(
+            failure_name = escape_filename(
                 f"SERVE-{serve_comb.name or 'default'}-failure.json"
             )
             failure_path = experiment_dir / failure_name
