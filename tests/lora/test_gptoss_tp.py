@@ -64,7 +64,9 @@ def _enable_deterministic_lora_shrink(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
-def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int) -> None:
+def generate_and_test(
+    llm: vllm.LLM, lora_path: str, lora_id: int, is_3d_lora_weight: bool = False
+) -> None:
     prompts = [
         PROMPT_TEMPLATE.format(
             context="Give the average number of working horses on farms with more than 5000 total horses."  # noqa: E501
@@ -80,7 +82,11 @@ def generate_and_test(llm: vllm.LLM, lora_path: str, lora_id: int) -> None:
     outputs = llm.generate(
         prompts,
         sampling_params,
-        lora_request=LoRARequest(str(lora_id), lora_id, lora_path) if lora_id else None,
+        lora_request=LoRARequest(
+            str(lora_id), lora_id, lora_path, is_3d_lora_weight=is_3d_lora_weight
+        )
+        if lora_id
+        else None,
     )
     # Print the outputs.
     generated_texts: list[str] = []
@@ -142,6 +148,30 @@ def test_gpt_oss_lora(
 
     generate_and_test(llm, gptoss20b_lora_files, lora_id=1)
     generate_and_test(llm, gptoss20b_lora_files, lora_id=2)
+
+
+def test_gpt_oss_lora_mixed_moe_lora_format(
+    gptoss20b_lora_files, monkeypatch: pytest.MonkeyPatch
+):
+    """The 2D MoE LoRA wrapper keeps gate/up as separate slices; their deltas
+    must land on GPT-OSS's interleaved gate/up channels."""
+    _enable_deterministic_lora_shrink(monkeypatch)
+
+    llm = vllm.LLM(
+        MODEL_PATH,
+        max_model_len=1024,
+        enable_lora=True,
+        enable_mixed_moe_lora_format=True,
+        max_loras=2,
+        max_lora_rank=8,
+        max_num_seqs=2,
+        max_num_batched_tokens=2048,
+        compilation_config=vllm.config.CompilationConfig(  # Avoid OOM
+            cudagraph_specialize_lora=False,
+        ),
+    )
+
+    generate_and_test(llm, gptoss20b_lora_files, lora_id=1, is_3d_lora_weight=True)
 
 
 @multi_gpu_test(num_gpus=2)

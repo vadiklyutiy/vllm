@@ -11,6 +11,7 @@ from vllm.distributed.utils import divide
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe import MoERunner
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.lora_context import MoELoRAContext
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
@@ -138,6 +139,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             max_loras=self.max_loras,
             top_k=self.moe_config.experts_per_token,
             w13_num_slices=self._w13_slices,
+            interleave_w13_slices=(
+                self._w13_slices == 2
+                and self.moe_config.activation == MoEActivation.SWIGLUOAI
+            ),
             fully_sharded=self.fully_sharded,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,

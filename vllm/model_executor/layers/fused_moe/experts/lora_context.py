@@ -70,3 +70,7 @@ class MoELoRAContext:
     # instead of raw quantized values that are missing the activation scale.
     # Set per forward pass; None until the modular kernel writes it.
     original_hidden_states: torch.Tensor | None = None
+
+    # Scatter the two w13 LoRA slices onto interleaved gate/up columns
+    # ([gate0, up0, gate1, ...], as SWIGLUOAI expects) instead of [gate | up].
+    interleave_w13_slices: bool = False

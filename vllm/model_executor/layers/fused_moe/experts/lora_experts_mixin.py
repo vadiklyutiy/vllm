@@ -70,8 +70,11 @@ class LoRAExpertsMixin:
             # concat swap afterwards.
             w13_lora_a_stacked = w13_lora_a_stacked[::-1]
             w13_lora_b_stacked = w13_lora_b_stacked[::-1]
-        return lora_context.punica_wrapper.add_lora_w13(
-            y,
+        # The expand kernel writes [gate | up]; for an interleaved base output
+        # write the delta to a scratch buffer and scatter it into y below.
+        out = torch.zeros_like(y) if lora_context.interleave_w13_slices else y
+        lora_meta = lora_context.punica_wrapper.add_lora_w13(
+            out,
             x,
             w13_lora_a_stacked,
             w13_lora_b_stacked,
@@ -92,6 +95,14 @@ class LoRAExpertsMixin:
             add_inputs=add_inputs,
             token_lora_mapping=lora_context.local_token_lora_mapping,
         )
+        if lora_context.interleave_w13_slices:
+            delta = out.unflatten(-1, (2, -1)).transpose(-1, -2)
+            y_pairs = y.unflatten(-1, (-1, 2))
+            if add_inputs:
+                y_pairs.add_(delta)
+            else:
+                y_pairs.copy_(delta)
+        return lora_meta
 
     def apply_w2_lora(
         self,
