@@ -125,6 +125,42 @@ def test_labels_start_the_reply(qwen):
         reply_label_ids(tokenizer, tokenizer.encode("team:"))
 
 
+# Like Qwen3-4B-Thinking-2507's: the generation prompt opens a thought whatever
+# enable_thinking says.
+THINKING_ONLY_TEMPLATE = (
+    "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+    "{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n"
+    "{% endif %}"
+)
+
+
+def template_context(tokenizer, template: str) -> ReadContext:
+    online_renderer = SimpleNamespace(
+        renderer=SimpleNamespace(get_tokenizer=lambda: tokenizer)
+    )
+    return ReadContext(
+        MagicMock(spec=EngineClient), online_renderer, template, "auto", {}
+    )
+
+
+def test_thinking_only_template_has_no_read(qwen):
+    tokenizer, _ = qwen
+    with pytest.raises(ValueError, match="starts the reply with a thought"):
+        NextTokenStrategy(template_context(tokenizer, THINKING_ONLY_TEMPLATE))
+
+
+def test_think_tag_in_system_text_keeps_read(qwen):
+    # The reply starts outside a thought; only the system text names the tag.
+    template = (
+        "<|im_start|>system\nDo not write a <think> block.<|im_end|>\n"
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}"
+        "<|im_end|>\n{% endfor %}"
+        "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+    )
+    tokenizer, _ = qwen
+    NextTokenStrategy(template_context(tokenizer, template))
+
+
 @pytest.fixture
 def serving_and_engine(qwen):
     tokenizer, _ = qwen

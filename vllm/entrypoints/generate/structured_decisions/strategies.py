@@ -130,12 +130,23 @@ class NextTokenStrategy(ReadStrategy):
     the reply's first token. The requests share the state. With prefix caching,
     it is prefilled once."""
 
+    THINK_START = "<think>"
+
     def __init__(self, context: ReadContext):
         super().__init__(context)
         # Every prompt ends with the same generation prompt, so a label's token
         # is the same for every question.
         prompt = self._generation_prompt()
         self.tail = prompt_tail(self._tokenizer(), prompt)
+        # Thinking-only templates ignore enable_thinking and open a thought, so
+        # the reply's first token would be the thought's, not a label.
+        head = self._tokenizer().decode(prompt[: len(prompt) - len(self.tail)])
+        if head.endswith(self.THINK_START):
+            raise ValueError(
+                "Structured decisions read the reply's first token, and this "
+                "model's chat template starts the reply with a thought even "
+                "with thinking off"
+            )
         self.label_ids = type_label_ids(self._tokenizer(), prompt)
 
     def _tokenizer(self) -> TokenizerLike:

@@ -6,7 +6,8 @@ returns a probability for every allowed answer.
 The endpoint is available by default on generation models. Models without a
 supported read strategy return 501. Supported architectures require
 `--logprobs-mode raw_logprobs` or `processed_logprobs`, since `label_mass` needs
-log probabilities.
+log probabilities. Checkpoints whose chat template opens a thought even with
+thinking off, such as `Qwen/Qwen3-4B-Thinking-2507`, also return 501.
 
 ## How it works
 
