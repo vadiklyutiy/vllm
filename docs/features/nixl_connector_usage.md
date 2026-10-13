@@ -124,7 +124,7 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
 
 - `kv_lease_duration` (via `kv_connector_extra_config`): Lease duration (in seconds) for the prefiller's KV cache blocks. (Optional)
     - Default: 30
-    - When a prefill request finishes, its KV blocks are held for this duration waiting for the decoder to read them. While the request is queued on the decoder, periodic heartbeats automatically extend the lease. If neither a heartbeat nor a read notification arrives before the lease expires, the blocks are freed. The heartbeat interval and extension amount are derived automatically from this value.
+    - When a prefill request finishes, its KV blocks are held for this duration waiting for the decoder to read them. While the request is queued on the decoder, periodic heartbeats automatically extend the lease. If neither a heartbeat nor a read notification arrives before the lease expires, the blocks are freed. The decoder does not read blocks whose lease has run out, or runs out within one heartbeat interval (at most 5 s): the KV load fails (see [KV Load Failure Policy](#kv-load-failure-policy)). The heartbeat interval and extension amount are derived automatically from this value. The decoder uses its own value to estimate how long its heartbeats extend the lease, so set the same value on the prefiller and the decoder.
     - Example: `--kv-transfer-config '{"kv_connector_extra_config": {"kv_lease_duration": 60}}'`
 
 - `decoder_kv_blocks_ttl` (via `kv_connector_extra_config`): TTL (in seconds) for KV blocks cached on the decoder in bidirectional transfer mode. (Optional)

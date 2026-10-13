@@ -26,6 +26,8 @@ When P finishes a prefill, it pins the KV blocks with an initial lease duration 
 2. **D keeps heartbeating** --- each heartbeat extends the lease by `lease_duration * 2/3` (~20s), keeping blocks alive indefinitely while D is healthy.
 3. **No heartbeat arrives** --- the lease expires and P reclaims the blocks.
 
+P also exports the initial lease deadline in `kv_transfer_params` (`remote_blocks_expiry_time`). D tracks which of its heartbeats renewed the lease in time, using its own `kv_lease_duration` for the extension, and checks the lease before reading. A step that starts reads always carries the heartbeats, sent before the reads, so a request that arrives late in the lease is renewed before it is read. If the lease was lost (e.g. the request reached D after the lease expired, or D stalled for longer than the extension), or runs out within one heartbeat interval (at most 5 s), P may have reused the blocks, so D does not read them and reports a KV load failure, handled according to `kv_load_failure_policy`.
+
 ### Piggybacking on NIXL notifications
 
 Rather than introducing a new transport channel, heartbeats reuse NIXL's existing notification system (`send_notif` / `get_new_notifs`). The notification medium is backend-specific, with automatic fallback from IB/RoCE to TCP already handled by NIXL. Each single heartbeat message sent from D to a particular P renews all requests pinned in P on behalf of that D --- in other words, a single batched message per iteration renews the lease of multiple requests.
@@ -132,5 +134,7 @@ vllm serve <MODEL> \
     "kv_connector_extra_config": {"kv_lease_duration": 60}
   }'
 ```
+
+Set the same `kv_lease_duration` on the decoder: D derives its heartbeat interval and its estimate of the lease extension from it.
 
 For full NixlConnector configuration details, see the [NixlConnector Usage Guide](../features/nixl_connector_usage.md).

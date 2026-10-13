@@ -50,8 +50,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  12: Add per-region member names for PP push
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add Qwen3.8-Flash-Next PLE page length - #59997
+#  15: P exports its lease deadline in remote_blocks_expiry_time; D checks it
+#      before every read
 #
-NIXL_CONNECTOR_VERSION: int = 14
+NIXL_CONNECTOR_VERSION: int = 15
 
 
 @dataclass
@@ -236,6 +238,8 @@ class RemoteMeta:
     request_id: str
     blocks_expiry_time: float | None = None
     num_tokens: int | None = None
+    # Turn-2 readback of D's blocks, whose TTL heartbeats do not renew.
+    is_turn2: bool = False
 
 
 @dataclass
@@ -336,5 +340,6 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             port=kv_transfer_params["remote_port"],
             blocks_expiry_time=kv_transfer_params.get("remote_blocks_expiry_time"),
             num_tokens=kv_transfer_params.get("remote_num_tokens"),
+            is_turn2=bool(kv_transfer_params.get("do_remote_decode")),
         )
         self.reqs_to_recv[request_id] = req

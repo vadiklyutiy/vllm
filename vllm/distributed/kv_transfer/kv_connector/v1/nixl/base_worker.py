@@ -530,12 +530,7 @@ class NixlBaseConnectorWorker:
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
         self._lease_extension = kv_lease_duration * 2 // 3
-
-        self._bidirectional_kv_xfer_enabled: bool = (
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "bidirectional_kv_xfer", False
-            )
-        )
+        self._heartbeat_interval = kv_lease_duration // 6
 
         self.kv_cache_config = kv_cache_config
         transfer_block_sizes = [
@@ -3176,8 +3171,14 @@ class NixlBaseConnectorWorker:
                 )
                 self.xfer_stats.record_failed_notification()
 
-    def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
-        """Send heartbeats to remote engines, extending the lease on KV blocks."""
+    def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> list[EngineId]:
+        """Send heartbeats to remote engines, extending the lease on KV blocks.
+
+        Returns:
+            The engines whose remote agents all got the heartbeat.
+
+        """
+        renewed_engines: list[EngineId] = []
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
             # Proactive handshake (this request may still be in waiting queue) so
             # the **next** heartbeat for this remote can go through.
@@ -3200,15 +3201,20 @@ class NixlBaseConnectorWorker:
             self._engine_last_active[engine_id] = time.perf_counter()
             # Build the heartbeat message: "HB:req1,req2,..."
             hb_msg = ("HB:" + ",".join(hb_info.req_ids)).encode()
+            renewed = True
             for agent_name in self._remote_agents[engine_id].values():
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
                 except Exception:
+                    renewed = False
                     logger.debug(
                         "Failed to send heartbeat to engine %s",
                         engine_id,
                         exc_info=True,
                     )
+            if renewed:
+                renewed_engines.append(engine_id)
+        return renewed_engines
 
     def get_mapped_blocks(
         self, block_ids: np.ndarray, block_size_ratio: int

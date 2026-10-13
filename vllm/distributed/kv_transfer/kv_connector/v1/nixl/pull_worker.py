@@ -7,12 +7,14 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    HeartbeatInfo,
     NixlConnectorMetadata,
+    ReqId,
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
@@ -28,9 +30,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Slack (seconds) subtracted from D's exported block-expiry deadline on the turn-2
-# readback, absorbing clock-offset error and read latency.
+# Slack (seconds) subtracted from the remote's exported block-expiry deadline
+# before a read, absorbing clock-offset error and read latency.
 _KV_BLOCKS_EXPIRY_SAFETY_MARGIN = 5.0
+# Slack (seconds) for a heartbeat to reach P: it renews P's lease only if sent
+# this long before the lease runs out.
+_HEARTBEAT_DELIVERY_SLACK = 1.0
 
 
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
@@ -43,11 +48,29 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Read margin on P's lease. Capped at the heartbeat interval: D keeps
+        # heartbeating a request while it reads it, which renews the lease.
+        self._lease_expiry_margin = min(
+            _KV_BLOCKS_EXPIRY_SAFETY_MARGIN, self._heartbeat_interval
+        )
+        self._renewal_slack = min(_HEARTBEAT_DELIVERY_SLACK, self._lease_expiry_margin)
+        # (remote engine, remote request) -> (start, end) on our clock of the
+        # latest unbroken run of heartbeats that renewed P's lease on its blocks.
+        self._lease_renewals: dict[tuple[EngineId, ReqId], tuple[float, float]] = {}
+        self._last_heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        # Send heartbeats to P-side engines to keep KV blocks alive while
+        # requests sit in the D scheduler WAITING queue. Sent before the reads,
+        # so that this step's renewal covers them.
+        renewed_engines = self._send_heartbeats(metadata)
+        if metadata.heartbeat_by_engine:
+            self._last_heartbeat_by_engine = metadata.heartbeat_by_engine
+            self._record_lease_renewals(metadata, renewed_engines)
+
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids, self._physical_blocks_per_logical_kv_block
@@ -75,8 +98,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._read_blocks_for_req(req_id, meta)
 
         # Start transfers for requests whose handshakes have now finished.
+        ready = []
         while not self._ready_requests.empty():
-            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+            ready.append(self._ready_requests.get_nowait())
+        if ready and self._last_heartbeat_by_engine:
+            # The pending handshake held back the heartbeat of the step that
+            # queued these reads: send the latest one again before reading.
+            heartbeat = NixlConnectorMetadata()
+            heartbeat.heartbeat_by_engine = self._last_heartbeat_by_engine
+            self._record_lease_renewals(heartbeat, self._send_heartbeats(heartbeat))
+        for req_id, meta in ready:
+            self._read_blocks_for_req(req_id, meta)
 
         if self.pcp_rank > 0 and not self.pcp_dcp_sharded:
             # Replicated-KV PCP: only PCP rank 0 serves the KV, so this rank
@@ -118,12 +150,39 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     )
                 self._reqs_to_send[req_id] = expiration_time
 
-        # Send heartbeats to P-side engines to keep KV blocks alive while
-        # requests sit in the D scheduler WAITING queue.
-        self._send_heartbeats(metadata)
+    def _record_lease_renewals(
+        self, metadata: NixlConnectorMetadata, renewed_engines: list[EngineId]
+    ) -> None:
+        """Track how long the heartbeats just sent keep P's blocks held.
 
-    def _is_turn2_read_expired(self, meta: ReqMeta) -> bool:
-        """Whether D's cached blocks for this turn-2 readback have (nearly) expired."""
+        P only extends a lease it still holds, so a heartbeat sent after the
+        previous renewal ran out starts a new run. A heartbeat that did not
+        reach every P agent leaves the run as it was. Requests no longer
+        heartbeated are dropped.
+        """
+        now = time.perf_counter()
+        renewals: dict[tuple[EngineId, ReqId], tuple[float, float]] = {}
+        for engine_id, hb_info in metadata.heartbeat_by_engine.items():
+            for remote_req_id in hb_info.req_ids:
+                key = (engine_id, remote_req_id)
+                renewal = self._lease_renewals.get(key)
+                if engine_id not in renewed_engines:
+                    if renewal is not None:
+                        renewals[key] = renewal
+                    continue
+                start, end = renewal or (now, now)
+                if now + self._renewal_slack >= end:
+                    start = now
+                renewals[key] = (start, now + self._lease_extension)
+        self._lease_renewals = renewals
+
+    def _is_remote_read_expired(self, meta: ReqMeta) -> bool:
+        """Whether the remote blocks to read have (nearly) been released.
+
+        The deadline is the one the remote set when it kept the blocks. On P,
+        a run of heartbeats that started before it holds them until the run's
+        end. D's turn-2 TTL is not renewed and keeps the full safety margin.
+        """
         assert meta.remote is not None
         blocks_expiry_time = meta.remote.blocks_expiry_time
         # Deadline may be absent (router may not forward it) -> read as usual.
@@ -131,7 +190,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             return False
         clock_offset = self._engine_clock_offset[meta.remote.engine_id]
         deadline = blocks_expiry_time - clock_offset
-        return time.perf_counter() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= deadline
+        if meta.remote.is_turn2:
+            return time.perf_counter() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= deadline
+        renewal = self._lease_renewals.get(
+            (meta.remote.engine_id, meta.remote.request_id)
+        )
+        if renewal is not None and renewal[0] + self._renewal_slack < deadline:
+            deadline = max(deadline, renewal[1])
+        return time.perf_counter() + self._lease_expiry_margin >= deadline
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
@@ -149,9 +215,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # thread (this one), so we don't race on this structure.
         self._engine_last_active[engine_id] = time.perf_counter()
 
-        if self._bidirectional_kv_xfer_enabled and self._is_turn2_read_expired(meta):
+        if self._is_remote_read_expired(meta):
             logger.warning(
-                "Declining expired remote read for %s from engine %s.",
+                "Declining expired remote read for %s from engine %s: its KV "
+                "blocks may already be released, so the KV load fails.",
                 req_id,
                 engine_id,
             )

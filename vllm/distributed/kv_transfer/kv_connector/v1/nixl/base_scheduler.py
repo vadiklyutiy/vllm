@@ -504,10 +504,14 @@ class NixlBaseConnectorScheduler:
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
-        # Package heartbeats, throttled by heartbeat_interval.
+        # Package heartbeats, throttled by heartbeat_interval. A step that
+        # starts reads always carries them, so the reads find the lease renewed.
         if self._heartbeat_by_engine:
             now = time.perf_counter()
-            if now - self._last_heartbeat_time >= self._heartbeat_interval:
+            if (
+                meta.reqs_to_recv
+                or now - self._last_heartbeat_time >= self._heartbeat_interval
+            ):
                 self._last_heartbeat_time = now
                 meta.heartbeat_by_engine = self._heartbeat_by_engine
 

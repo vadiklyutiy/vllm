@@ -7,6 +7,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    HeartbeatInfo,
+    NixlConnectorMetadata,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import create_request, make_nixl_scheduler
@@ -112,6 +116,22 @@ def test_build_connector_meta_heartbeat_throttling():
     # Immediate second call is throttled (< 5s since last).
     meta2 = s.build_connector_meta(MagicMock())
     assert len(meta2.heartbeat_by_engine) == 0
+
+
+def test_build_connector_meta_heartbeats_step_with_new_reads():
+    """A step that starts a read heartbeats even inside the throttle interval,
+    so D reads with P's lease just renewed."""
+    s = _sched(kv_lease_duration=30)
+    req = _req(1)
+    s.on_new_request(req)
+    # Another request's heartbeat went out just now.
+    s._last_heartbeat_time = time.perf_counter()
+    s._reqs_need_recv[req.request_id] = (req, ([10, 11, 12],), (), True)
+
+    meta = s.build_connector_meta(MagicMock())
+
+    assert "id-1" in meta.reqs_to_recv
+    assert meta.heartbeat_by_engine[_ENGINE_A].req_ids == {"prefill-1"}
 
 
 # ===================================================================
@@ -251,3 +271,73 @@ def test_reaper_reclaims_shorter_lease_behind_later_deadline(monkeypatch):
     assert done == {"Y"}
     assert list(w._reqs_to_send) == ["X"]
     assert w._reqs_to_process == {"X"}
+
+
+# ===================================================================
+# Worker (D): reads past P's lease
+# ===================================================================
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_times", "failed_heartbeat_times", "read_time", "expect_expired"),
+    [
+        # The request reaches D after P's 30s lease ran out (issue #61229).
+        pytest.param([], [], 60.0, True, id="read_after_lease"),
+        pytest.param([], [], 10.0, False, id="read_within_lease"),
+        # Steady heartbeats from before the deadline keep the blocks held.
+        pytest.param(
+            list(range(5, 65, 5)), [], 62.0, False, id="renewed_while_waiting"
+        ),
+        # A first heartbeat late in the lease still renews it.
+        pytest.param([26.0], [], 39.0, False, id="renewed_near_lease_end"),
+        # P already released the blocks when the first heartbeat arrived.
+        pytest.param([40.0, 45.0, 50.0], [], 52.0, True, id="renewals_too_late"),
+        # A stall longer than the lease extension lets P release the blocks.
+        pytest.param([5.0, 10.0, 15.0, 40.0, 45.0], [], 47.0, True, id="stall"),
+        # A heartbeat that did not reach P neither extends nor ends the run.
+        pytest.param([20.0, 30.0], [25.0], 44.0, False, id="failed_heartbeat"),
+    ],
+)
+def test_d_declines_read_past_lease(
+    monkeypatch, heartbeat_times, failed_heartbeat_times, read_time, expect_expired
+):
+    """D must not read P's blocks once the lease on them is lost: P may have
+    reused them for another request, and the read would succeed silently."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import pull_worker
+
+    w = _worker_stub()  # _lease_extension = 20
+    w._lease_expiry_margin = 5.0
+    w._renewal_slack = 1.0
+    w._lease_renewals = {}
+    w._engine_clock_offset = {_ENGINE_A: 0.0}
+
+    now = {"t": 0.0}
+    monkeypatch.setattr(pull_worker.time, "perf_counter", lambda: now["t"])
+
+    heartbeat = NixlConnectorMetadata()
+    heartbeat.heartbeat_by_engine = {
+        _ENGINE_A: HeartbeatInfo(
+            req_ids={"prefill-1"}, host="my-host", port=1234, tp_size=1
+        )
+    }
+    for t in sorted(heartbeat_times + failed_heartbeat_times):
+        now["t"] = t
+        renewed = [] if t in failed_heartbeat_times else [_ENGINE_A]
+        w._record_lease_renewals(heartbeat, renewed)
+
+    meta = NixlConnectorMetadata()
+    meta.add_new_req_to_recv(
+        request_id="id-1",
+        local_block_ids=([10, 11],),
+        kv_transfer_params={
+            "remote_block_ids": ([20, 21],),
+            "remote_engine_id": _ENGINE_A,
+            "remote_request_id": "prefill-1",
+            "remote_host": "my-host",
+            "remote_port": 1234,
+            # P granted a 30s lease at t=0.
+            "remote_blocks_expiry_time": 30.0,
+        },
+    )
+    now["t"] = read_time
+    assert w._is_remote_read_expired(meta.reqs_to_recv["id-1"]) is expect_expired

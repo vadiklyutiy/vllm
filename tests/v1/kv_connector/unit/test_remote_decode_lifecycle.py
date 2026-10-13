@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import time
 
 import pytest
 
@@ -258,3 +259,30 @@ def test_abort_during_kv_transfer():
     )
     scheduler.update_from_output(scheduler_output, model_runner_output)
     assert_scheduler_empty(scheduler)
+
+
+def test_kv_transfer_params_carry_lease_deadline():
+    """P hands out its lease deadline, so D can decline the blocks once the
+    lease is lost (P may have reused them by then)."""
+    vllm_config = create_vllm_config(
+        kv_connector_extra_config={"kv_lease_duration": 30}
+    )
+    scheduler = create_scheduler(vllm_config)
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        max_tokens=1,
+        num_tokens=int(BLOCK_SIZE * 2.5),
+        do_remote_decode=True,
+    )
+    scheduler.add_request(request)
+
+    before = time.perf_counter()
+    scheduler_output = scheduler.schedule()
+    engine_core_outputs = scheduler.update_from_output(
+        scheduler_output, create_model_runner_output(reqs=[request])
+    )
+
+    kv_transfer_params = engine_core_outputs[0].outputs[0].kv_transfer_params
+    assert kv_transfer_params["remote_blocks_expiry_time"] >= before + 30

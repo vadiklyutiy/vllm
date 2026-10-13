@@ -1679,6 +1679,163 @@ def test_reqs_to_send_deadline_rebased_to_worker_clock(default_vllm_config, dist
     assert req_id in worker._reqs_to_process
 
 
+@pytest.mark.parametrize(
+    ("kv_lease_duration", "expiry_delta", "heartbeat", "expect_declined"),
+    [
+        # The request reaches D after P's lease ran out (issue #61229).
+        pytest.param(30, -10.0, False, True, id="lease_lost"),
+        # Near the end of the lease, this step's heartbeat renews it first.
+        pytest.param(30, 4.0, True, False, id="renewed_near_lease_end"),
+        # A short lease: the read margin shrinks with the heartbeat interval.
+        pytest.param(6, 4.2, False, False, id="short_lease_no_heartbeat"),
+    ],
+)
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_d_declines_read_after_lost_lease(
+    default_vllm_config,
+    dist_init,
+    kv_lease_duration,
+    expiry_delta,
+    heartbeat,
+    expect_declined,
+):
+    """D must not read P's blocks once P's lease on them is lost: P may have
+    reused them, and the READ would load another request's KV without error.
+    The lost lease fails the recv instead."""
+    block_size = maybe_update_block_size(16)
+    vllm_config = create_vllm_config(
+        block_size=block_size,
+        kv_connector_extra_config={"kv_lease_duration": kv_lease_duration},
+    )
+    connector = NixlConnector(
+        vllm_config,
+        KVConnectorRole.WORKER,
+        make_kv_cache_config(block_size=block_size),
+    )
+    connector.connector_worker = FakeNixlConnectorWorker(
+        vllm_config, connector.engine_id, hand_shake_latency=0
+    )
+    worker = connector.connector_worker
+    remote_engine_id = FakeNixlConnectorWorker.REMOTE_ENGINE_ID
+    worker._remote_agents[remote_engine_id], _ = worker._nixl_handshake(
+        host="localhost",
+        port=1234,
+        remote_tp_size=1,
+        expected_engine_id=remote_engine_id,
+    )
+    worker._engine_clock_offset[remote_engine_id] = 0.0
+
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="req",
+        local_block_ids=([0],),
+        kv_transfer_params={
+            "remote_block_ids": ([0],),
+            "remote_engine_id": remote_engine_id,
+            "remote_request_id": "prefill-req",
+            "remote_host": "localhost",
+            "remote_port": 1234,
+            "remote_tp_size": 1,
+            "remote_blocks_expiry_time": time.perf_counter() + expiry_delta,
+        },
+    )
+    if heartbeat:
+        metadata.heartbeat_by_engine = {
+            remote_engine_id: HeartbeatInfo(
+                req_ids={"prefill-req"}, host="localhost", port=1234, tp_size=1
+            )
+        }
+    connector.bind_connector_metadata(metadata)
+    dummy_ctx = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+    )
+    with patch.object(
+        worker.nixl_wrapper,
+        "make_prepped_xfer",
+        wraps=worker.nixl_wrapper.make_prepped_xfer,
+    ) as read:
+        connector.start_load_kv(dummy_ctx)
+    results = worker.get_transfer_results()
+
+    assert read.called is not expect_declined
+    assert results.finished_recving == {"req"}
+    assert results.failed_recving == ({"req"} if expect_declined else set())
+    assert worker.xfer_stats.data["num_kv_expired_reqs"] == (
+        [1] if expect_declined else []
+    )
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_read_deferred_by_handshake_renews_lease(default_vllm_config, dist_init):
+    """The first read from a new P waits for the handshake, which also holds
+    back its step's heartbeat. It runs in a later step without one, and must
+    still read blocks P holds, near the end of the lease."""
+    block_size = maybe_update_block_size(16)
+    vllm_config = create_vllm_config(block_size=block_size)
+    connector = NixlConnector(
+        vllm_config,
+        KVConnectorRole.WORKER,
+        make_kv_cache_config(block_size=block_size),
+    )
+    connector.connector_worker = FakeNixlConnectorWorker(
+        vllm_config, connector.engine_id, hand_shake_latency=0.1
+    )
+    worker = connector.connector_worker
+    remote_engine_id = FakeNixlConnectorWorker.REMOTE_ENGINE_ID
+    dummy_ctx = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+    )
+
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="req",
+        local_block_ids=([0],),
+        kv_transfer_params={
+            "remote_block_ids": ([0],),
+            "remote_engine_id": remote_engine_id,
+            "remote_request_id": "prefill-req",
+            "remote_host": "localhost",
+            "remote_port": 1234,
+            "remote_tp_size": 1,
+            "remote_blocks_expiry_time": time.perf_counter() + 4.0,
+        },
+    )
+    metadata.heartbeat_by_engine = {
+        remote_engine_id: HeartbeatInfo(
+            req_ids={"prefill-req"}, host="localhost", port=1234, tp_size=1
+        )
+    }
+    with patch.object(
+        worker.nixl_wrapper,
+        "make_prepped_xfer",
+        wraps=worker.nixl_wrapper.make_prepped_xfer,
+    ) as read:
+        connector.bind_connector_metadata(metadata)
+        connector.start_load_kv(dummy_ctx)
+        assert not read.called
+        handshake_deadline = time.perf_counter() + 5
+        while worker._ready_requests.empty():
+            assert time.perf_counter() < handshake_deadline
+            time.sleep(0.01)
+        connector.bind_connector_metadata(NixlConnectorMetadata())
+        connector.start_load_kv(dummy_ctx)
+        assert read.called
+
+    results = worker.get_transfer_results()
+    assert results.failed_recving == set()
+    assert worker.xfer_stats.data["num_kv_expired_reqs"] == []
+
+
 def test_kv_connector_stats_aggregation():
     """Test KV transfer stats aggregation across TP ranks using
     KVOutputAggregator (used by MultiprocExecutor).

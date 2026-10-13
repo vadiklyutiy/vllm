@@ -982,6 +982,50 @@ def test_turn2_deadline_gate(dist_init, offset, expiry_delta, expect_declined):
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
+def test_turn2_deadline_margin_ignores_kv_lease_duration(dist_init):
+    """kv_lease_duration sizes P's lease, not D's TTL: with a short lease, a
+    turn-2 read 2s before D's deadline is still within the safety margin."""
+    block_size = maybe_update_block_size(32)
+    vllm_config = create_vllm_config(
+        kv_connector_extra_config=BIDIR_KV_EXTRA_CONFIG | {"kv_lease_duration": 6},
+        block_size=block_size,
+    )
+    kv_cache_config = make_kv_cache_config(block_size=block_size, num_blocks=2)
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    connector.connector_worker = FakeNixlConnectorWorker(
+        vllm_config, connector.engine_id, kv_cache_config=kv_cache_config
+    )
+    worker = connector.connector_worker
+    worker.kv_cache_layout = "LBHNC"
+    worker._remote_agents[_REMOTE], _ = worker._nixl_handshake(
+        host="localhost", port=1234, remote_tp_size=1, expected_engine_id=_REMOTE
+    )
+    worker._engine_clock_offset[_REMOTE] = 0.0
+
+    meta = NixlConnectorMetadata()
+    meta.add_new_req_to_recv(
+        request_id="req",
+        local_block_ids=([10, 11],),
+        kv_transfer_params={
+            "do_remote_prefill": False,
+            "do_remote_decode": True,
+            "remote_block_ids": ([20, 21],),
+            "remote_engine_id": _REMOTE,
+            "remote_request_id": "decode-req",
+            "remote_host": "localhost",
+            "remote_port": 1234,
+            "remote_tp_size": 1,
+            "remote_blocks_expiry_time": time.perf_counter() + 2.0,
+        },
+    )
+    _do_load_kv(connector, meta)
+    assert worker.xfer_stats.data["num_kv_expired_reqs"] == [1]
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
 def test_turn2_full_prefix_hit_with_expired_deadline_skips_gate(dist_init):
     """A full local prefix hit issues no READ. The expiry gate must be skipped
     even when D's deadline is expired."""
