@@ -978,6 +978,52 @@ def test_block_verification_rejection_sample(
         )
 
 
+def test_block_verification_seeded_steps_match_target():
+    """Block verification tests every draft token of a step, so the next step
+    verifies the positions past the accepted length again. A seeded request
+    must draw fresh randomness there, or the tokens drift from the target.
+    """
+    device = "cuda"
+    num_reqs = 10000
+    K = 2
+    num_tokens = 4
+
+    target_logits_1d = torch.zeros(2, device=device)
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        target_logits_1d,
+        K,
+        temperature=1.0,
+        num_trials=num_reqs,
+    )
+    inputs["draft_logits"] = None
+    # The draft always proposes token 0, which the target gives 0.5.
+    inputs["draft_sampled"].zero_()
+
+    steps = torch.arange(K + 1, device=device)
+    rows = torch.arange(num_reqs, device=device).unsqueeze(1).expand(-1, K + 1)
+    output = torch.empty(
+        num_reqs, num_tokens * (K + 1), dtype=torch.int64, device=device
+    )
+    num_output = torch.zeros(num_reqs, dtype=torch.int64, device=device)
+    # Every step emits at least one token.
+    for _ in range(num_tokens):
+        pos = num_output.unsqueeze(1) + steps
+        inputs["pos"] = pos.reshape(-1)
+        sampled, num_sampled = rejection_sample(
+            **inputs, num_speculative_steps=K, use_block_verification=True
+        )
+        emitted = steps < num_sampled.unsqueeze(1)
+        output[rows[emitted], pos[emitted]] = sampled[emitted]
+        num_output += num_sampled
+
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for i in range(num_tokens):
+        _assert_distribution_match(
+            output[:, i], target_probs, device, label=f"token {i}"
+        )
+
+
 @pytest.mark.parametrize("num_speculative_steps", [3, 5])
 def test_block_verification_accepts_at_least_as_many(num_speculative_steps: int):
     """Block verification is designed to accept at least as long a prefix as

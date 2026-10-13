@@ -565,8 +565,15 @@ def _rejection_kernel(
             # placeholder via `accepted` instead.
             verifying &= is_valid_draft
         if verifying:
-            pos = tl.load(pos_ptr + logit_idx)
-            u = tl_rand32(seed, pos, includes_zero=False)
+            if USE_BLOCK_VERIFICATION:
+                # Block verification draws u for every draft token, and the next
+                # step verifies the ones past the accepted length again. Key u
+                # by this step's start position so that each step draws fresh u.
+                start_pos = tl.load(pos_ptr + start_idx).to(tl.int64)
+                rand_offset = (start_pos << 32) + i
+            else:
+                rand_offset = tl.load(pos_ptr + logit_idx)
+            u = tl_rand32(seed, rand_offset, includes_zero=False)
             if is_greedy:
                 # Greedy sampling. Accept IFF draft matches target argmax.
                 # NOTE: Target argmax is stored directly so that resampling
