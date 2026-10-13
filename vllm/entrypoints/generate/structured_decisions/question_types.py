@@ -113,12 +113,16 @@ def build_question(
         )
     if not isinstance(instructions, str):
         instructions = "" if instructions is None else str(instructions)
+    # The model answers with an option's name when the name is a label, so
+    # when every name is a label, the names are the labels. A mix of names
+    # and position labels confuses the model.
+    named = all(n in qtype.label_set for n in names)
     return Question(
         id=qid,
         type=qtype,
         instructions=instructions,
         options=tuple(options),
-        labels=qtype.label_set[: len(options)],
+        labels=tuple(names) if named else qtype.label_set[: len(options)],
     )
 
 
@@ -213,7 +217,8 @@ class ScoreQuestion(QuestionType):
     level names, from the first to the last level of the scale."""
 
     name = "score"
-    # 0-indexed like the answer, so a level's label is its score.
+    # 0-indexed like the answer, so a level's label is its score unless
+    # build_question() keeps a level's name as its label.
     label_set = tuple(string.digits)
     reply_instruction = "Answer with the number of one level only."
 

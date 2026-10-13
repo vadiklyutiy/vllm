@@ -122,6 +122,12 @@ Labels follow the type: a `choice` labels its options `A` to `Z` in the order
 the request lists them, a `noul` labels its options `yes` and `no`, and a
 `score` labels its levels `0` to `9`, so a level's label is its score.
 
+When every option's name is one of its type's labels, each option takes its
+name as its label. A `score` with levels `["1", "2", "3", "4", "5"]` is
+labeled `1` to `5`, and a `choice` with options `C`, `A`, `D` and `B` keeps
+those letters. Otherwise, as for `XS`, `S`, `M`, `L` and `XL`, all options are
+labeled in order.
+
 ## Limits
 
 | limit | value |

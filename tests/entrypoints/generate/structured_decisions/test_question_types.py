@@ -93,6 +93,24 @@ def test_one_option_choice():
     assert q.type.answer(q, [1.0], 0.4)["confidence"] == 0.4
 
 
+@pytest.mark.parametrize(
+    "type_name,criteria,labels",
+    [
+        ("score", ["1", "2", "3", "4", "5"], ("1", "2", "3", "4", "5")),
+        ("choice", dict.fromkeys(["C", "A", "D", "B"]), ("C", "A", "D", "B")),
+        ("choice", dict.fromkeys(["I", "II", "III", "IV"]), ("A", "B", "C", "D")),
+        ("choice", dict.fromkeys(["XS", "S", "M", "L", "XL"]), tuple("ABCDE")),
+    ],
+)
+def test_labels_of_options_named_like_labels(type_name, criteria, labels):
+    """The model answers an option's name when it is a label, so when every
+    name is a label, each option takes its name as its label. A mix of name
+    and position labels confuses the model, so then every option keeps its
+    position label."""
+    q = build_question("q", type_name, "", criteria, 128)
+    assert q.labels == labels
+
+
 def test_option_limit():
     with pytest.raises(StructuredDecisionError, match="at most 2 options"):
         choice(criteria={"x": None, "y": None, "z": None}, max_options=2)
