@@ -655,6 +655,7 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        self.enable_fault_tolerance = vllm_config.parallel_config.enable_fault_tolerance
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -820,7 +821,7 @@ class WorkerProc:
 
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
-    def shutdown(self):
+    def shutdown(self, destroy_process_groups: bool = True):
         if self.rpc_broadcast_mq is not None:
             self.rpc_broadcast_mq.shutdown()
         if self.worker_response_mq is not None:
@@ -828,8 +829,9 @@ class WorkerProc:
         self.worker.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
-        destroy_model_parallel()
-        destroy_distributed_environment()
+        if destroy_process_groups:
+            destroy_model_parallel()
+            destroy_distributed_environment()
 
     def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
         if death_pipe is None:
@@ -895,6 +897,7 @@ class WorkerProc:
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
         worker = None
+        failed = False
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
 
@@ -944,8 +947,9 @@ class WorkerProc:
             worker.worker_busy_loop()
 
         except Exception:
-            # NOTE: if an Exception arises in busy_loop, we send
-            # a FAILURE message over the MQ RPC to notify the Executor,
+            # NOTE: errors whose reply the Executor reads are sent as FAILURE
+            # messages by _execute_worker_rpc. An Exception that gets here ends
+            # this process, which the Executor sees as a worker failure and
             # which triggers system shutdown.
             # TODO(rob): handle case where the MQ itself breaks.
 
@@ -957,6 +961,9 @@ class WorkerProc:
                 )
             else:
                 logger.exception("WorkerProc failed.")
+                # Peers may be blocked in collectives with this rank, so a
+                # graceful process group teardown could block this exit.
+                failed = True
 
             # The parent sends a SIGTERM to all worker processes if
             # any worker dies. Set this value so we don't re-throw
@@ -982,7 +989,7 @@ class WorkerProc:
                 death_pipe.close()
             # Clean up once worker exits busy loop
             if worker is not None:
-                worker.shutdown()
+                worker.shutdown(destroy_process_groups=not failed)
 
     class ResponseStatus(Enum):
         SUCCESS = auto()
@@ -1057,6 +1064,17 @@ class WorkerProc:
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(output)
         except Exception as e:
+            if (
+                output_rank is not None
+                and self.rank != output_rank
+                and not self.enable_fault_tolerance
+            ):
+                # The executor reads no reply from this rank, so it would never
+                # learn of the error. Exit the busy loop instead of running the
+                # next RPC out of step with the other ranks; the executor sees
+                # this worker die. With fault tolerance, a fault raised on every
+                # rank is recovered by `retry`, which needs this worker alive.
+                raise
             # Notes have been introduced in python 3.11
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())

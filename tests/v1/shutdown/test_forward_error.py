@@ -13,7 +13,7 @@ from tests.v1.shutdown.utils import (
     SHUTDOWN_TEST_TIMEOUT_SEC,
 )
 from vllm import LLM, AsyncEngineArgs, SamplingParams
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -34,6 +34,24 @@ def evil_forward(self, *args, **kwargs):
         and get_tensor_model_parallel_rank() == 0
     ):
         raise Exception("Simulated illegal memory access on Rank 0!")
+    self.num_calls += 1
+
+    kwargs.setdefault("intermediate_tensors", None)  # required for MRV2
+    return self.model(*args, **kwargs)
+
+
+def evil_forward_non_output_rank(self, *args, **kwargs):
+    """Raise after 10 calls on a rank whose reply the executor does not
+    read (TP rank 1, or a PP rank that is not the last)."""
+    NUMBER_OF_GOOD_PASSES = 10
+
+    if not hasattr(self, "num_calls"):
+        self.num_calls = 0
+
+    if self.num_calls == NUMBER_OF_GOOD_PASSES and (
+        get_tensor_model_parallel_rank() == 1 or not get_pp_group().is_last_rank
+    ):
+        raise Exception("Simulated illegal memory access on a non-output rank!")
     self.num_calls += 1
 
     kwargs.setdefault("intermediate_tensors", None)  # required for MRV2
@@ -147,5 +165,55 @@ def test_llm_model_error(
         # Confirm all the processes are cleaned up.
         wait_for_gpu_memory_to_clear(
             devices=list(range(tensor_parallel_size)),
+            threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
+        )
+
+
+@pytest.fixture
+def rocm_evil_forward_non_output_rank(rocm_sitecustomize_factory):
+    lines = [
+        "from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank",
+        "from vllm.model_executor.models.llama import LlamaForCausalLM",
+        inspect.getsource(evil_forward_non_output_rank),
+        f"LlamaForCausalLM.forward = {evil_forward_non_output_rank.__name__}",
+    ]
+    rocm_sitecustomize_factory(lines)
+
+
+@pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
+@pytest.mark.parametrize(
+    "tensor_parallel_size,pipeline_parallel_size", [(2, 1), (1, 2)]
+)
+@pytest.mark.parametrize("model", MODELS)
+def test_llm_non_output_rank_model_error(
+    monkeypatch,
+    rocm_evil_forward_non_output_rank,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    model: str,
+) -> None:
+    """The executor reads no reply from a non-output rank, so the engine must
+    learn of its error from the worker exiting, well before the execute-model
+    timeout."""
+    world_size = tensor_parallel_size * pipeline_parallel_size
+    if current_platform.device_count() < world_size:
+        pytest.skip(reason="Not enough CUDA devices")
+
+    with monkeypatch.context() as m:
+        m.setattr(LlamaForCausalLM, "forward", evil_forward_non_output_rank)
+
+        llm = LLM(
+            model=model,
+            enforce_eager=True,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            distributed_executor_backend="mp",
+        )
+
+        with pytest.raises(EngineDeadError):
+            llm.generate("Hello my name is Robert and I")
+
+        wait_for_gpu_memory_to_clear(
+            devices=list(range(world_size)),
             threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
         )

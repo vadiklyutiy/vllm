@@ -222,6 +222,7 @@ class RayWorkerProc(WorkerProc):
 
     def run(self) -> None:
         """Main entry point called via actor.run.remote()."""
+        failed = False
         try:
             assert self.rpc_broadcast_mq is not None
             self.rpc_broadcast_mq.wait_until_ready()
@@ -231,9 +232,10 @@ class RayWorkerProc(WorkerProc):
             self.worker_busy_loop()
         except Exception as e:
             logger.exception("RayWorkerProc failed: %s", e)
+            failed = True
             raise
         finally:
-            self.shutdown()
+            self.shutdown(destroy_process_groups=not failed)
 
 
 class RayExecutorV2(MultiprocExecutor):

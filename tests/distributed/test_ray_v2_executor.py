@@ -325,6 +325,48 @@ def test_ray_v2_single_node_generation(tp_size, pp_size):
         gc.collect()
 
 
+@pytest.mark.parametrize("tp_size, pp_size", [(2, 1), (1, 2)])
+def test_ray_v2_non_output_rank_error(tp_size, pp_size):
+    """The executor reads no reply from a non-output rank, so a step error
+    there must end the worker's run() for the monitor to fail the executor."""
+
+    # Defined here so it is pickled by value: Ray workers cannot import the
+    # tests package.
+    def fail_step_on_non_output_rank(worker):
+        from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() == 0 and get_pp_group().is_last_rank:
+            return
+        execute_model = worker.worker.execute_model
+
+        def failing_execute_model(scheduler_output):
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                raise RuntimeError("Simulated fault on a non-output rank")
+            return execute_model(scheduler_output)
+
+        worker.worker.execute_model = failing_execute_model
+
+    llm = LLM(
+        model=MODEL,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        distributed_executor_backend="ray",
+        enforce_eager=True,
+        max_model_len=256,
+        gpu_memory_utilization=0.3,
+    )
+    executor = llm.llm_engine.model_executor
+    try:
+        llm.collective_rpc(fail_step_on_non_output_rank)
+        with pytest.raises(RuntimeError):
+            llm.generate("Hello, my name is")
+        assert executor.is_failed
+    finally:
+        executor.shutdown()
+        del llm
+        gc.collect()
+
+
 @pytest.mark.parametrize(
     "bundle_indices, expected_bundle_ids, create_placement_group",
     [("2,3", [2, 3], 4), ("3,2", [3, 2], 4)],
