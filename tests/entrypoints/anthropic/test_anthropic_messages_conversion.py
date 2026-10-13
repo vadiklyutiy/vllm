@@ -1003,6 +1003,74 @@ class TestInlineSystemMessageInMessagesArray:
         assert result.messages[1]["content"] == "Real system content."
 
 
+class TestNonTextSystemBlocks:
+    """System content is converted to text only, so dropping any other block
+    must be warned about (#61172)."""
+
+    IMAGE_BLOCK = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+    }
+
+    @pytest.fixture
+    def mock_logger(self, monkeypatch):
+        import vllm.entrypoints.anthropic.serving as serving_mod
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(serving_mod, "logger", mock_logger)
+        return mock_logger
+
+    def test_top_level_image_block_warns(self, mock_logger):
+        request = _make_request(
+            [{"role": "user", "content": "Hi"}],
+            system=[{"type": "text", "text": "Read the image."}, self.IMAGE_BLOCK],
+        )
+        result = _convert(request)
+        assert result.messages[0] == {"role": "system", "content": "Read the image."}
+        mock_logger.warning_once.assert_called_once()
+        assert mock_logger.warning_once.call_args.args[1] == "image"
+
+    @pytest.mark.parametrize("merge_inline_system", [False, True])
+    def test_inline_image_block_warns(self, mock_logger, merge_inline_system):
+        request = _make_request(
+            [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Read the image."},
+                        self.IMAGE_BLOCK,
+                    ],
+                },
+            ]
+        )
+        result = _convert(request, merge_inline_system=merge_inline_system)
+        assert {"role": "system", "content": "Read the image."} in result.messages
+        mock_logger.warning_once.assert_called_once()
+        assert mock_logger.warning_once.call_args.args[1] == "image"
+
+    def test_text_and_tool_change_blocks_do_not_warn(self, mock_logger):
+        request = _make_request(
+            [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Tools changed."},
+                        {
+                            "type": "tool_addition",
+                            "tool": {"type": "tool_reference", "name": "bash"},
+                        },
+                    ],
+                },
+            ],
+            system=[{"type": "text", "text": "Be concise."}],
+            tools=[{"name": "bash", "input_schema": {}}],
+        )
+        _convert(request)
+        mock_logger.warning_once.assert_not_called()
+
+
 # ======================================================================
 # Streaming conversion: message_stream_converter
 # ======================================================================

@@ -139,6 +139,14 @@ def _is_json(text: str) -> bool:
     return True
 
 
+def _warn_ignored_system_block(block_type: str) -> None:
+    logger.warning_once(
+        "System content should only contain text blocks according to the "
+        "Anthropic API spec. Ignoring content block of type: '%s'.",
+        block_type,
+    )
+
+
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
@@ -371,6 +379,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                         if block.text.startswith("x-anthropic-billing-header"):
                             continue
                         system_parts.append(block.text)
+                    elif block.type != "text":
+                        _warn_ignored_system_block(block.type)
 
         # When the template requires system-first ordering, extract inline
         # system messages from the messages array and merge them into the
@@ -400,6 +410,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                 if block.text.startswith("x-anthropic-billing-header"):
                     continue
                 parts.append(block.text)
+            elif block.type not in ("text", "tool_addition", "tool_removal"):
+                _warn_ignored_system_block(block.type)
         return "".join(parts) if parts else None
 
     @classmethod
