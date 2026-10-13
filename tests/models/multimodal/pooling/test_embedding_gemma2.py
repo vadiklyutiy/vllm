@@ -3,6 +3,7 @@
 
 import ast
 import inspect
+import json
 import os
 import textwrap
 
@@ -237,6 +238,37 @@ def test_tower_skip(vllm_runner, monkeypatch):
         assert abs(p_full - 744.37) <= 0.05, (
             f"Expected 744.37M full params, got {p_full}M"
         )
+
+
+@pytest.mark.parametrize("dense_out, expected", [(None, 768), (1024, 1024)])
+def test_matryoshka_full_embedding_dim(tmp_path, dense_out, expected):
+    """`dimensions` may equal the full output size, not just hidden_size."""
+    from transformers.models.embedding_gemma2.configuration_embedding_gemma2 import (
+        EmbeddingGemma2Config,
+    )
+
+    from vllm import PoolingParams
+    from vllm.config import ModelConfig
+
+    EmbeddingGemma2Config(
+        architectures=["EmbeddingGemma2Model"],
+        text_config={"hidden_size": 512, "embedding_dim": 768},
+    ).save_pretrained(tmp_path)
+    if dense_out is not None:
+        dense = {"path": "2_Dense", "type": "sentence_transformers.models.Dense"}
+        (tmp_path / "modules.json").write_text(json.dumps([dense]))
+        (tmp_path / "2_Dense").mkdir()
+        (tmp_path / "2_Dense" / "config.json").write_text(
+            json.dumps({"in_features": 768, "out_features": dense_out})
+        )
+    model_config = ModelConfig(
+        str(tmp_path),
+        runner="pooling",
+        skip_tokenizer_init=True,
+        hf_overrides={"is_matryoshka": True},
+    )
+    assert model_config.embedding_size == expected
+    PoolingParams(task="embed", dimensions=expected).verify(model_config)
 
 
 def test_encoder_contract():

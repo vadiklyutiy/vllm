@@ -314,6 +314,20 @@ class EmbeddingGemma2ModelConfig(Gemma4Config):
         ) in (None, -1):
             model_config.max_model_len = 8192
 
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        from vllm.transformers_utils.config import try_get_dense_modules
+
+        # The pooled output is projected from hidden_size to embedding_dim.
+        # A Sentence-Transformers Dense head, if any, sets the final size.
+        dense_modules = try_get_dense_modules(
+            model_config.model, revision=model_config.revision
+        )
+        if dense_modules is None:
+            model_config.hf_config.embedding_size = (
+                model_config.hf_text_config.embedding_dim
+            )
+
 
 class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
     @classmethod
