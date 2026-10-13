@@ -59,6 +59,19 @@ def _verify_num_sequences(value: int, parameter_name: str) -> None:
         )
 
 
+def _verify_int(value: Any, parameter_name: str, optional: bool = False) -> None:
+    if optional and value is None:
+        return
+    # The engine decodes requests with strict msgspec types, which reject
+    # floats and bools in int fields.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise VLLMValidationError(
+            f"{parameter_name} must be an int, got {type(value).__name__}.",
+            parameter=parameter_name,
+            value=value,
+        )
+
+
 def validate_thinking_token_budget(value: int | float | bool | None) -> int | None:
     """Validate ``thinking_token_budget``; return ``None`` if unset."""
     if value is None:
@@ -630,6 +643,17 @@ class SamplingParams(
 
     def _verify_args(self) -> None:
         _verify_num_sequences(self.n, "n")
+        for name in ("n", "top_k", "min_tokens", "routed_experts_prompt_start"):
+            _verify_int(getattr(self, name), name)
+        for name in (
+            "max_tokens",
+            "logprobs",
+            "prompt_logprobs",
+            "prompt_logprob_start",
+            "seed",
+            "stream_interval",
+        ):
+            _verify_int(getattr(self, name), name, optional=True)
         if self.extra_args:
             self._verify_extra_args()
         if not -2.0 <= self.presence_penalty <= 2.0:
@@ -679,10 +703,6 @@ class SamplingParams(
             raise VLLMValidationError(
                 f"top_k must be 0 (disable), or at least 1, got {self.top_k}."
             )
-        if not isinstance(self.top_k, int):
-            raise VLLMValidationError(
-                f"top_k must be an integer, got {type(self.top_k).__name__}"
-            )
         if not 0.0 <= self.min_p <= 1.0:
             raise VLLMValidationError(f"min_p must be in [0, 1], got {self.min_p}.")
         if self.max_tokens is not None and self.max_tokens < 1:
@@ -724,7 +744,10 @@ class SamplingParams(
                 value=self.prompt_logprobs,
             )
         assert isinstance(self.stop_token_ids, list)
-        if not all(isinstance(st_id, int) for st_id in self.stop_token_ids):
+        if not all(
+            isinstance(st_id, int) and not isinstance(st_id, bool)
+            for st_id in self.stop_token_ids
+        ):
             raise VLLMValidationError(
                 f"stop_token_ids must contain only integers, got {self.stop_token_ids}."
             )

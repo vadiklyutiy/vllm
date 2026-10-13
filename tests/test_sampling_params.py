@@ -280,3 +280,34 @@ def test_extra_args_preserves_custom_objects_and_shared_containers():
     params = SamplingParams(extra_args=extra_args)
     assert params.extra_args["first"][0] is custom
     assert params.extra_args["first"] is params.extra_args["second"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_tokens": 2.5},
+        {"max_tokens": 3.0},
+        {"max_tokens": True},
+        {"min_tokens": 1.5},
+        {"logprobs": 3.5},
+        {"logprobs": False},
+        {"prompt_logprobs": 1.5},
+        {"prompt_logprob_start": True},
+        {"seed": 1.5},
+        {"stream_interval": 2.5},
+        {"routed_experts_prompt_start": 1.5},
+        {"n": True},
+        {"top_k": True},
+    ],
+)
+def test_int_params_reject_non_int(kwargs):
+    """The engine's strict msgspec decoder rejects these values, which left
+    `LLM.generate()` hanging, so construction must reject them instead."""
+    (name,) = kwargs
+    with pytest.raises(VLLMValidationError, match=f"{name} must be an int"):
+        SamplingParams(**kwargs)
+
+
+def test_stop_token_ids_reject_bool():
+    with pytest.raises(VLLMValidationError, match="stop_token_ids must contain only"):
+        SamplingParams(stop_token_ids=[True])
