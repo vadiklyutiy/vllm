@@ -332,12 +332,13 @@ class NgramProposerGPU:
             valid_sampled_tokens_count: Count of valid tokens per sequence
 
         Returns:
-            draft_tokens: Proposed draft token IDs [batch_size, k]
+            draft_tokens: Proposed draft token IDs
+                [batch_size, num_speculative_tokens]
             num_valid_draft_tokens: Count of leading valid draft tokens
                 per request [batch_size]
 
         """
-        assert num_speculative_tokens == self.k
+        assert num_speculative_tokens <= self.k
         assert token_ids_gpu.device == self.device
         assert num_tokens_no_spec.device == self.device
 
@@ -385,6 +386,11 @@ class NgramProposerGPU:
                     token_ids_gpu,
                     combined_mask,
                 )
+
+            # The kernel is compiled for self.k; Dynamic SD may ask for fewer.
+            if num_speculative_tokens < self.k:
+                draft_tokens = draft_tokens[:, :num_speculative_tokens]
+                num_valid_draft_tokens.clamp_(max=num_speculative_tokens)
 
             return draft_tokens, num_valid_draft_tokens
 

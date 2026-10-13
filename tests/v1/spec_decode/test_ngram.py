@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import numpy as np
+import pytest
+import torch
 
 from vllm.config import (
     ModelConfig,
+    SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
+    set_current_vllm_config,
 )
 from vllm.v1.spec_decode.ngram_proposer import (
     NgramProposer,
     _find_longest_matched_ngram_and_propose_tokens,
 )
+from vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU
 
 
 def test_find_longest_matched_ngram_and_propose_tokens():
@@ -212,3 +217,51 @@ def test_ngram_proposer():
     assert len(result[0]) == 2
     assert np.array_equal(result[0], np.array([middle_integer + 2, middle_integer + 3]))
     assert np.array_equal(result[1], np.array([]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_ngram_proposer_gpu_dynamic_num_speculative_tokens():
+    """Dynamic SD may ask for fewer drafts than num_speculative_tokens."""
+    device = torch.device("cuda:0")
+    max_model_len = 16
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(model="Qwen/Qwen3-0.6B", max_model_len=max_model_len),
+        scheduler_config=SchedulerConfig.default_factory(
+            max_num_seqs=2, max_model_len=max_model_len
+        ),
+        speculative_config=SpeculativeConfig(
+            prompt_lookup_min=2,
+            prompt_lookup_max=2,
+            num_speculative_tokens=3,
+            method="ngram_gpu",
+        ),
+    )
+    with set_current_vllm_config(vllm_config):
+        proposer = NgramProposerGPU(vllm_config, device)
+
+    # After sampling 2, request 0 ends with [1, 2], which is followed by
+    # [3, 1, 2] earlier in the sequence. Request 1 has no match.
+    for k, expected in [
+        (3, [[3, 1, 2], [-1, -1, -1]]),
+        (1, [[3], [-1]]),
+        (0, [[], []]),
+    ]:
+        token_ids_gpu = torch.zeros(
+            (2, max_model_len), dtype=torch.int32, device=device
+        )
+        token_ids_gpu[0, :4] = torch.tensor([1, 2, 3, 1])
+        token_ids_gpu[1, :4] = torch.tensor([4, 5, 6, 7])
+        draft_tokens, num_valid_draft_tokens = proposer.propose(
+            k,
+            num_tokens_no_spec=torch.tensor([4, 4], dtype=torch.int32, device=device),
+            token_ids_gpu=token_ids_gpu,
+            valid_sampled_token_ids_gpu=torch.tensor(
+                [[2], [8]], dtype=torch.int32, device=device
+            ),
+            valid_sampled_tokens_count=torch.tensor(
+                [1, 1], dtype=torch.int32, device=device
+            ),
+        )
+        assert draft_tokens.shape == (2, k)
+        assert draft_tokens.tolist() == expected
+        assert num_valid_draft_tokens.tolist() == [k, 0]
