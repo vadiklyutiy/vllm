@@ -427,8 +427,9 @@ class Qwen3ASRForConditionalGeneration(
 
         # inputs features from rust frontend is batched and padded
         # with shape [batch_size, n_mels, padded_seq_len], different
-        # from python's shape [n_mels, batch_size * seq_len]
-        if (
+        # from python's shape [n_mels, batch_size * seq_len]. Items with
+        # different padded_seq_len are not stacked and arrive as a list.
+        if isinstance(input_audio_features, list) or (
             isinstance(input_audio_features, torch.Tensor)
             and input_audio_features.dim() == 3
         ):
