@@ -147,3 +147,41 @@ async def test_audio_connector_threads_byte_limit_to_http_reader(
     connector = MediaConnector(connection=_Connection())
     with pytest.raises(VLLMValidationError, match="Maximum file size exceeded"):
         await connector.fetch_audio_async("https://example.test/audio")
+
+
+def test_audio_zero_limit_disables_encoded_size_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", 0)
+
+    audio_file = tmp_path / "clip.wav"
+    audio_file.write_bytes(b"x")
+    audio_io = AudioMediaIO()
+
+    with patch(
+        "vllm.multimodal.media.audio.load_audio", return_value=(None, 0.0)
+    ) as decode:
+        audio_io.load_bytes(b"x")
+        audio_io.load_base64("audio/wav", "eA==")
+        audio_io.load_file(audio_file)
+
+    assert decode.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_audio_connector_zero_limit_disables_http_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", 0)
+    fetch_kwargs = {}
+
+    class _Connection:
+        async def async_get_bytes(self, _url: str, **kwargs):
+            fetch_kwargs.update(kwargs)
+            return b"x"
+
+    connector = MediaConnector(connection=_Connection())
+    with patch("vllm.multimodal.media.audio.load_audio", return_value=(None, 0.0)):
+        await connector.fetch_audio_async("https://example.test/audio")
+
+    assert fetch_kwargs["max_bytes"] is None

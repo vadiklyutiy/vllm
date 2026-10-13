@@ -1020,6 +1020,28 @@ async def test_download_bytes_allows_http_body_at_audio_limit(
 
 
 @pytest.mark.asyncio
+async def test_download_bytes_zero_audio_limit_disables_check(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_http_server: _BatchHTTPServer,
+):
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", 0)
+    connection = HTTPConnection()
+    monkeypatch.setattr(
+        "vllm.entrypoints.launchers.run_batch.global_http_connection",
+        connection,
+    )
+
+    try:
+        assert await download_bytes_from_url("data:audio/wav;base64,eA==") == b"x"
+        result = await download_bytes_from_url(
+            _batch_http_url(batch_http_server, "/exact-limit")
+        )
+        assert result == _EXACT_LIMIT_AUDIO
+    finally:
+        await _close_async_connection(connection)
+
+
+@pytest.mark.asyncio
 async def test_transcription_wrapper_rejects_oversized_http_before_handler(
     monkeypatch: pytest.MonkeyPatch,
     batch_http_server: _BatchHTTPServer,

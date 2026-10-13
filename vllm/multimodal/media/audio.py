@@ -550,12 +550,15 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
         # for flexible control.
         self.kwargs = kwargs
 
-    def get_max_bytes(self) -> int:
-        return int(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * MiB_bytes)
+    def get_max_bytes(self) -> int | None:
+        max_size_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
+        if max_size_mb <= 0:
+            return None
+        return int(max_size_mb * MiB_bytes)
 
     def _validate_encoded_size(self, size: int) -> None:
         max_bytes = self.get_max_bytes()
-        if size > max_bytes:
+        if max_bytes is not None and size > max_bytes:
             raise VLLMValidationError(
                 "Maximum file size exceeded",
                 parameter="audio_filesize_mb",
@@ -577,8 +580,8 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
         media_type: str,
         data: str,
     ) -> tuple[npt.NDArray, float]:
-        max_encoded_chars = 4 * ((self.get_max_bytes() + 2) // 3)
-        if len(data) > max_encoded_chars:
+        max_bytes = self.get_max_bytes()
+        if max_bytes is not None and len(data) > 4 * ((max_bytes + 2) // 3):
             raise VLLMValidationError(
                 "Maximum file size exceeded",
                 parameter="audio_filesize_mb",

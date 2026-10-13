@@ -37,6 +37,8 @@ async def read_upload_with_limit(
     """
     if max_size_mb is None:
         max_size_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
+    if max_size_mb <= 0:
+        return await file.read()
 
     max_bytes = int(max_size_mb * MiB_bytes)
 

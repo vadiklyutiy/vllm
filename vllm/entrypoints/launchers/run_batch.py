@@ -74,8 +74,11 @@ from .cli_args import BaseFrontendArgs
 logger = init_logger(__name__)
 
 
-def _get_audio_download_limit_bytes() -> int:
-    return int(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * MiB_bytes)
+def _get_audio_download_limit_bytes() -> int | None:
+    max_size_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
+    if max_size_mb <= 0:
+        return None
+    return int(max_size_mb * MiB_bytes)
 
 
 def _raise_audio_filesize_limit(size_bytes: int) -> NoReturn:
@@ -483,7 +486,8 @@ async def download_bytes_from_url(
             header, data = url.split(",", 1)
             if "base64" in header:
                 decoded_size_bytes = len(data.rstrip("=")) * 3 // 4
-                if decoded_size_bytes > _get_audio_download_limit_bytes():
+                max_bytes = _get_audio_download_limit_bytes()
+                if max_bytes is not None and decoded_size_bytes > max_bytes:
                     _raise_audio_filesize_limit(decoded_size_bytes)
                 return base64.b64decode(data)
             else:
