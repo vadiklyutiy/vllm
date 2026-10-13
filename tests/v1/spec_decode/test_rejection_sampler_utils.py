@@ -557,6 +557,76 @@ def test_gumbel_drafted_rejection_sample_is_unbiased(num_speculative_steps: int)
         )
 
 
+@pytest.mark.parametrize("use_block_verification", [False, True])
+def test_narrow_draft_vocab_rejection_sample(use_block_verification: bool):
+    """A draft head narrower than the target gives zero probability to the
+    target tokens beyond its vocab. Those tokens must still be emitted with
+    their target probability.
+    """
+    torch.manual_seed(42)
+    device = "cuda"
+    num_speculative_steps = 3
+    draft_vocab_size = NARROW_VOCAB_SIZE // 2
+
+    target_logits_1d = torch.randn(
+        NARROW_VOCAB_SIZE, device=device, dtype=torch.float32
+    )
+    draft_logits_1d = torch.randn(draft_vocab_size, device=device, dtype=torch.float32)
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d[:draft_vocab_size],
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=1.0,
+        num_trials=NARROW_NUM_TRIALS,
+    )
+    num_logits = inputs["target_logits"].shape[0]
+    inputs["target_logits"] = target_logits_1d.expand(num_logits, -1).contiguous()
+
+    sampled, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=num_speculative_steps,
+        use_block_verification=use_block_verification,
+    )
+
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for pos in range(num_speculative_steps + 1):
+        accepted_mask = num_sampled >= pos + 1
+        _assert_distribution_match(
+            sampled[accepted_mask, pos], target_probs, device, label=f"position {pos}"
+        )
+
+
+def test_narrow_draft_vocab_greedy_rejection_sample():
+    """A greedy row must emit the target argmax even when it lies beyond the
+    draft's vocab.
+    """
+    device = "cuda"
+    num_speculative_steps = 3
+    draft_vocab_size = NARROW_VOCAB_SIZE // 2
+
+    target_logits_1d = torch.zeros(NARROW_VOCAB_SIZE, device=device)
+    target_logits_1d[-1] = 1.0
+    draft_logits_1d = torch.zeros(draft_vocab_size, device=device)
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d[:draft_vocab_size],
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=0.0,
+        num_trials=1,
+    )
+    num_logits = inputs["target_logits"].shape[0]
+    inputs["target_logits"] = target_logits_1d.expand(num_logits, -1).contiguous()
+
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=num_speculative_steps
+    )
+
+    assert num_sampled.item() == 1
+    assert sampled[0, 0].item() == NARROW_VOCAB_SIZE - 1
+
+
 @pytest.mark.parametrize("num_speculative_steps", [1, 3])
 def test_greedy_rejection_sample(num_speculative_steps: int):
     """Verify that greedy (temperature=0) always outputs the target argmax

@@ -120,6 +120,7 @@ def _compute_global_target_argmax(
 def _compute_global_logprobs_and_logsumexp(
     token,
     mask,
+    draft_mask,
     logit_idx,
     req_state_idx,
     draft_step,
@@ -168,7 +169,7 @@ def _compute_global_logprobs_and_logsumexp(
                 + req_state_idx * draft_logits_stride_0
                 + draft_step * draft_logits_stride_1
                 + token,
-                mask=mask,
+                mask=draft_mask,
                 other=float("-inf"),
             ).to(tl.float32)
             / temp
@@ -221,6 +222,7 @@ def _compute_local_logits_stats_kernel(
     # [max_num_reqs]
     temp_ptr,
     vocab_size,
+    draft_vocab_size,
     num_speculative_steps,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
@@ -285,7 +287,7 @@ def _compute_local_logits_stats_kernel(
                     + req_state_idx * draft_logits_stride_0
                     + draft_step_idx * draft_logits_stride_1
                     + block_offsets,
-                    mask=mask,
+                    mask=block_offsets < draft_vocab_size,
                     other=float("-inf"),
                 ).to(tl.float32)
                 / temp
@@ -358,6 +360,7 @@ def _compute_cumulative_log_p_kernel(
                 _compute_global_logprobs_and_logsumexp(
                     draft_token,
                     True,  # mask
+                    True,  # draft_mask
                     logit_idx,
                     req_state_idx,
                     step,
@@ -419,6 +422,7 @@ def _compute_local_residual_mass_kernel(
     # [max_num_reqs]
     temp_ptr,
     vocab_size,
+    draft_vocab_size,
     num_speculative_steps,
     vocab_num_blocks,
     BLOCK_SIZE: tl.constexpr,
@@ -448,6 +452,7 @@ def _compute_local_residual_mass_kernel(
     target_log_probs, draft_log_probs, _, _ = _compute_global_logprobs_and_logsumexp(
         block_offsets,
         mask,
+        block_offsets < draft_vocab_size,
         logit_idx,
         req_state_idx,
         draft_step_idx,
@@ -631,6 +636,7 @@ def _rejection_kernel(
                     _compute_global_logprobs_and_logsumexp(
                         draft_sampled,
                         True,  # mask
+                        True,  # draft_mask
                         logit_idx,
                         req_state_idx,
                         i,
@@ -771,6 +777,7 @@ def _resample_kernel(
     watermark_key_0,
     watermark_key_1,
     vocab_size,
+    draft_vocab_size,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     USE_FP64: tl.constexpr,
@@ -841,7 +848,7 @@ def _resample_kernel(
                 + req_state_idx * draft_logits_stride_0
                 + resample_idx * draft_logits_stride_1
                 + block,
-                mask=mask,
+                mask=block < draft_vocab_size,
                 other=float("-inf"),
             ).to(tl.float32)
             / temp
@@ -1082,12 +1089,14 @@ def rejection_sample(
         watermark_key_1 = watermark_key >> 32
     draft_logits_stride_0 = 0
     draft_logits_stride_1 = 0
+    draft_vocab_size = vocab_size
     if has_draft_logits := draft_logits is not None:
         draft_logits_stride_0 = draft_logits.stride(0)
         draft_logits_stride_1 = draft_logits.stride(1)
         # In some cases (e.g. MiMo v2.5 Pro + DFlash) the target model's
-        # vocab size is larger than the draft's due to padding.
-        vocab_size = min(vocab_size, draft_logits.size(-1))
+        # vocab size is larger than the draft's. The draft gives zero
+        # probability to the target tokens beyond its vocab.
+        draft_vocab_size = min(vocab_size, draft_logits.size(-1))
 
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
@@ -1130,6 +1139,7 @@ def rejection_sample(
         expanded_local_pos,
         temperature,
         vocab_size,
+        draft_vocab_size,
         num_speculative_steps,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
@@ -1201,6 +1211,7 @@ def rejection_sample(
                 expanded_local_pos,
                 temperature,
                 vocab_size,
+                draft_vocab_size,
                 num_speculative_steps,
                 vocab_num_blocks,
                 BLOCK_SIZE=VOCAB_BLOCK_SIZE,
@@ -1298,6 +1309,7 @@ def rejection_sample(
         watermark_key_0,
         watermark_key_1,
         vocab_size,
+        draft_vocab_size,
         BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
         USE_FP64=use_fp64,
