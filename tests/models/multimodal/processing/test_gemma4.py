@@ -9,10 +9,14 @@ import torch
 from PIL import Image as PILImage
 
 from vllm.exceptions import VLLMValidationError
+from vllm.model_executor.models.diffusion_gemma import (
+    DiffusionGemmaForConditionalGeneration,
+)
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
     Gemma4ImagePixelInputs,
 )
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import MultiModalProcessorOnlyCache
 from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -199,6 +203,50 @@ def test_get_prompt_updates_respects_nested_max_soft_tokens(model_id: str):
     ).full
 
     assert replacement == expected
+
+
+@pytest.mark.parametrize(
+    "model_cls,model_id,modality,data",
+    [
+        (
+            Gemma4ForConditionalGeneration,
+            GEMMA4_MODEL_ID,
+            "image",
+            PILImage.new("RGB", (48, 48)),
+        ),
+        (
+            Gemma4ForConditionalGeneration,
+            GEMMA4_MODEL_ID,
+            "audio",
+            (np.zeros(16000, dtype=np.float32), 16000),
+        ),
+        (
+            DiffusionGemmaForConditionalGeneration,
+            "google/diffusiongemma-26B-A4B-it",
+            "image",
+            PILImage.new("RGB", (48, 48)),
+        ),
+    ],
+)
+def test_placeholder_str_is_replaced(
+    model_cls: type[SupportsMultiModal],
+    model_id: str,
+    modality: str,
+    data: object,
+):
+    """The placeholder that string-format chat requests put in the prompt must
+    be the token that the prompt update replaces.
+    """
+    ctx = build_model_context(model_id, limit_mm_per_prompt={modality: 1})
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+
+    result = processor(
+        model_cls.get_placeholder_str(modality, 1),
+        mm_items=processor.info.parse_mm_data({modality: data}),
+        hf_processor_mm_kwargs={},
+    )
+
+    assert len(result["mm_placeholders"][modality]) == 1
 
 
 @pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
