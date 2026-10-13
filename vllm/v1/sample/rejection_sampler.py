@@ -415,7 +415,7 @@ def rejection_sample(
     max_spec_len: int,
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
-    # [num_tokens, vocab_size]
+    # [num_tokens, draft_vocab_size <= vocab_size]
     draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_logits: torch.Tensor,
@@ -482,6 +482,14 @@ def rejection_sample(
         )
         if sampling_metadata.all_greedy:
             return output_token_ids
+
+    if draft_probs is not None and draft_probs.shape[-1] < vocab_size:
+        # A draft head with a smaller vocab (e.g. EAGLE) gives probability 0 to
+        # the ids beyond its width. The kernels index draft_probs with the
+        # target's vocab_size as row stride, so pad it to that width.
+        draft_probs = nn.functional.pad(
+            draft_probs, (0, vocab_size - draft_probs.shape[-1])
+        )
 
     # Compute probability distribution from target logits.
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)

@@ -14,6 +14,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    rejection_sample,
     sample_recovered_tokens,
 )
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
@@ -375,6 +376,55 @@ def test_deterministic_when_seeded(
         if seeded_mask[i]:
             for j in range(1, n_rep):
                 assert torch.equal(results[j][i], results[0][i])
+
+
+def test_narrow_draft_probs_match_zero_padded():
+    """A draft head with a smaller vocab than the target (e.g. EAGLE) gives
+    draft_probs narrower than the target logits. They must be sampled as if
+    zero-padded to the target width, not read with the target's row stride.
+    """
+    batch_size, k, vocab_size, draft_vocab_size = 8, 3, 1024, 16
+    num_tokens = batch_size * k
+    draft_probs = F.softmax(
+        torch.rand(num_tokens, draft_vocab_size, device=DEVICE_TYPE), dim=-1
+    )
+    # Place the narrow rows at the start of a buffer of -1 so that reads with
+    # the target's row stride stay in bounds but see a non-probability.
+    buffer = torch.full((num_tokens * vocab_size,), -1.0, device=DEVICE_TYPE)
+    buffer[: draft_probs.numel()] = draft_probs.flatten()
+    narrow_draft_probs = buffer[: draft_probs.numel()].view(
+        num_tokens, draft_vocab_size
+    )
+    padded_draft_probs = F.pad(draft_probs, (0, vocab_size - draft_vocab_size))
+
+    draft_token_ids = torch.multinomial(draft_probs, num_samples=1).flatten()
+    target_logits = torch.rand(num_tokens, vocab_size, device=DEVICE_TYPE)
+    bonus_token_ids = torch.randint(
+        vocab_size, (batch_size, 1), dtype=torch.int32, device=DEVICE_TYPE
+    )
+    cu_num_draft_tokens = torch.arange(
+        k, num_tokens + 1, k, dtype=torch.int32, device=DEVICE_TYPE
+    )
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False, temperature=torch.ones(batch_size, device=DEVICE_TYPE)
+    )
+
+    outputs = []
+    for probs in (narrow_draft_probs, padded_draft_probs):
+        torch.manual_seed(0)
+        outputs.append(
+            rejection_sample(
+                draft_token_ids.to(torch.int32),
+                [k] * batch_size,
+                k,
+                cu_num_draft_tokens,
+                probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+            )
+        )
+    assert torch.equal(outputs[0], outputs[1])
 
 
 def test_rejection_sampling_approximates_target_distribution():
