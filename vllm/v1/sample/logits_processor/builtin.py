@@ -370,6 +370,59 @@ class MinTokensLogitsProcessor(LogitsProcessor):
 
         return logits
 
+    def apply_to_bonus_tokens(
+        self,
+        logits: torch.Tensor,
+        spec_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        """Bonus-token version of apply().
+
+        The bonus token of request ``i`` comes after its ``spec_token_ids[i]``
+        drafts, so its stop tokens are masked only if that position is still
+        below ``min_tokens``.
+        """
+        if not self.min_toks:
+            return logits
+
+        reqs: list[int] = []
+        tok_ids: list[int] = []
+        restore_reqs: list[int] = []
+        restore_tok_ids: list[int] = []
+        for req, (
+            min_toks,
+            out_tok_ids,
+            stop_tok_ids,
+            uses_structured_output,
+        ) in self.min_toks.items():
+            num_tokens = len(out_tok_ids)
+            # Async scheduling appends -1 placeholders that count drafts as
+            # accepted before verification, so the length may overshoot.
+            if not out_tok_ids or out_tok_ids[-1] != -1:
+                num_tokens += len(spec_token_ids[req])
+            if num_tokens >= min_toks:
+                continue
+            reqs.extend([req] * len(stop_tok_ids))
+            tok_ids.extend(stop_tok_ids)
+            if uses_structured_output:
+                restore_reqs.extend([req] * len(stop_tok_ids))
+                restore_tok_ids.extend(stop_tok_ids)
+
+        if not reqs:
+            return logits
+        logits_slice = (
+            self._device_tensor(reqs, torch.int32),
+            self._device_tensor(tok_ids, torch.int32),
+        )
+        if restore_reqs:
+            restore_logits_slice = (
+                self._device_tensor(restore_reqs, torch.int32),
+                self._device_tensor(restore_tok_ids, torch.int32),
+            )
+            self._mask_stop_token_logits(logits, logits_slice, restore_logits_slice)
+        else:
+            logits.index_put_(logits_slice, self.neg_inf_tensor)
+        return logits
+
 
 def process_dict_updates(
     req_entries: dict[int, T],

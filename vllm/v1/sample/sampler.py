@@ -10,6 +10,7 @@ from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
@@ -401,7 +402,16 @@ class Sampler(nn.Module):
 
         # Apply logits processors which can impact greedy sampling.
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
-            logits = processor.apply(logits)
+            if (
+                predict_bonus_token
+                and sampling_metadata.spec_token_ids is not None
+                and isinstance(processor, MinTokensLogitsProcessor)
+            ):
+                logits = processor.apply_to_bonus_tokens(
+                    logits, sampling_metadata.spec_token_ids
+                )
+            else:
+                logits = processor.apply(logits)
 
         # Apply penalties (e.g., freq_penalties).
         logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)

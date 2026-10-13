@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import replace
 from typing import Any
 from unittest.mock import Mock
 
@@ -8,8 +9,14 @@ import torch
 import torch.nn.functional as F
 
 from tests.v1.sample.utils import create_allowed_token_ids
+from vllm import SamplingParams
+from vllm.config import VllmConfig
 from vllm.platforms import current_platform
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import (
+    BatchUpdate,
+    LogitsProcessors,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
@@ -870,6 +877,77 @@ def test_allowed_token_ids(rejection_sampler):
 
     expected = torch.tensor(
         [[15, -1, -1, -1], [10, 5, 10, -1], [7, 10, 12, 5]],
+        dtype=torch.int,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_min_tokens_bonus_token():
+    """min_tokens must mask the bonus token's stop tokens by the bonus
+    position (committed + draft tokens), not by the committed length alone."""
+    stop_token, fallback_token = 0, 1
+    spec_tokens = [[5, 6], [5, 6], [5, 6]]
+    # The third request ends in async-scheduling placeholders, which may
+    # count rejected drafts, so it keeps the committed-length rule.
+    output_token_ids = [[4], [4], [-1, -1, -1]]
+    # The bonus token is at position 1 + 2 = 3, so it may stop only if
+    # min_tokens <= 3.
+    min_tokens = [3, 4, 4]
+
+    min_tokens_proc = MinTokensLogitsProcessor(
+        VllmConfig(), torch.device(DEVICE_TYPE), False
+    )
+    min_tokens_proc.update_state(
+        BatchUpdate(
+            batch_size=len(min_tokens),
+            removed=(),
+            added=[
+                (
+                    i,
+                    SamplingParams(min_tokens=m, stop_token_ids=[stop_token]),
+                    None,
+                    out,
+                )
+                for i, (m, out) in enumerate(zip(min_tokens, output_token_ids))
+            ],
+            moved=(),
+        )
+    )
+    metadata = replace(
+        create_sampling_metadata(
+            all_greedy=True,
+            output_token_ids=output_token_ids,
+            spec_token_ids=spec_tokens,
+        ),
+        logitsprocs=LogitsProcessors([min_tokens_proc]),
+    )
+
+    # Rows per request: two draft rows that accept the drafts, then the bonus.
+    logits = torch.full((9, 100), -100.0, device=DEVICE_TYPE)
+    for start in (0, 3, 6):
+        logits[start, 5] = 100.0
+        logits[start + 1, 6] = 100.0
+        logits[start + 2, stop_token] = 100.0
+        logits[start + 2, fallback_token] = 99.0
+    spec_decode_metadata = SpecDecodeMetadata.make_dummy(
+        spec_tokens, device=logits.device
+    )
+    spec_decode_metadata.target_logits_indices = torch.tensor(
+        [0, 1, 3, 4, 6, 7], device=logits.device
+    )
+    spec_decode_metadata.bonus_logits_indices = torch.tensor(
+        [2, 5, 8], device=logits.device
+    )
+
+    output = RejectionSampler(Sampler())(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+    expected = torch.tensor(
+        [[5, 6, stop_token], [5, 6, fallback_token], [5, 6, fallback_token]],
         dtype=torch.int,
         device=logits.device,
     )
