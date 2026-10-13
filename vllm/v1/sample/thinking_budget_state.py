@@ -427,22 +427,39 @@ class ThinkingBudgetStateHolder:
                 # forcing starts. If we're already over budget without spec
                 # tokens, force from position 0. Force from the position
                 # where budget is exceeded.
-                state["in_think"] = False
-                state["in_end"] = True
-                state["end_count"] = 0
-                state["check_count_down"] = state["thinking_token_budget"]
                 remaining_budget = state["thinking_token_budget"] - state["think_count"]
                 spec_len = len(state["spec_token_ids"])
                 if 0 < remaining_budget < spec_len:
-                    state["force_index"] = [remaining_budget]
+                    force_index = remaining_budget
 
                 elif remaining_budget <= 0:
-                    state["force_index"] = [0]
+                    force_index = 0
 
                 else:
                     # remaining_budget >= spec_len: all spec tokens are within
                     # budget; force the bonus token position
-                    state["force_index"] = [len(state["spec_token_ids"])]
+                    force_index = spec_len
+
+                # An end sequence completed by the drafts before force_index ends
+                # thinking naturally if accepted. If a draft before it is
+                # rejected, this step stays within budget. Either way nothing is
+                # forced here; the next step re-evaluates on the committed tokens.
+                end_len = len(self.think_end_token_ids)
+                tail = output[max(0, current_length - end_len + 1) :]
+                if (
+                    self._find_last_sequence_index(
+                        tail + state["spec_token_ids"][:force_index],
+                        self.think_end_token_ids,
+                    )
+                    >= 0
+                ):
+                    state["bonus_token_forced"] = False
+                    return
+                state["in_think"] = False
+                state["in_end"] = True
+                state["end_count"] = 0
+                state["check_count_down"] = state["thinking_token_budget"]
+                state["force_index"] = [force_index]
 
         else:
             state["force_index"] = []
