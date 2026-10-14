@@ -148,3 +148,38 @@ def test_streaming_tool_section_ends_reasoning(kimi_k2_tokenizer):
     )
     assert isinstance(result, DeltaMessage)
     assert result.content == "<|tool_calls_section_begin|>"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "ended"),
+    [
+        (
+            "<|im_user|>user<|im_middle|>hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think>old</think>hello<|im_end|>"
+            "<|im_user|>user<|im_middle|>again<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|>",
+            False,
+        ),
+        (
+            "<|im_user|>user<|im_middle|>weather?<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think>old</think>"
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.f:0"
+            "<|tool_call_argument_begin|>{}<|tool_call_end|>"
+            "<|tool_calls_section_end|><|im_end|>"
+            "<|im_system|>tool<|im_middle|>sunny<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|>",
+            False,
+        ),
+        (
+            "<|im_user|>user<|im_middle|>hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>",
+            True,
+        ),
+    ],
+)
+def test_is_reasoning_end_reads_only_current_turn(kimi_k2_tokenizer, prompt, ended):
+    """Reasoning markers of earlier turns in a multi-turn prompt must not be
+    read as the state of the turn being generated."""
+    parser = KimiK2ReasoningParser(kimi_k2_tokenizer)
+    prompt_ids = kimi_k2_tokenizer.encode(prompt, add_special_tokens=False)
+    assert parser.is_reasoning_end(prompt_ids) is ended
