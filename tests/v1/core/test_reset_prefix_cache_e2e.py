@@ -67,3 +67,31 @@ def test_reset_prefix_cache_e2e(monkeypatch):
             f"preempted_results['preempted_{i}'].outputs[0].text="
             f"{preempted_results['preempted_' + str(i)].outputs[0].text}"
         )
+
+
+def test_reset_prefix_cache_keeps_prompt_logprobs(monkeypatch):
+    """A reset while the prefill output is in flight drops that output; the
+    resumed prefill must compute the prompt logprobs again."""
+    # In-process engine core: each step() runs one step_with_batch_queue.
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    engine_args = EngineArgs(
+        model="Qwen/Qwen3-0.6B",
+        gpu_memory_utilization=0.2,
+        async_scheduling=True,
+        max_model_len=2048,
+        compilation_config={"mode": 0},
+        dtype="float16",
+    )
+    engine = LLMEngine.from_engine_args(engine_args)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=4, prompt_logprobs=1)
+    engine.add_request("0", PROMPTS[3], sampling_params)
+    # Schedules the whole prefill and returns before its output is processed.
+    engine.step()
+    engine.reset_prefix_cache(reset_running_requests=True)
+
+    outputs = []
+    while engine.has_unfinished_requests():
+        outputs.extend(engine.step())
+    assert outputs[-1].finished
+    assert len(outputs[-1].prompt_logprobs) == len(outputs[-1].prompt_token_ids)

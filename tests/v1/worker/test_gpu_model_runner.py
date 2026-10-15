@@ -787,6 +787,73 @@ def test_update_states_request_resumed(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def _computes_prompt_logprobs(model_runner, req_id: str, num_tokens: int) -> bool:
+    """Runs the prompt logprobs step of a scheduled prefill of `num_tokens`."""
+    vocab_size = model_runner.input_batch.vocab_size
+    model_runner.model = Mock(
+        compute_logits=lambda h: torch.zeros(h.shape[0], vocab_size, device=h.device)
+    )
+    hidden_states = torch.zeros(num_tokens, 8, device=DEVICE_TYPE)
+    return req_id in model_runner._get_prompt_logprobs_dict(
+        hidden_states, {req_id: num_tokens}
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_output_tokens", "streaming_update", "expected"),
+    [(0, False, True), (1, False, False), (0, True, False)],
+)
+def test_update_states_resumed_request_prompt_logprobs(
+    model_runner, dist_init, num_output_tokens, streaming_update, expected
+):
+    """Prompt logprobs go out with the first token, so a request preempted
+    before it (e.g. reset_prefix_cache dropping the in-flight prefill output)
+    must compute them again when resumed. Not once a token was returned, and
+    not after a streaming-input update: the previous prompt's were returned."""
+    req_id = "req_0"
+    prompt_token_ids = [1, 2, 3]
+    scheduler_output = _schedule_new_request(req_id)
+    scheduler_output.scheduled_new_reqs[0].sampling_params = SamplingParams(
+        prompt_logprobs=1
+    )
+    model_runner._update_states(scheduler_output)
+    assert _computes_prompt_logprobs(model_runner, req_id, len(prompt_token_ids))
+
+    if streaming_update:
+        prompt_token_ids = [1, 2, 3, 4, 5]
+        scheduler_output = _schedule_new_request(req_id)
+        new_req_data = scheduler_output.scheduled_new_reqs[0]
+        new_req_data.prompt_token_ids = prompt_token_ids
+        new_req_data.sampling_params = SamplingParams(prompt_logprobs=1)
+        new_req_data.num_computed_tokens = 3
+        scheduler_output.num_scheduled_tokens = {req_id: 2}
+        scheduler_output.total_num_scheduled_tokens = 2
+        model_runner._update_states(scheduler_output)
+
+    # Preempted, then resumed from the start of the prompt.
+    num_tokens = len(prompt_token_ids) + num_output_tokens
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(
+            req_ids=[req_id],
+            resumed_req_ids={req_id},
+            new_token_ids=[[]],
+            all_token_ids={req_id: prompt_token_ids + [6] * num_output_tokens},
+            new_block_ids=[([0],)],
+            num_computed_tokens=[0],
+            num_output_tokens=[num_output_tokens],
+        ),
+        num_scheduled_tokens={req_id: num_tokens},
+        total_num_scheduled_tokens=num_tokens,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_runner._update_states(scheduler_output)
+    assert _computes_prompt_logprobs(model_runner, req_id, num_tokens) == expected
+
+
 def test_get_nans_in_logits(model_runner, dist_init, monkeypatch):
     monkeypatch.setattr(gpu_model_runner_module.envs, "VLLM_RAISE_ON_LOGIT_NANS", False)
     req_ids = ("req_0", "req_1")

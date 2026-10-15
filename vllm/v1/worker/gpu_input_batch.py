@@ -50,6 +50,9 @@ class CachedRequestState:
     prompt_embeds: torch.Tensor | None = None
     # To accumulate prompt logprobs tensor chunks across prefill steps.
     in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
+    # num_prompt_logprobs of the prompt logprobs computed for the current
+    # prompt, kept in case their output is dropped by a preemption.
+    completed_num_prompt_logprobs: int | None = None
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.

@@ -1438,6 +1438,17 @@ class GPUModelRunner(
                     resumed_token_ids = req_data.all_token_ids[req_id]
                     req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
 
+                if (
+                    resumed_from_preemption
+                    and num_output_tokens == 0
+                    and req_state.completed_num_prompt_logprobs is not None
+                ):
+                    # Prompt logprobs are returned with the first token, so the
+                    # preemption may have dropped them. Compute them again.
+                    self.num_prompt_logprobs[req_id] = (
+                        req_state.completed_num_prompt_logprobs
+                    )
+
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
                 if is_ngram_gpu:
@@ -1617,6 +1628,8 @@ class GPUModelRunner(
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
+        # Prompt logprobs computed for the previous prompt were returned.
+        req_state.completed_num_prompt_logprobs = None
 
         if self.uses_mrope:
             self._init_mrope_positions(req_state)
@@ -5403,8 +5416,9 @@ class GPUModelRunner(
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
         for req_id in completed_prefill_reqs:
-            del num_prompt_logprobs_dict[req_id]
-            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
+            request = self.requests[req_id]
+            request.completed_num_prompt_logprobs = num_prompt_logprobs_dict.pop(req_id)
+            request.in_progress_prompt_logprobs_cpu = None
 
         # Must synchronize the non-blocking GPU->CPU transfers.
         if prompt_logprobs_dict:
