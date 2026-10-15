@@ -738,4 +738,17 @@ class LlavaForConditionalGeneration(
         num_mm_embeds: int,
     ) -> tuple[int, int | None]:
         del modality, mm_kwargs
-        return num_mm_embeds, num_mm_embeds
+
+        # The tower also runs on the tokens that the feature select strategy
+        # drops afterwards (e.g. CLIP's class token), once per image.
+        encoder_info = get_vision_encoder_info(self.config)
+        image_size = encoder_info.get_image_size()
+        num_vision_tokens = encoder_info.get_num_image_tokens(
+            image_width=image_size, image_height=image_size
+        )
+        num_selected_tokens = get_num_selected_vision_tokens(
+            num_vision_tokens, self.config.vision_feature_select_strategy
+        )
+        num_images = num_mm_embeds // num_selected_tokens
+        num_dropped_tokens = num_vision_tokens - num_selected_tokens
+        return num_mm_embeds + num_images * num_dropped_tokens, num_mm_embeds
