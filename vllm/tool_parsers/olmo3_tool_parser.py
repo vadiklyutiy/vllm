@@ -71,13 +71,24 @@ class Olmo3PythonicToolParser(ToolParser):
         self, model_output: str, request: ChatCompletionRequest
     ) -> ExtractedToolCallInformation:
         """Extract the tool calls from a complete model response."""
-        original_model_output = model_output
-        # Remove xml tags.
+        # Remove xml tags. The first </function_calls> can be inside a string
+        # argument, so if the calls before it do not parse, try the last one.
         match = re.search(
             r"<function_calls>(.*?)</function_calls>", model_output, re.DOTALL
         )
-        if match:
-            model_output = match.group(1).strip()
+        if not match:
+            return self._parse_tool_calls(model_output, model_output)
+        result = self._parse_tool_calls(match.group(1).strip(), model_output)
+        last_end = model_output.rfind("</function_calls>")
+        if not result.tools_called and last_end > match.end(1):
+            result = self._parse_tool_calls(
+                model_output[match.start(1) : last_end].strip(), model_output
+            )
+        return result
+
+    def _parse_tool_calls(
+        self, model_output: str, original_model_output: str
+    ) -> ExtractedToolCallInformation:
         # Make the newline separated function calls into a list.
         model_output = ", ".join(
             [line.strip() for line in model_output.splitlines() if line.strip()]

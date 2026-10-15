@@ -66,6 +66,15 @@ ESCAPED_STRING_FUNCTION_CALL = FunctionCall(
     name="get_weather",
     arguments='{"city": "Martha\'s Vineyard", "metric": "\\"cool units\\""}',
 )
+TAG_IN_STRING_FUNCTION_OUTPUT = (
+    "write_file(path='README.md', "
+    "content='Calls are wrapped in <function_calls>...</function_calls>.')"
+)
+TAG_IN_STRING_FUNCTION_CALL = FunctionCall(
+    name="write_file",
+    arguments='{"path": "README.md", '
+    '"content": "Calls are wrapped in <function_calls>...</function_calls>."}',
+)
 
 
 @pytest.mark.parametrize("streaming", [True, False])
@@ -167,6 +176,32 @@ TEST_CASES = [
         f"<function_calls>{ESCAPED_STRING_FUNCTION_OUTPUT}</function_calls>",
         [ESCAPED_STRING_FUNCTION_CALL],
         id="escaped_string_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        f"<function_calls>{TAG_IN_STRING_FUNCTION_OUTPUT}</function_calls>",
+        [TAG_IN_STRING_FUNCTION_CALL],
+        id="tag_in_string_streaming",
+    ),
+    pytest.param(
+        False,
+        f"<function_calls>{TAG_IN_STRING_FUNCTION_OUTPUT}</function_calls>",
+        [TAG_IN_STRING_FUNCTION_CALL],
+        id="tag_in_string_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        f"<function_calls>{SIMPLE_FUNCTION_OUTPUT}</function_calls> "
+        "Calls end with </function_calls>.",
+        [SIMPLE_FUNCTION_CALL],
+        id="tag_after_block_streaming",
+    ),
+    pytest.param(
+        False,
+        f"<function_calls>{SIMPLE_FUNCTION_OUTPUT}</function_calls> "
+        "Calls end with </function_calls>.",
+        [SIMPLE_FUNCTION_CALL],
+        id="tag_after_block_nonstreaming",
     ),
     pytest.param(
         True,
