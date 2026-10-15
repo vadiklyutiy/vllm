@@ -177,6 +177,7 @@ async def serve_http(
     sock: socket.socket | None,
     enable_ssl_refresh: bool = False,
     peer_loads: tuple[MutableSequence[int], int] | None = None,
+    external_engines: bool = False,
     **uvicorn_kwargs: Any,
 ):
     """Start a FastAPI app using Uvicorn, with support for custom Uvicorn config
@@ -263,7 +264,10 @@ async def serve_http(
     async def handle_shutdown() -> None:
         await shutdown_event.wait()
 
-        if engine_client is not None:
+        # External engines are stopped by their owner process only after this
+        # server exits, so let uvicorn finish the in-flight requests while they
+        # still run; the caller shuts the engine client down afterwards.
+        if engine_client is not None and not external_engines:
             timeout = engine_client.vllm_config.shutdown_timeout
             mode = "abort" if timeout == 0 else "drain"
 
@@ -280,7 +284,8 @@ async def serve_http(
 
         server.should_exit = True
         logger.info_once("[shutdown] API server: signalling HTTP server shutdown")
-        server_task.cancel()
+        if not external_engines:
+            server_task.cancel()
         if watchdog_task is not None:
             watchdog_task.cancel()
         if ssl_cert_refresher:

@@ -119,6 +119,7 @@ async def build_and_serve(
     sock: socket.socket,
     args: Namespace,
     peer_loads: tuple[MutableSequence[int], int] | None = None,
+    external_engines: bool = False,
     **uvicorn_kwargs,
 ) -> asyncio.Task:
     """Build FastAPI app, initialize state, and start serving.
@@ -144,6 +145,7 @@ async def build_and_serve(
         sock=sock,
         enable_ssl_refresh=args.enable_ssl_refresh,
         peer_loads=peer_loads,
+        external_engines=external_engines,
         host=args.host,
         port=args.port,
         log_level=args.uvicorn_log_level,
@@ -196,8 +198,15 @@ async def run_server_worker(
         args,
         client_config=client_config,
     ) as engine_client:
+        # With client_config, the engines are owned by another process.
         shutdown_task = await build_and_serve(
-            engine_client, listen_address, sock, args, peer_loads, **uvicorn_kwargs
+            engine_client,
+            listen_address,
+            sock,
+            args,
+            peer_loads,
+            external_engines=bool(client_config),
+            **uvicorn_kwargs,
         )
     # NB: Await server shutdown only after the backend context is exited
     try:

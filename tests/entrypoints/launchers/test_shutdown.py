@@ -611,3 +611,63 @@ async def test_multi_api_server_shutdown():
             pytest.fail("Process did not exit after SIGTERM")
 
         await _assert_children_cleaned_up(child_pids)
+
+
+@pytest.mark.asyncio
+async def test_multi_api_server_wait_timeout_completes_requests():
+    """Verify wait timeout completes in-flight requests with multiple API servers."""
+    server_args = [
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "256",
+        "--enforce-eager",
+        "--gpu-memory-utilization",
+        "0.05",
+        "--max-num-seqs",
+        "4",
+        "--shutdown-timeout",
+        "30",
+        "--api-server-count",
+        "2",
+    ]
+
+    with RemoteOpenAIServer(MODEL_NAME, server_args, auto_port=True) as remote_server:
+        client = remote_server.get_async_client()
+        proc = remote_server.proc
+        child_pids = _get_child_pids(proc.pid)
+
+        requests = [
+            asyncio.create_task(
+                client.completions.create(
+                    model=MODEL_NAME,
+                    prompt="Write a story: ",
+                    max_tokens=200,
+                    extra_body={"ignore_eos": True},
+                )
+            )
+            for _ in range(8)
+        ]
+        await _wait_for_running_request(remote_server.url_for("metrics"))
+        proc.send_signal(signal.SIGTERM)
+
+        done, pending = await asyncio.wait(
+            requests, timeout=_SHUTDOWN_DETECTION_TIMEOUT
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*requests, return_exceptions=True)
+
+        completed = sum(
+            1
+            for task in done
+            if task.exception() is None
+            and task.result().choices[0].finish_reason == "length"
+        )
+        assert completed > 0, (
+            f"Wait timeout should complete in-flight requests. "
+            f"pending: {len(pending)}, "
+            f"errors: {[task.exception() for task in done if task.exception()]}"
+        )
+
+        await _assert_children_cleaned_up(child_pids)
