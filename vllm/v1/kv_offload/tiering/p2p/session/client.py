@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Client-role state machine for a single peer session.
 
-Handles outgoing fetch requests, abort-on-timeout, abort-ack timeout,
-and produces ``LoadResult`` for completed loads. The session coordinator
+Handles outgoing fetch requests and abort-on-timeout, and produces
+``LoadResult`` for completed loads. The session coordinator
 parses wire messages and dispatches typed arguments here; this module
 never touches ``ControlConnection`` directly — it emits via the ``send``
 callback injected by the coordinator (which gates on ConnectAck).
@@ -45,6 +45,7 @@ class _InboundLoadState:
     job_id: int  # opaque ID assigned by the manager to this load request
     submitted_at: float
     aborted_at: float | None = None
+    abort_ack_overdue: bool = False
 
 
 @dataclass
@@ -241,8 +242,8 @@ class ClientRole:
         while an earlier round's load is still in flight, so both can be
         owed at once.
 
-        Then drop all probe/lookup state. Keep aborted loads until their abort
-        acknowledgement or timeout produces a terminal result.
+        Then drop all probe/lookup state. Keep aborted loads until the peer's
+        abort acknowledgement or TransferDone produces a terminal result.
         """
         st = self._requests.get(kv_request_id)
         if st is None:
@@ -452,14 +453,16 @@ class ClientRole:
         """Walk load timeouts and drain completed loads.
 
         Loads past ``_LOAD_TIMEOUT_S`` get an AbortFetchMsg sent and
-        enter the aborting phase. Aborting loads past
-        ``_ABORT_ACK_TIMEOUT_S`` are surfaced as failed.
+        enter the aborting phase. An aborting load stays in flight until
+        the peer's AbortAck or TransferDone: until then the peer's WRITE
+        into its blocks may still land, so failing it would free blocks
+        that are still a WRITE target. Past ``_ABORT_ACK_TIMEOUT_S`` the
+        missing ack is only logged.
 
         Lookups have no timeout: an unanswered probe stays None (RETRY)
         until finish_request clears it — see ``_ClientRequestState.probes``.
         """
         now = time.monotonic()
-        to_remove: list[tuple[str, int]] = []
         for req_id in self._active_loads:
             st = self._requests[req_id]
             assert st.loads
@@ -480,27 +483,19 @@ class ClientRole:
                                 AbortFetchMsg.ROUND_SEQ: round_seq,
                             }
                         )
-                else:
-                    if now - load.aborted_at >= _ABORT_ACK_TIMEOUT_S:
-                        to_remove.append((req_id, round_seq))
-                        self._completed_loads.append(
-                            LoadResult(
-                                job_id=load.job_id,
-                                kv_request_id=req_id,
-                                success=False,
-                            )
-                        )
-                        logger.warning(
-                            "P2PSession %s: abort_ack timed out for "
-                            "kv_request_id=%s round=%s",
-                            self._peer_id,
-                            req_id,
-                            round_seq,
-                        )
-        for req_id, round_seq in to_remove:
-            st = self._requests[req_id]
-            st.loads.pop(round_seq)
-            self._on_load_terminal(req_id, st)
+                elif (
+                    not load.abort_ack_overdue
+                    and now - load.aborted_at >= _ABORT_ACK_TIMEOUT_S
+                ):
+                    load.abort_ack_overdue = True
+                    logger.warning(
+                        "P2PSession %s: abort_ack overdue for kv_request_id=%s "
+                        "round=%s; keeping its blocks reserved until the peer "
+                        "acks or the session closes",
+                        self._peer_id,
+                        req_id,
+                        round_seq,
+                    )
 
         results = self._completed_loads
         self._completed_loads = []

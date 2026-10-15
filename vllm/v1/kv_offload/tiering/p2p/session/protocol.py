@@ -47,7 +47,9 @@ Abort Flow (timeout path)
 2. Server cancels inflight transfers for that kv_request_id and
    replies with AbortAckMsg.
 3. Client receives AbortAckMsg and reports the load job as failed.
-4. If AbortAckMsg itself times out, the client fails the job anyway.
+4. Until AbortAckMsg or TransferDoneMsg arrives, the client keeps the
+   load in flight, since the server's WRITE may still land; only
+   session teardown fails it without one.
 
 Message Format
 --------------

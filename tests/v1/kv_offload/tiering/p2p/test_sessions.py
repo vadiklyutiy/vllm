@@ -728,6 +728,39 @@ class TestClientFlows:
         assert loads == [LoadResult(job_id=8, kv_request_id="req-8", success=False)]
         assert "req-8" not in session._client._requests
 
+    def test_overdue_abort_ack_keeps_load_in_flight(self):
+        """A missing AbortAck must not fail the load: the peer's WRITE into
+        its blocks may still land, and a failed load frees those blocks for
+        reuse. The load stays in flight until the peer acks."""
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(
+            job_id=9, kv_request_id="req-9", keys=[b"k"], block_ids=[0]
+        )
+        _client_load(session, "req-9").submitted_at = (
+            time.monotonic() - _LOAD_TIMEOUT_S - 1.0
+        )
+        assert session.poll().loads == []
+        _client_load(session, "req-9").aborted_at = (
+            time.monotonic() - _ABORT_ACK_TIMEOUT_S - 1.0
+        )
+
+        assert session.poll().loads == []
+        assert session.poll().loads == []
+        assert session._client.has_active_loads is True
+
+        conn.enqueue(
+            {
+                TYPE_KEY: AbortAckMsg.TYPE,
+                AbortAckMsg.ROUND_SEQ: 0,
+                AbortAckMsg.KV_REQUEST_ID: "req-9",
+            }
+        )
+        loads = session.poll().loads
+        assert loads == [LoadResult(job_id=9, kv_request_id="req-9", success=False)]
+        assert session._client.has_active_loads is False
+        assert "req-9" not in session._client._requests
+
 
 # ---------------------------------------------------------------------------
 # Symmetric-P2P lookup flow (do_p2p_fetch)
