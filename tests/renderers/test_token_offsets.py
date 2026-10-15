@@ -69,6 +69,25 @@ class _OffsetTokenizer:
         }
 
 
+class _BosEosOffsetTokenizer(_OffsetTokenizer):
+    """Adds BOS and EOS around the text with the (0, 0) offsets of fast
+    tokenizers."""
+
+    bos_token_id = 98
+    eos_token_id = 99
+
+    def __call__(self, text, **kwargs):
+        encoding = super().__call__(text, **kwargs)
+        if kwargs.get("add_special_tokens", True):
+            encoding["input_ids"] = [
+                self.bos_token_id,
+                *encoding["input_ids"],
+                self.eos_token_id,
+            ]
+            encoding["offset_mapping"] = [(0, 0), *encoding["offset_mapping"], (0, 0)]
+        return encoding
+
+
 class TestTokenizePromptOffsets:
     def test_fast_tokenizer_with_flag_returns_offsets(self, fast_tokenizer):
         renderer = _make_base_renderer_with(fast_tokenizer)
@@ -277,6 +296,32 @@ class TestTruncationKeepsOffsetsAligned:
 
         result = renderer.tokenize_prompt({"prompt": text}, params)
 
+        assert result["prompt_token_offsets"] == expected_offsets
+
+    @pytest.mark.parametrize(
+        ("side", "expected_ids", "expected_offsets"),
+        [
+            ("left", [98, 14, 15, 99], [(0, 0), (38, 39), (39, 40), (0, 0)]),
+            ("right", [98, 0, 1, 99], [(0, 0), (0, 1), (1, 2), (0, 0)]),
+        ],
+    )
+    def test_added_special_tokens_keep_their_offsets(
+        self, side, expected_ids, expected_offsets
+    ):
+        """An explicit side keeps the special tokens the tokenizer adds, with
+        their offsets, as tokenizer-level truncation does."""
+        renderer = _make_base_renderer_with(_BosEosOffsetTokenizer())
+        text = "0123456789" * 4
+        params = TokenizeParams(
+            max_total_tokens=16,
+            return_token_offsets=True,
+            truncate_prompt_tokens=4,
+            truncation_side=side,
+        )
+
+        result = renderer.tokenize_prompt({"prompt": text}, params)
+
+        assert result["prompt_token_ids"] == expected_ids
         assert result["prompt_token_offsets"] == expected_offsets
 
     def test_async_left_text_pretrim_preserves_source_offsets(self):

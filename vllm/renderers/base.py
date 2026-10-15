@@ -636,10 +636,16 @@ class BaseRenderer(ABC, Generic[_T]):
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
         encoding = tokenizer(prompt["prompt"], **kwargs)
+        token_ids = list(encoding["input_ids"])
+        offset_mapping = list(encoding["offset_mapping"]) if want_offsets else None
+        dropped = params._dropped_text_slice(tokenizer, prompt["prompt"], token_ids)
+        if dropped is not None:
+            del token_ids[dropped]
+            if offset_mapping is not None:
+                del offset_mapping[dropped]
+
         return self._build_tokens_prompt(
-            encoding["input_ids"],
-            prompt,
-            offset_mapping=encoding["offset_mapping"] if want_offsets else None,
+            token_ids, prompt, offset_mapping=offset_mapping
         )
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:

@@ -359,7 +359,8 @@ class TokenizeParams:
             max_length = self.max_input_tokens + 1
 
         # Explicit truncation-side overrides require the full token sequence
-        # so we can slice from the requested side in _token_truncation.
+        # so we can slice from the requested side in _dropped_text_slice
+        # (or in _token_truncation when it returns None).
         # Disable tokenizer-level truncation because its default side may
         # differ from the requested side.  The defense against unbounded
         # tokenization lives in _text_len_check (character-level pre-trim).
@@ -503,6 +504,48 @@ class TokenizeParams:
             return slice(-max_length, None)
 
         return slice(0, max_length)
+
+    def _dropped_text_slice(
+        self, tokenizer: TokenizerLike, text: str, token_ids: list[int]
+    ) -> slice | None:
+        """The slice of the tokenized `text` that an explicit side drops.
+
+        `get_encode_kwargs` turns tokenizer-level truncation off for an
+        explicit `truncation_side`, so `token_ids` still hold the special
+        tokens the tokenizer added around `text`. Find them by tokenizing
+        `text` without them and, like tokenizer-level truncation, keep them,
+        count them towards the limit, and drop text tokens only.
+
+        `None` means `_truncation_slice` applies as is.
+        """
+        if self.truncation_side is None or not self.add_special_tokens:
+            return None
+
+        truncation = self._truncation_slice(tokenizer, len(token_ids))
+        if truncation is None:
+            return None
+
+        text_ids = list(
+            tokenizer(
+                text, **(self.get_encode_kwargs() | {"add_special_tokens": False})
+            )["input_ids"]
+        )
+        num_added = len(token_ids) - len(text_ids)
+        num_kept_text = len(range(len(token_ids))[truncation]) - num_added
+        if num_kept_text < 0:
+            return None
+
+        for start in range(num_added + 1):
+            if token_ids[start : start + len(text_ids)] == text_ids:
+                break
+        else:
+            return None
+
+        end = start + len(text_ids)
+        if self.truncation_side == "left":
+            return slice(start, end - num_kept_text)
+
+        return slice(start + num_kept_text, end)
 
     def _token_truncation(self, tokenizer: TokenizerLike | None, tokens: _S) -> _S:
         """Apply truncation to prompt tokens if necessary."""
