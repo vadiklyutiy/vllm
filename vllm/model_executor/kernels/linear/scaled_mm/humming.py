@@ -45,6 +45,8 @@ class HummingFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def can_implement(
         cls, config: FP8ScaledMMLinearLayerConfig
     ) -> tuple[bool, str | None]:
+        if not config.allow_weight_only_fallback:
+            return False, "is weight-only (W8A16) and ignores activation quantization"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

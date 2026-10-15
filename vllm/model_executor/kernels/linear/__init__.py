@@ -731,6 +731,7 @@ def init_fp8_linear_kernel(
     weight_shape: tuple[int, int],
     force_kernel: type[FP8ScaledMMLinearKernel] | None = None,
     module_name: str | None = None,
+    allow_weight_only_fallback: bool = True,
 ) -> FP8ScaledMMLinearKernel | Fp8BlockScaledMMLinearKernel:
     scaled_mm_linear_kernel_config = FP8ScaledMMLinearLayerConfig(
         weight_quant_key=weight_quant_key,
@@ -738,6 +739,7 @@ def init_fp8_linear_kernel(
         input_dtype=input_dtype,
         out_dtype=out_dtype,
         weight_shape=weight_shape,
+        allow_weight_only_fallback=allow_weight_only_fallback,
     )
 
     if activation_quant_key.scale.group_shape.is_per_group():

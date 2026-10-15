@@ -14,10 +14,17 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm import _custom_ops as ops
+from vllm.config import ModelConfig
 from vllm.config.quantization import (
     _ONLINE_SHORTHANDS,
     QUANT_KEY_NAMES,
     QuantizationConfigArgs,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+    HummingFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+    MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.quantization.online.base import (
     _ONLINE_LINEAR_METHODS,
@@ -31,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticChannelSym,
 )
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_humming
 
 
 def test_fp8_per_channel_shorthand_registered() -> None:
@@ -69,3 +77,48 @@ def test_scaled_fp8_quant_per_channel_shape() -> None:
     assert y.dtype == current_platform.fp8_dtype()
     assert s.shape == (96, 1)
     assert s.dtype == torch.float32
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Marlin and Humming FP8 kernels are CUDA-only.",
+)
+@pytest.mark.parametrize(
+    "linear_backend, kernel_cls",
+    [
+        ("marlin", MarlinFP8ScaledMMLinearKernel),
+        pytest.param(
+            "humming",
+            HummingFP8ScaledMMLinearKernel,
+            marks=pytest.mark.skipif(
+                not has_humming(), reason="Humming is not installed."
+            ),
+        ),
+    ],
+)
+def test_fp8_per_channel_rejects_weight_only_kernels(
+    default_vllm_config, dist_init, linear_backend: str, kernel_cls: type
+) -> None:
+    """PTPC needs per-token activation quantization, so a weight-only (W8A16)
+    kernel must not implement it. When no other kernel is left, kernel
+    selection must fail before any weight is created, with the rejection
+    reason of each kernel it tried.
+    """
+    default_vllm_config.model_config = ModelConfig()
+    default_vllm_config.kernel_config.linear_backend = linear_backend
+
+    method = Fp8PtpcOnlineLinearMethod()
+    layer = torch.nn.Module()
+    with pytest.raises(
+        ValueError,
+        match=rf"Reasons: \n{kernel_cls.__name__} is weight-only \(W8A16\)",
+    ):
+        method.create_weights(
+            layer,
+            input_size_per_partition=256,
+            output_partition_sizes=[128],
+            input_size=256,
+            output_size=128,
+            params_dtype=torch.bfloat16,
+        )
+    assert not hasattr(layer, "weight")

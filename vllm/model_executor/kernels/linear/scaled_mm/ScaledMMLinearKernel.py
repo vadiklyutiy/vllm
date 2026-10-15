@@ -36,6 +36,9 @@ class FP8ScaledMMLinearLayerConfig(MMLinearLayerConfig):
     weight_shape: tuple[int, int]
     input_dtype: torch.dtype
     out_dtype: torch.dtype
+    # Whether a weight-only (W8A16) kernel that ignores activation_quant_key
+    # may implement this layer.
+    allow_weight_only_fallback: bool = True
 
 
 _FP8ParamsT = tuple[

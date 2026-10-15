@@ -409,6 +409,18 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # PTPC requires per-token activation FP8; a weight-only fallback
+        # would silently produce a weight-only fp8 model.
+        self.fp8_linear = init_fp8_linear_kernel(
+            activation_quant_key=self.activation_quant_key,
+            weight_quant_key=self.weight_quant_key,
+            weight_shape=(sum(output_partition_sizes), input_size_per_partition),
+            input_dtype=self.input_dtype,
+            out_dtype=self.out_dtype,
+            module_name=self.__class__.__name__,
+            allow_weight_only_fallback=False,
+        )
+
         super().create_weights(
             layer,
             input_size_per_partition,
@@ -418,24 +430,6 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
             params_dtype,
             **extra_weight_attrs,
         )
-
-        self.fp8_linear = init_fp8_linear_kernel(
-            activation_quant_key=self.activation_quant_key,
-            weight_quant_key=self.weight_quant_key,
-            weight_shape=layer.weight.shape,
-            input_dtype=self.input_dtype,
-            out_dtype=self.out_dtype,
-            module_name=self.__class__.__name__,
-        )
-        # PTPC requires per-token activation FP8; MarlinFP8 is W8A16 and
-        # would silently produce a weight-only fp8 model.
-        if isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel):
-            raise ValueError(
-                "FP8 PTPC online quant requires a kernel that honors "
-                "per-token activation quantization; MarlinFP8 is W8A16 "
-                "weight-only. Requires SM89+ for Cutlass FP8 or ROCm MI3xx "
-                "for rowwise scaled_mm."
-            )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):

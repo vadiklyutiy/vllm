@@ -46,6 +46,8 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     @classmethod
     def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        if not c.allow_weight_only_fallback:
+            return False, "is weight-only (W8A16) and ignores activation quantization"
         return True, None
 
     def __init__(
