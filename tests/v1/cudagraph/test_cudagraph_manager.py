@@ -17,12 +17,15 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.device_communicators import pynccl_allocator
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
+    _prepare_dflash_inputs_to_capture,
+)
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
     cudagraph_utils as spec_cudagraph_utils,
 )
@@ -259,6 +262,43 @@ def test_speculator_capture_preserves_decode_query_bounds(
     assert model_state.prepare_attn.call_count == 2
     for call in model_state.prepare_attn.call_args_list:
         assert call.args[0].max_query_len == expected_max_query_len
+
+
+def test_dflash_capture_metadata_has_cpu_seq_lens_upper_bound():
+    """Draft backends such as FlexAttention read the CPU upper bound on seq_lens
+    when building capture metadata, so DFlash capture must pass it through."""
+    num_reqs, num_tokens = 4, 16
+    buffers = InputBuffers(num_reqs, num_tokens, torch.device("cpu"))
+    block_tables = MagicMock()
+    block_tables.cp_size = 1
+    block_tables.get_dummy_block_tables.return_value = (
+        torch.zeros(num_reqs, 1, dtype=torch.int32),
+    )
+    block_tables.get_dummy_slot_mappings.return_value = torch.zeros(
+        1, num_tokens, dtype=torch.int64
+    )
+    attn_group = MagicMock(layer_names=["draft_attn"])
+    kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["draft_attn"], MagicMock())],
+    )
+
+    _prepare_dflash_inputs_to_capture(
+        num_reqs,
+        num_tokens,
+        buffers,
+        block_tables,
+        [[attn_group]],
+        kv_cache_config,
+        max_model_len=1024,
+        skip_attn=False,
+        causal=True,
+    )
+
+    metadata = attn_group.build_metadata_for_cudagraph_capture.call_args.args[0]
+    assert metadata.seq_lens_cpu_upper_bound is not None
+    assert metadata.seq_lens_cpu_upper_bound.tolist() == metadata.seq_lens.tolist()
 
 
 _DECODE_QUERY_LEN = 3
