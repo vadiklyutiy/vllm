@@ -1911,6 +1911,97 @@ def test_derive_mamba_conv_split(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("n_groups", [1, 4])
+@pytest.mark.parametrize("p_tp,d_tp", [(1, 2), (2, 1), (1, 4), (4, 1), (2, 4), (4, 2)])
+def test_mamba2_conv_hetero_tp_reads_own_columns(monkeypatch, n_groups, p_tp, d_tp):
+    """Every D rank must receive the conv columns it holds itself, also when
+    TP does not divide n_groups and each rank holds a replica of B and C
+    (e.g. granite-4.0-h, n_groups=1)."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+        derive_mamba_conv_split,
+    )
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateShapeCalculator,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    num_heads, head_dim, state_size = 8, 2, 4
+    intermediate_size = num_heads * head_dim
+
+    def split(tp):
+        shapes = MambaStateShapeCalculator.mamba2_state_shape(
+            tp_world_size=tp,
+            intermediate_size=intermediate_size,
+            n_groups=n_groups,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            conv_kernel=4,
+        )
+        spec = MambaSpec(
+            block_size=64, shapes=shapes, dtypes=(torch.bfloat16, torch.bfloat16)
+        )
+        return derive_mamba_conv_split(spec, local_tp=tp)
+
+    def page_columns(tp, rank):
+        """Global conv column ids held by one rank, in page order [x|B|C]."""
+        x_dim = intermediate_size // tp
+        x = list(range(rank * x_dim, (rank + 1) * x_dim))
+        groups_per_rank = n_groups // tp
+        groups = (
+            range(n_groups)
+            if n_groups % tp
+            else range(rank * groups_per_rank, (rank + 1) * groups_per_rank)
+        )
+        b = [g * state_size + s for g in groups for s in range(state_size)]
+        b_start = intermediate_size
+        c_start = b_start + n_groups * state_size
+        page = x + [b_start + i for i in b] + [c_start + i for i in b]
+        assert len(page) == split(tp).local_conv_dim
+        return page
+
+    d_split = split(d_tp)
+    row_bytes = d_split.conv_rows * d_split.conv_dtype_size
+    p_meta = SimpleNamespace(
+        kv_caches_base_addr=[0],
+        block_strides=[0],
+        num_blocks=1,
+        device_id=0,
+        ssm_sizes=split(p_tp).ssm_sizes,
+    )
+
+    def read(p_rank, d_rank, tp_ratio):
+        worker = NixlConnectorWorker.__new__(NixlConnectorWorker)
+        worker.tp_rank = d_rank
+        worker._conv_decomp = d_split
+        worker._mamba_ssm_size = d_split.ssm_sizes
+        worker._ssm_region_indices = None
+        worker._ple_region_index = None
+        descs = worker._build_mamba_remote(
+            p_meta,
+            tp_ratio,
+            SimpleNamespace(remote_physical_blocks_per_logical=1),
+            p_rank,
+        )
+        page = page_columns(p_tp, p_rank)
+        # Last descriptor is the SSM temporal state.
+        conv_descs = descs[:-1].tolist()
+        return [page[o // row_bytes : (o + n) // row_bytes] for o, n, _ in conv_descs]
+
+    for d_rank in range(d_tp):
+        if d_tp >= p_tp:
+            k = d_tp // p_tp
+            parts = read(d_rank // k, d_rank, k)
+        else:
+            # Each P rank fills its own chunk of every local sub-projection.
+            k = p_tp // d_tp
+            reads = [read(d_rank * k + j, d_rank, -k) for j in range(k)]
+            parts = [sum((r[i] for r in reads), []) for i in range(len(reads[0]))]
+        assert sum(parts, []) == page_columns(d_tp, d_rank)
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "mamba_enabled,swa_enabled,"
     "local_physical_per_logical,remote_physical_per_logical,"

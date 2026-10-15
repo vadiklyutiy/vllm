@@ -42,6 +42,10 @@ class MambaConvSplitInfo:
     local_proj_dims: tuple[int, ...]
     conv_dtype_size: int  # bytes per element (e.g. 2 for float16)
     ssm_sizes: tuple[int, int]  # (conv_state_bytes, ssm_state_bytes)
+    # Sub-projections sized by n_groups (Mamba2 B and C). When n_groups is
+    # not divisible by TP, every rank holds a full replica of its groups
+    # (see MambaStateShapeCalculator.extra_groups_for_head_shards).
+    group_proj_indices: tuple[int, ...] = ()
 
     @property
     def local_conv_dim(self) -> int:
@@ -68,8 +72,39 @@ class MambaConvSplitInfo:
             offset += size
         return offsets
 
+    def remote_proj_dims(
+        self, tp_ratio: int, remote_conv_state_bytes: int | None = None
+    ) -> tuple[int, ...]:
+        """Per-rank column counts of the sub-projections in one P page.
+
+        Head-sharded sub-projections scale with the TP ratio. Group
+        sub-projections may be replicated on either side, so their size is
+        recovered from P's conv state size (from the handshake); without
+        it, they are assumed to be TP-sharded too.
+        """
+        if tp_ratio >= 1:
+            dims = [d * tp_ratio for d in self.local_proj_dims]
+        else:
+            dims = [d // -tp_ratio for d in self.local_proj_dims]
+        if remote_conv_state_bytes is not None and self.group_proj_indices:
+            remote_conv_dim = remote_conv_state_bytes // (
+                self.conv_rows * self.conv_dtype_size
+            )
+            head_sharded_dim = sum(
+                d for i, d in enumerate(dims) if i not in self.group_proj_indices
+            )
+            group_dim = (remote_conv_dim - head_sharded_dim) // len(
+                self.group_proj_indices
+            )
+            for i in self.group_proj_indices:
+                dims[i] = group_dim
+        return tuple(dims)
+
     def remote_conv_offsets(
-        self, local_rank_offset: int, tp_ratio: int
+        self,
+        local_rank_offset: int,
+        tp_ratio: int,
+        remote_conv_state_bytes: int | None = None,
     ) -> list[tuple[int, int]]:
         """(byte_offset, byte_size) of this D rank's sub-projection slices
         within one P page.
@@ -77,30 +112,33 @@ class MambaConvSplitInfo:
         Used by D side only, during remote descriptor registration.
 
         Args:
-            local_rank_offset: which slice this D rank reads.
+            local_rank_offset: which slice of a P sub-projection is read.
+                tp_ratio >= 1: this D rank's index among the D ranks that
+                read the same P rank.
+                tp_ratio < 0: this P rank's index among the P ranks that
+                this D rank reads.
             tp_ratio: signed TP ratio.
-                >= 1:  D_TP >= P_TP — P page is larger, D reads its slice.
-                < 0:   P_TP > D_TP — P pages are smaller, D reads entire
-                       P page.  Local dims are scaled down by |tp_ratio|
-                       to get P-sized offsets.
+                >= 1:  D_TP >= P_TP — D reads a whole local sub-projection
+                       from each P sub-projection.
+                < 0:   P_TP > D_TP — D reads 1/|tp_ratio| of each local
+                       sub-projection from each P rank.
+            remote_conv_state_bytes: P's conv state size, see
+                ``remote_proj_dims``.
 
         """
+        row_bytes = self.conv_rows * self.conv_dtype_size
+        remote_dims = self.remote_proj_dims(tp_ratio, remote_conv_state_bytes)
         offsets: list[tuple[int, int]] = []
-        if tp_ratio >= 1:
-            remote_base = 0
-            for size in self.proj_bytes:
-                offsets.append((remote_base + local_rank_offset * size, size))
-                remote_base += size * tp_ratio
-        else:
-            # NOTE (ZhanqiuHu): tp_ratio < 0 means P_TP > D_TP, so P pages
-            # are smaller than D's. Local dims are D-sized, but we need
-            # P-sized offsets. Scale down by |tp_ratio|.
-            abs_ratio = -tp_ratio
-            remote_base = 0
-            for size in self.proj_bytes:
-                remote_size = size // abs_ratio
-                offsets.append((remote_base, remote_size))
-                remote_base += remote_size
+        remote_base = 0
+        for local_dim, remote_dim in zip(self.local_proj_dims, remote_dims):
+            read_dim = local_dim if tp_ratio >= 1 else local_dim // -tp_ratio
+            # A P sub-projection larger than one read holds the slices of
+            # several readers; one that fits a single read is read whole.
+            slot = local_rank_offset if remote_dim > read_dim else 0
+            offsets.append(
+                ((remote_base + slot * read_dim) * row_bytes, read_dim * row_bytes)
+            )
+            remote_base += remote_dim
         return offsets
 
 
@@ -156,6 +194,7 @@ def derive_mamba_conv_split(
     ssm_state_bytes = torch.Size(mamba_spec.shapes[1]).numel() * ssm_dtype_size
 
     local_proj_dims: tuple[int, ...]
+    group_proj_indices: tuple[int, ...] = ()
     if mamba_spec.mamba_type == MambaAttentionBackendEnum.MAMBA1:
         # Mamba1 conv state holds only x (no B/C), so it's a single
         # contiguous TP shard with no sub-projection decomposition.
@@ -189,6 +228,7 @@ def derive_mamba_conv_split(
         x_local = intermediate_size // local_tp
         b_local = groups_ss // local_tp
         local_proj_dims = (x_local, b_local, b_local)
+        group_proj_indices = (1, 2)
     elif mamba_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN:
         # GDN: conv = [Q, K, V] where dim(Q) == dim(K) == key_dim.
         # conv_dim = key_dim*2 + value_dim (all global, divided by TP).
@@ -216,6 +256,7 @@ def derive_mamba_conv_split(
         local_proj_dims=local_proj_dims,
         conv_dtype_size=conv_dtype_size,
         ssm_sizes=(conv_state_bytes, ssm_state_bytes),
+        group_proj_indices=group_proj_indices,
     )
 
 

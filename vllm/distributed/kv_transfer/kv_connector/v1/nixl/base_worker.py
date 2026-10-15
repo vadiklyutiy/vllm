@@ -1893,6 +1893,7 @@ class NixlBaseConnectorWorker:
         nixl_agent_meta: NixlAgentMetadata,
         tp_ratio: int,
         transfer_info: EngineTransferInfo,
+        remote_tp_rank: int = 0,
     ) -> np.ndarray:
         """Build remote desc regions (conv sub-projections + ssm) per layer.
         For hetero-TP, each D rank reads only its sub-projection slice from
@@ -1907,7 +1908,12 @@ class NixlBaseConnectorWorker:
         local_offset = self.tp_rank % effective_ratio
         conv_size_remote = nixl_agent_meta.ssm_sizes[0]
 
-        conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
+        # With P_TP > D_TP, replicated conv sub-projections are read in
+        # slices, one per P rank, in _build_local_splits_from_plan order.
+        conv_slot = local_offset if tp_ratio >= 1 else remote_tp_rank % -tp_ratio
+        conv_offsets = self._conv_decomp.remote_conv_offsets(
+            conv_slot, tp_ratio, conv_size_remote
+        )
         if tp_ratio >= 1:
             ssm_read_size = self._mamba_ssm_size[1]
         else:
@@ -2394,7 +2400,9 @@ class NixlBaseConnectorWorker:
                 engine_id,
                 remote_tp_rank,
             )
-            mamba = self._build_mamba_remote(nixl_agent_meta, tp_ratio, transfer_info)
+            mamba = self._build_mamba_remote(
+                nixl_agent_meta, tp_ratio, transfer_info, remote_tp_rank
+            )
             blocks_data = np.concatenate([blocks_data, mamba])
 
         remote_mem_types = set(self.dst_region_mem_types[engine_id])
