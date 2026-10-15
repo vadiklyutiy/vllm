@@ -649,6 +649,26 @@ def test_no_hisparse_connector_keeps_attention_config_unset(monkeypatch):
     assert config.attention_config.hisparse_config is None
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        # Mamba state cannot share one KV cache type with attention layers.
+        ("LiquidAI/LFM2-8B-A1B", False),
+        ("Qwen/Qwen3-0.6B", True),
+    ],
+)
+def test_disable_hybrid_kv_cache_manager_on_hybrid_model(model_id, expected):
+    config = VllmConfig(
+        model_config=ModelConfig(model_id, max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            disable_hybrid_kv_cache_manager=True,
+        ),
+    )
+    assert config.scheduler_config.disable_hybrid_kv_cache_manager is expected
+
+
 def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):
     """ROCm keeps the DSA models (DeepSeek V3.2/V4, GLM-5.2) on their compiled
     paths and off breakable cudagraphs by default."""

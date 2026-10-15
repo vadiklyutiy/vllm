@@ -185,6 +185,8 @@ class SchedulerConfig:
     like full attention and sliding window attention.
     If set to None, the default value will be determined based on the environment
     and starting configuration.
+    For hybrid models with mamba layers, True is treated as None, because mamba
+    state cannot share one KV cache type with attention layers.
     """
 
     scheduler_reserve_full_isl: bool = True

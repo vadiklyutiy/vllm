@@ -2152,7 +2152,9 @@ class VllmConfig:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
         #   disables it
         # - No preference: auto-disable for unsupported features or connector configs
-        # - Explicit disable (--disable-kv-cache-manager): always respect it
+        # - Explicit disable (--disable-kv-cache-manager): respect it, except for
+        #   hybrid mamba models, which are treated as no preference because
+        #   mamba state cannot share one KV cache type with attention layers
         need_disable_hybrid_kv_cache_manager = False
         # logger should only print warning message for hybrid models. As we
         # can't know whether the model is hybrid or not now, so we don't log
@@ -2181,6 +2183,19 @@ class VllmConfig:
                 # Hybrid KV cache manager is not yet supported with chunked
                 # local attention.
                 need_disable_hybrid_kv_cache_manager = True
+
+        if (
+            self.scheduler_config.disable_hybrid_kv_cache_manager
+            and self.model_config is not None
+            and self.model_config.is_hybrid
+        ):
+            logger.warning(
+                "Ignoring --disable-hybrid-kv-cache-manager for hybrid model %s "
+                "and deciding automatically: mamba layers cannot share one KV "
+                "cache type with attention layers.",
+                self.model_config.architecture,
+            )
+            self.scheduler_config.disable_hybrid_kv_cache_manager = None
 
         if self.scheduler_config.disable_hybrid_kv_cache_manager is None:
             # Auto-disable HMA only when the connector config does not support it.
