@@ -1231,6 +1231,11 @@ class FlexAttentionImpl(AttentionImpl):
 
         # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        # reshape_and_cache_flash copies unquantized K/V as is, without
+        # converting them to the KV cache dtype.
+        if key.dtype != key_cache.dtype:
+            key = key.to(key_cache.dtype)
+            value = value.to(value_cache.dtype)
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,

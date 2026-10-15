@@ -241,11 +241,21 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
             sliding_window_size = (
                 list(self.sliding_window) if self.sliding_window is not None else None
             )
+            attn_query = query[:num_actual_tokens]
+            attn_output = output[:num_actual_tokens]
+            # As in FlashAttentionImpl.forward: FA needs q, k, v and out in
+            # one dtype, so attend in the KV cache dtype and cast back.
+            attend_in_kv_cache_dtype = query.dtype != key_cache.dtype and (
+                not is_quantized_kv_cache(self.kv_cache_dtype)
+            )
+            if attend_in_kv_cache_dtype:
+                attn_query = attn_query.to(key_cache.dtype)
+                attn_output = torch.empty_like(attn_output, dtype=key_cache.dtype)
             flash_attn_varlen_func(
-                q=query[:num_actual_tokens],
+                q=attn_query,
                 k=key_cache,
                 v=value_cache,
-                out=output[:num_actual_tokens],
+                out=attn_output,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k,
@@ -264,4 +274,6 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
                 num_splits=attn_metadata.max_num_splits,
                 s_aux=self.sinks,
             )
+            if attend_in_kv_cache_dtype:
+                output[:num_actual_tokens].copy_(attn_output)
             return output

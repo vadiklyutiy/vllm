@@ -851,6 +851,120 @@ def test_causal_backend_correctness(
         )
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA backends")
+@pytest.mark.parametrize(
+    "backend",
+    [
+        AttentionBackendEnum.FLASH_ATTN,
+        AttentionBackendEnum.FLASH_ATTN_DIFFKV,
+        AttentionBackendEnum.FLEX_ATTENTION,
+    ],
+)
+@pytest.mark.parametrize("batch_spec_name", ["small_decode", "small_prefill"])
+def test_float16_kv_cache_with_bfloat16_model(
+    default_vllm_config,
+    backend: AttentionBackendEnum,
+    batch_spec_name: str,
+):
+    """A float16 KV cache under a bfloat16 model must give the same output as
+    a bfloat16 KV cache: new K/V are stored as float16 values and attention
+    accepts a query whose dtype differs from the KV cache."""
+    set_random_seed(42)
+    batch_spec = BATCH_SPECS[batch_spec_name]
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        max_model_len=max(batch_spec.seq_lens),
+        dtype=torch.bfloat16,
+    )
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    num_q_heads = vllm_config.model_config.get_num_attention_heads(
+        vllm_config.parallel_config
+    )
+    num_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    head_size = vllm_config.model_config.get_head_size()
+    block_size = vllm_config.cache_config.block_size
+
+    def randn(num_tokens: int, num_heads: int) -> torch.Tensor:
+        return torch.randn(
+            num_tokens, num_heads, head_size, dtype=torch.bfloat16, device=device
+        )
+
+    num_tokens = sum(batch_spec.query_lens)
+    query = randn(num_tokens, num_q_heads)
+    key = randn(num_tokens, num_kv_heads)
+    value = randn(num_tokens, num_kv_heads)
+    context_lens = [s - q for s, q in zip(batch_spec.seq_lens, batch_spec.query_lens)]
+    k_contexts = [randn(n, num_kv_heads) for n in context_lens]
+    v_contexts = [randn(n, num_kv_heads) for n in context_lens]
+
+    common_attn_metadata = create_common_attn_metadata(batch_spec, block_size, device)
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+
+    outputs = {}
+    for kv_cache_dtype, cache_dtype in (
+        ("auto", torch.bfloat16),
+        ("float16", torch.float16),
+    ):
+        vllm_config.cache_config.cache_dtype = kv_cache_dtype
+        kv_cache = create_and_prepopulate_kv_cache(
+            k_contexts=k_contexts,
+            v_contexts=v_contexts,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=cache_dtype,
+            device=device,
+            num_blocks=vllm_config.cache_config.num_gpu_blocks or 1000,
+            common_attn_metadata=common_attn_metadata,
+            layout=KVCacheLayout.LBNHC,
+            randomize_blocks=False,
+        )
+        outputs[kv_cache_dtype] = run_attention_backend(
+            backend,
+            replace(kv_cache_spec, dtype=cache_dtype),
+            ["placeholder"],
+            vllm_config,
+            device,
+            common_attn_metadata,
+            query,
+            key,
+            value,
+            kv_cache,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+
+    assert outputs["float16"].dtype == torch.bfloat16
+    torch.testing.assert_close(
+        outputs["float16"], outputs["auto"], atol=1e-2, rtol=1e-2
+    )
+
+
+def test_fa4_dense_warmup_compiles_for_kv_cache_dtype(monkeypatch):
+    """FA4 dense attention runs in the KV cache dtype, so its warmup must
+    compile for that dtype, not the model dtype."""
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.flash_attn import _FA4_DENSE_ATTENTION_KERNEL
+
+    vllm_config = create_vllm_config(model_name="Qwen/Qwen3-0.6B", dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda device_id=0: DeviceCapability(9, 0),
+    )
+    kv_cache_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=8, head_size=512, dtype=torch.float16
+    )
+
+    keys = _FA4_DENSE_ATTENTION_KERNEL.get_warmup_keys(
+        vllm_config=vllm_config, kv_cache_spec=kv_cache_spec, num_qo_heads=16
+    )
+
+    assert keys
+    assert {key.dtype for key in keys} == {torch.float16}
+
+
 @pytest.mark.skipif(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",

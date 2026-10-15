@@ -194,7 +194,7 @@ class FA4DenseAttentionKernel(VllmJitKernel["FA4DenseAttentionKernel.CompileKey"
             q_stage=q_stages,
             is_single_batch=single_batches,
             num_splits=split_counts,
-            dtype=vllm_config.model_config.dtype,
+            dtype=kv_cache_spec.dtype,
             num_qo_heads=num_qo_heads,
             num_kv_heads=kv_cache_spec.num_kv_heads,
             head_dim=head_dim,
@@ -1396,11 +1396,23 @@ class FlashAttentionImpl(AttentionImpl):
                 block_table = block_table[:, :num_pages]
                 num_splits = 1
 
+            attn_query = query[:num_actual_tokens]
+            attn_output = output[:num_actual_tokens]
+            # FA needs q, k, v and out in one dtype. An unquantized KV cache
+            # may differ from the model dtype (e.g. float16 with a bfloat16
+            # model), so attend in the KV cache dtype and cast back.
+            attend_in_kv_cache_dtype = query.dtype != key_cache.dtype and (
+                not is_quantized_kv_cache(self.kv_cache_dtype)
+            )
+            if attend_in_kv_cache_dtype:
+                attn_query = attn_query.to(key_cache.dtype)
+                attn_output = torch.empty_like(attn_output, dtype=key_cache.dtype)
+
             _FA4_DENSE_ATTENTION_KERNEL(
-                q=query[:num_actual_tokens],
+                q=attn_query,
                 k=key_cache,
                 v=value_cache,
-                out=output[:num_actual_tokens],
+                out=attn_output,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k,
@@ -1422,6 +1434,8 @@ class FlashAttentionImpl(AttentionImpl):
                 mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                 aux_tensors=rswa_aux or mm_aux,
             )
+            if attend_in_kv_cache_dtype:
+                output[:num_actual_tokens].copy_(attn_output)
             return output
 
     def do_kv_cache_update(
@@ -1441,6 +1455,14 @@ class FlashAttentionImpl(AttentionImpl):
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+
+        # reshape_and_cache_flash copies unquantized K/V as is, without
+        # converting them to the KV cache dtype.
+        if key.dtype != key_cache.dtype and not is_quantized_kv_cache(
+            self.kv_cache_dtype
+        ):
+            key = key.to(key_cache.dtype)
+            value = value.to(value_cache.dtype)
 
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
