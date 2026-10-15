@@ -358,3 +358,46 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA is required")
+def test_causal_conv1d_fn_offset_cache_indices_reuse_kernel():
+    """Prefill state indices sliced after decode rows can start unaligned; they
+    must reuse the kernel compiled for aligned indices, or warmup cannot cover
+    mixed batches."""
+    from triton import knobs
+
+    # A dim no other test uses, so no earlier test compiled the offset variant.
+    dim, width = 80, 3
+    x = torch.randn(1, dim, device=DEVICE, dtype=torch.bfloat16).t()
+    weight = torch.randn(dim, width, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = torch.zeros(
+        4, width - 1, dim, device=DEVICE, dtype=torch.bfloat16
+    ).transpose(1, 2)
+    state_indices = torch.arange(1, 3, dtype=torch.int32, device=DEVICE)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    has_initial_state = torch.zeros(1, dtype=torch.bool, device=DEVICE)
+
+    def run(cache_indices: torch.Tensor) -> None:
+        causal_conv1d_fn(
+            x,
+            weight,
+            None,
+            conv_states,
+            query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=None,
+        )
+
+    run(state_indices[:1])
+    compiled: list[str] = []
+    saved_hook = knobs.runtime.jit_post_compile_hook
+    knobs.runtime.jit_post_compile_hook = lambda **kwargs: compiled.append(
+        kwargs["fn"].name
+    )
+    try:
+        run(state_indices[1:])
+    finally:
+        knobs.runtime.jit_post_compile_hook = saved_hook
+    assert "_causal_conv1d_fwd_kernel" not in compiled, compiled

@@ -32,7 +32,10 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
-from vllm.model_executor.warmup.mamba_triton_warmup import mamba_triton_warmup
+from vllm.model_executor.warmup.mamba_triton_warmup import (
+    _has_mamba_style_cache,
+    mamba_triton_warmup,
+)
 from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (
     qwen4_exp_qsa_triton_warmup,
 )
@@ -267,9 +270,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
-    # FlashInfer attention warmup
-    # Only warmup if the model has FlashInfer attention groups
-    # and is not a pooling model
+    # Mixed prefill+decode warmup for FlashInfer-only models and, on V1, for
+    # models with Mamba-style layers. Not for pooling models.
     def _is_flashinfer_backend(backend):
         try:
             return backend.get_name() == "FLASHINFER"
@@ -279,16 +281,23 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups
-        # NOTE: This should be `any` instead of `all` but other hybrid attention
-        # backends don't support this dummy run. Once we remove
-        # `build_for_cudagraph_capture`, we can change it to `any`.
-        and all(
-            _is_flashinfer_backend(group.backend)
-            for groups in worker.model_runner.attn_groups
-            for group in groups
+        and (
+            # NOTE: This should be `any` instead of `all` but other hybrid attention
+            # backends don't support this dummy run. Once we remove
+            # `build_for_cudagraph_capture`, we can change it to `any`.
+            all(
+                _is_flashinfer_backend(group.backend)
+                for groups in worker.model_runner.attn_groups
+                for group in groups
+            )
+            # No other V1 dummy run reaches the prefill path of Mamba-style layers.
+            or (
+                not worker.use_v2_model_runner
+                and _has_mamba_style_cache(worker.model_runner)
+            )
         )
     ):
-        logger.info_once("Warming up FlashInfer attention.")
+        logger.info_once("Warming up attention with a mixed prefill+decode batch.")
         mixed_batch_attention_warmup(worker)
 
 
