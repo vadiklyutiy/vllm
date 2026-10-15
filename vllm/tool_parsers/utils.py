@@ -988,7 +988,8 @@ def make_valid_python(text: str) -> tuple[str, str] | None:
     Returns:
         A tuple of (completed_text, added_suffix) if the text can be
         made valid, or None if the text is too incomplete to complete
-        meaningfully (e.g. mid-parameter-name or mid-dict-key).
+        meaningfully (e.g. mid-parameter-name, mid-dict-key or ending in a
+        literal that may still grow).
 
     Raises:
         UnexpectedAstError: If mismatched brackets or parentheses
@@ -1073,6 +1074,23 @@ def make_valid_python(text: str) -> tuple[str, str] | None:
         for node in ast.walk(module):
             if isinstance(node, ast.Set):
                 return None
+
+    # A trailing literal may still grow, and its JSON is then not a prefix of
+    # the final one (`37.` reads as `37.0`, not `37.7749`; `'a'` may go on
+    # as `'a' 'b'`). An open string only grows at its end, so it streams.
+    if bracket_stack and bracket_stack[-1] in {"'", '"'}:
+        return candidate, added_text
+    last_statement = module.body[-1]
+    text_end = (
+        last_statement.end_lineno,
+        last_statement.end_col_offset - len(added_text),  # type: ignore[operator]
+    )
+    for node in ast.walk(last_statement):
+        if (
+            isinstance(node, (ast.Constant, ast.JoinedStr))
+            and (node.end_lineno, node.end_col_offset) == text_end
+        ):
+            return None
 
     return candidate, added_text
 

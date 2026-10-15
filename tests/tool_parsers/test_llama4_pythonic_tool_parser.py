@@ -61,6 +61,16 @@ ESCAPED_STRING_FUNCTION_CALL = FunctionCall(
 PYTHON_TAG_FUNCTION_OUTPUT = (
     "<|python_start|>[get_weather(city='LA', metric='C')]<|python_end|>"
 )
+FLOAT_ARGS_AFTER_URL_FUNCTION_OUTPUT = (
+    "[fetch(url='https://example.com/search?q=sf&page=1'), "
+    "locate(lat=37.7749, lon=-122.4194)]"
+)
+FLOAT_ARGS_AFTER_URL_FUNCTION_CALLS = [
+    FunctionCall(
+        name="fetch", arguments='{"url": "https://example.com/search?q=sf&page=1"}'
+    ),
+    FunctionCall(name="locate", arguments='{"lat": 37.7749, "lon": -122.4194}'),
+]
 
 
 @pytest.mark.parametrize("streaming", [True, False])
@@ -199,6 +209,18 @@ TEST_CASES = [
             FunctionCall(name="register_user", arguments='{"name": "Doe", "age": 9}'),
         ],
         id="parallel_calls_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        FLOAT_ARGS_AFTER_URL_FUNCTION_OUTPUT,
+        FLOAT_ARGS_AFTER_URL_FUNCTION_CALLS,
+        id="float_args_after_url_streaming",
+    ),
+    pytest.param(
+        False,
+        FLOAT_ARGS_AFTER_URL_FUNCTION_OUTPUT,
+        FLOAT_ARGS_AFTER_URL_FUNCTION_CALLS,
+        id="float_args_after_url_nonstreaming",
     ),
 ]
 

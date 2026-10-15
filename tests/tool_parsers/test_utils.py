@@ -495,6 +495,33 @@ class TestMakeValidPythonSets:
         assert make_valid_python('[f(x={"k') is None
 
 
+class TestMakeValidPythonTrailingLiteral:
+    # A literal at the end of the text may still grow (`37.` -> `37.7749`,
+    # `1.5` -> `1.5e3`, `'a'` -> `'a' 'b'`, `''` -> `'''a'''`), so its value
+    # must not be streamed yet. The `=` and `:` inside the strings get the
+    # text past the `=`/`:` counting checks.
+    @pytest.mark.parametrize(
+        "literal",
+        ["37.", "37.7", "-122.4", "1.5e3", "0x1", "1_0", "7", "'a'", "''", "f'a'"],
+    )
+    def test_trailing_literal_waits(self, literal: str):
+        assert make_valid_python(f"[f(u='?a=1'), g(x={literal}") is None
+        assert make_valid_python(f"[f(u='a:b:c', x={{'k': {literal}") is None
+
+    def test_closed_number_completes(self):
+        assert make_valid_python("[f(u='?a=1'), g(x=37.7749)") == (
+            "[f(u='?a=1'), g(x=37.7749)]",
+            "]",
+        )
+
+    @pytest.mark.parametrize("literal", ["'ab", "f'ab"])
+    def test_open_string_streams(self, literal: str):
+        assert make_valid_python(f"[f(u='?a=1'), g(x={literal}") == (
+            f"[f(u='?a=1'), g(x={literal}')]",
+            "')]",
+        )
+
+
 class TestGetParameterValueFString:
     # A placeholder-free f-string is a plain string constant, but ast parses
     # it as JoinedStr; it must not drop the call. Real placeholders are not

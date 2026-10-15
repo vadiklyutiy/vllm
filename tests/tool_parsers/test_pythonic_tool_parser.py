@@ -58,6 +58,26 @@ ESCAPED_STRING_FUNCTION_CALL = FunctionCall(
     name="get_weather",
     arguments='{"city": "Martha\'s Vineyard", "metric": "\\"cool units\\""}',
 )
+# The `=` and `:` in a URL let later arguments stream before the call closes,
+# so a half-written number such as `37.` reaches the streamed output.
+URL_FUNCTION_OUTPUT = "fetch(url='https://example.com/search?q=sf&page=1')"
+URL_FUNCTION_CALL = FunctionCall(
+    name="fetch",
+    arguments='{"url": "https://example.com/search?q=sf&page=1"}',
+)
+FLOAT_FUNCTION_OUTPUT = "locate(lat=37.7749, lon=-122.4194)"
+FLOAT_FUNCTION_CALL = FunctionCall(
+    name="locate",
+    arguments='{"lat": 37.7749, "lon": -122.4194}',
+)
+FLOAT_IN_DICT_FUNCTION_OUTPUT = (
+    "post(url='http://localhost:8080/geo', body={'lat': 37.7749, 'lon': -122.4194})"
+)
+FLOAT_IN_DICT_FUNCTION_CALL = FunctionCall(
+    name="post",
+    arguments='{"url": "http://localhost:8080/geo", '
+    '"body": {"lat": 37.7749, "lon": -122.4194}}',
+)
 
 
 @pytest.mark.parametrize("streaming", [True, False])
@@ -159,6 +179,30 @@ TEST_CASES = [
         f"[{SIMPLE_FUNCTION_OUTPUT}, {MORE_TYPES_FUNCTION_OUTPUT}]",
         [SIMPLE_FUNCTION_CALL, MORE_TYPES_FUNCTION_CALL],
         id="parallel_calls_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        f"[{URL_FUNCTION_OUTPUT}, {FLOAT_FUNCTION_OUTPUT}]",
+        [URL_FUNCTION_CALL, FLOAT_FUNCTION_CALL],
+        id="float_args_after_url_streaming",
+    ),
+    pytest.param(
+        False,
+        f"[{URL_FUNCTION_OUTPUT}, {FLOAT_FUNCTION_OUTPUT}]",
+        [URL_FUNCTION_CALL, FLOAT_FUNCTION_CALL],
+        id="float_args_after_url_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        f"[{FLOAT_IN_DICT_FUNCTION_OUTPUT}]",
+        [FLOAT_IN_DICT_FUNCTION_CALL],
+        id="float_in_dict_streaming",
+    ),
+    pytest.param(
+        False,
+        f"[{FLOAT_IN_DICT_FUNCTION_OUTPUT}]",
+        [FLOAT_IN_DICT_FUNCTION_CALL],
+        id="float_in_dict_nonstreaming",
     ),
 ]
 

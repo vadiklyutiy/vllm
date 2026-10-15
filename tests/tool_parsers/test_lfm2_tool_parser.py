@@ -125,6 +125,17 @@ NUL_BYTE_FUNCTION_CALL = FunctionCall(
     name="exec",
     arguments='{"command": "printf a\\u0000b"}',
 )
+# The `=` in the URL lets the second call's arguments stream before it closes.
+FLOAT_ARGS_AFTER_URL_FUNCTION_OUTPUT = (
+    "fetch(url='https://example.com/search?q=sf&page=1'), "
+    "locate(lat=37.7749, lon=-122.4194)"
+)
+FLOAT_ARGS_AFTER_URL_FUNCTION_CALLS = [
+    FunctionCall(
+        name="fetch", arguments='{"url": "https://example.com/search?q=sf&page=1"}'
+    ),
+    FunctionCall(name="locate", arguments='{"lat": 37.7749, "lon": -122.4194}'),
+]
 
 
 @pytest.fixture(scope="module")
@@ -383,6 +394,20 @@ TEST_CASES = [
         [NUL_BYTE_FUNCTION_CALL],
         None,
         id="nul_byte_string_arg_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        _wrap(FLOAT_ARGS_AFTER_URL_FUNCTION_OUTPUT),
+        FLOAT_ARGS_AFTER_URL_FUNCTION_CALLS,
+        None,
+        id="float_args_after_url_streaming",
+    ),
+    pytest.param(
+        False,
+        _wrap(FLOAT_ARGS_AFTER_URL_FUNCTION_OUTPUT),
+        FLOAT_ARGS_AFTER_URL_FUNCTION_CALLS,
+        None,
+        id="float_args_after_url_nonstreaming",
     ),
 ]
 
