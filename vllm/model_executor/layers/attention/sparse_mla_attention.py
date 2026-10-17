@@ -639,6 +639,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # Reuse the index group's top-k conversion only for uniform decode batches
     # of multi-layer groups; other batches convert per layer.
     group_conversion_decode_only: ClassVar[bool] = False
+    index_group: SparseMLAIndexGroup | None = None
+    index_group_index = 0
 
     def __init__(
         self,
@@ -679,8 +681,6 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         )
 
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
-        self.index_group: SparseMLAIndexGroup | None = None
-        self.index_group_index = 0
         if index_group_builder is None and self.topk_indices_buffer is not None:
             index_group_builder = SparseMLAIndexGroupBuilder(self.topk_indices_buffer)
         if index_group_builder is not None:
@@ -746,10 +746,12 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert self.topk_indices_buffer is not None
         num_tokens = q[0].shape[0] if isinstance(q, tuple) else q.shape[0]
-        topk = self.topk_indices_buffer[:num_tokens]
         num_decode_tokens = attn_metadata.num_decode_tokens
         block_size = attn_metadata.block_size
         index_group = self.index_group
+        topk = self.topk_indices_buffer[:num_tokens]
+        if index_group is not None:
+            topk = index_group.logical_topk(self.index_group_index, topk, 0)
         if not isinstance(index_group, HiSparseMLAIndexGroup):
             _, block_stride_rows = flat_kv_row_view(kv_c_and_k_pe_cache, block_size)
             if self.dcp_world_size > 1:
@@ -1181,6 +1183,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         topk_all = self.topk_indices_buffer[
             num_decode_tokens : num_decode_tokens + q.shape[0]
         ]
+        if self.index_group is not None:
+            topk_all = self.index_group.logical_topk(
+                self.index_group_index, topk_all, num_decode_tokens
+            )
         topk_per_req = self._slice_topk_per_req(topk_all, q_lens)
 
         k, v = self._project_kv(kv_c_normed, k_pe)

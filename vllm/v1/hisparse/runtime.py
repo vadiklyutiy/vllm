@@ -9,6 +9,7 @@ import mmap
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import numpy as np
@@ -27,6 +28,12 @@ from vllm.v1.attention.backend import max_decode_query_len
 from vllm.v1.hisparse.types import SparseKVResidencyUpdate
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.worker.ubatching import (
+    dbo_current_ubatch_id,
+    dbo_current_ubatch_request_offset,
+    dbo_current_ubatch_token_offset,
+    dbo_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -680,6 +687,7 @@ class HiSparseIndexGroup:
         top_k: int,
         copy_stream: torch.Stream | None = None,
         logical_topk_ready: torch.Event | None = None,
+        num_ubatches: int = 1,
     ) -> None:
         self.device_global_indices = torch.full(
             (max_num_reqs, region_stride),
@@ -689,7 +697,12 @@ class HiSparseIndexGroup:
         )
         self.lru_init = torch.arange(region_stride, dtype=torch.int16, device=device)
         self.lru_slots = self.lru_init.repeat(max_num_reqs, 1).contiguous()
-        self.shared_topk = _create_shared_topk_state(device, max_swap_rows, top_k)
+        # Followers read the leader's result layers later, after the other
+        # microbatches have resolved theirs, so each microbatch keeps its own.
+        self.ubatch_shared_topk = [
+            _create_shared_topk_state(device, max_swap_rows, top_k)
+            for _ in range(num_ubatches)
+        ]
         # Request ids the resolver reads, built on the copy stream: a
         # compute-stream write would race with its logical_topk_ready wait.
         self.row_indices = torch.arange(max_swap_rows, dtype=torch.int32, device=device)
@@ -704,6 +717,19 @@ class HiSparseIndexGroup:
             2, dtype=torch.uint64, device="cpu", pin_memory=True
         )
         self.stats_row_bytes = 0
+
+    @property
+    def shared_topk(self) -> _SharedTopKState:
+        return self.ubatch_shared_topk[dbo_current_ubatch_id()]
+
+
+@dataclass
+class _SwapState:
+    """One microbatch's swap rows and the leader-to-layer staging handoff."""
+
+    step: int = 0
+    staged: bool = False
+    ready_event: torch.Event | None = None
 
 
 class HiSparseRuntime:
@@ -726,6 +752,7 @@ class HiSparseRuntime:
         index_group: HiSparseIndexGroup | None = None,
         copy_stream: torch.Stream | None = None,
         logical_topk_ready: torch.Event | None = None,
+        num_ubatches: int = 1,
     ) -> None:
         if not _has_hisparse_ops():
             raise RuntimeError(
@@ -751,9 +778,7 @@ class HiSparseRuntime:
                 f"HiSparse requires 16-byte aligned KV rows, got {row_bytes}B."
             )
 
-        self._layer_ready_event: torch.Event | None = None
-        self._swap_staged = False
-        self._swap_step = 0
+        self._ubatch_swaps: list[_SwapState] = []
         self.is_group_leader = index_group is None
         if index_group is None:
             index_group = HiSparseIndexGroup(
@@ -764,6 +789,7 @@ class HiSparseRuntime:
                 config.top_k,
                 copy_stream,
                 logical_topk_ready,
+                num_ubatches,
             )
             index_group.leader = self
         else:
@@ -919,22 +945,29 @@ class HiSparseRuntime:
             written_slots[:num_tokens],
         )
 
+    def _swap(self) -> _SwapState:
+        ubatch = dbo_current_ubatch_id()
+        while len(self._ubatch_swaps) <= ubatch:
+            self._ubatch_swaps.append(_SwapState())
+        return self._ubatch_swaps[ubatch]
+
     def begin_forward(self) -> None:
-        self._swap_step = 0
+        self._swap().step = 0
 
     @property
     def max_swap_rows(self) -> int:
         return self.index_group.shared_topk.physical_topk_indices.shape[0]
 
     def _step_rows(self, num_tokens: int) -> slice:
-        start = self._swap_step * num_tokens
+        swap = self._swap()
+        start = swap.step * num_tokens
         stop = start + num_tokens
         if stop > self.max_swap_rows:
             raise ValueError(
                 "HiSparse swap rows exceed the configured speculative decode "
                 f"capacity: stop={stop}, capacity={self.max_swap_rows}."
             )
-        self._swap_step += 1
+        swap.step += 1
         return slice(start, stop)
 
     def _resolve_residency(
@@ -957,6 +990,7 @@ class HiSparseRuntime:
         assert hot.block_size == block_size
         request_state_indices = self.request_state_indices
         assert request_state_indices is not None
+        request_offset = dbo_current_ubatch_request_offset()
         group = self.index_group
         shared = group.shared_topk
 
@@ -982,12 +1016,12 @@ class HiSparseRuntime:
         torch.ops._C_cache_ops.hisparse_resolve_residency(
             host_cache,
             hot.cache,
-            self.hot_block_table,
+            self.hot_block_table[request_offset:],
             topk_indices,
             device_topk_rows,
             group.device_global_indices,
             group.lru_slots,
-            request_state_indices,
+            request_state_indices[request_offset:],
             self.region_stride,
             self.max_union_rows,
             None,
@@ -1065,10 +1099,7 @@ class HiSparseRuntime:
                 runtimes.extend(group.followers)
             for runtime in runtimes:
                 runtime._swap_rows(shared_rows)
-                if runtime._layer_ready_event is None:
-                    runtime._layer_ready_event = torch.Event()
-                runtime._layer_ready_event.record(group.copy_stream)
-                runtime._swap_staged = True
+                runtime._record_staged_swap(group.copy_stream)
 
     def _stage_this_layer(self, shared_rows: slice) -> None:
         group = self.index_group
@@ -1076,16 +1107,21 @@ class HiSparseRuntime:
         group.copy_stream.wait_stream(compute_stream)
         with group.copy_stream:
             self._swap_rows(shared_rows)
-            if self._layer_ready_event is None:
-                self._layer_ready_event = torch.Event()
-            self._layer_ready_event.record(group.copy_stream)
-            self._swap_staged = True
+            self._record_staged_swap(group.copy_stream)
+
+    def _record_staged_swap(self, stream: torch.Stream) -> None:
+        swap = self._swap()
+        if swap.ready_event is None:
+            swap.ready_event = torch.Event()
+        swap.ready_event.record(stream)
+        swap.staged = True
 
     def wait_for_staged_swap(self) -> None:
-        if not self._swap_staged or self._layer_ready_event is None:
+        swap = self._swap()
+        if not swap.staged or swap.ready_event is None:
             raise RuntimeError("HiSparse layer swap was not prefetched.")
-        current_stream().wait_event(self._layer_ready_event)
-        self._swap_staged = False
+        current_stream().wait_event(swap.ready_event)
+        swap.staged = False
 
     def swap_in(
         self,
@@ -1122,7 +1158,7 @@ class HiSparseRuntime:
                 num_valid_rows=num_valid_rows,
             )
 
-        if not self._swap_staged:
+        if not self._swap().staged:
             self._stage_this_layer(shared_rows)
         self.wait_for_staged_swap()
 
@@ -1173,8 +1209,80 @@ def update_hisparse_residency(
     residency[state_rows, :, values[:, 1]] = values[:, 2:]
 
 
+@dataclass
+class _BatchState:
+    """What one forward's (micro)batch tells the cache handle."""
+
+    dummy_batch: bool = False
+    decode_batch: bool = False
+    num_actual_tokens: int = 0
+    num_decode_tokens: int = 0
+    req_id_per_token: torch.Tensor | None = None
+    host_mirror_required: bool = False
+    request_offset: int = 0
+    _batch_block_table: torch.Tensor | None = None
+
+
+def _step_req_ids(batches: list[_BatchState]) -> torch.Tensor | None:
+    if not batches:
+        return None
+    return torch.cat(
+        [
+            batch.req_id_per_token[: batch.num_actual_tokens] + batch.request_offset
+            for batch in batches
+            if batch.req_id_per_token is not None
+        ]
+    )
+
+
+class _BatchField:
+    """A ``HiSparseCacheHandle`` field kept per DBO microbatch.
+
+    Inside a microbatch thread it reads and writes that microbatch's value.
+    Outside, setting it starts a new step, and reading it applies ``merge`` to
+    the microbatches that had tokens (or reads the only batch). Their real
+    tokens are contiguous from the start of the batch.
+    """
+
+    def __init__(self, merge: Callable[[list[_BatchState]], Any] | None = None):
+        self.merge = merge
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    def __get__(self, handle: Any, owner: type | None = None) -> Any:
+        if handle is None:
+            return self
+        batches = handle._batches
+        if self.merge is None or dbo_enabled() or len(batches) == 1:
+            return getattr(handle._batch(), self.name)
+        return self.merge([batch for batch in batches if batch.num_actual_tokens])
+
+    def __set__(self, handle: Any, value: Any) -> None:
+        if not dbo_enabled():
+            del handle._batches[1:]
+        setattr(handle._batch(), self.name, value)
+
+
 class HiSparseCacheHandle:
     """Attention-facing handle for resident KV and sparse offload state."""
+
+    dummy_batch = _BatchField()
+    decode_batch = _BatchField(
+        lambda batches: bool(batches) and all(b.decode_batch for b in batches)
+    )
+    num_actual_tokens = _BatchField(
+        lambda batches: sum(b.num_actual_tokens for b in batches)
+    )
+    num_decode_tokens = _BatchField(
+        lambda batches: sum(b.num_decode_tokens for b in batches)
+    )
+    req_id_per_token = _BatchField(_step_req_ids)
+    host_mirror_required = _BatchField(
+        lambda batches: any(b.host_mirror_required for b in batches)
+    )
+    request_offset = _BatchField()
+    _batch_block_table = _BatchField()
 
     def __init__(self, runtime: HiSparseRuntime) -> None:
         self.view: PagedCacheView | None = None
@@ -1183,19 +1291,22 @@ class HiSparseCacheHandle:
         self.source_block_table: torch.Tensor | None = None
         self.slot_mapping: torch.Tensor | None = None
         self.runtime = runtime
-        self.dummy_batch = False
-        self.decode_batch = False
         self.all_context_pages_resident = True
-        self.num_actual_tokens = 0
-        self.num_decode_tokens = 0
-        self.req_id_per_token: torch.Tensor | None = None
-        self.host_mirror_required = False
         self.mirror_slot_mapping: torch.Tensor | None = None
         self.submit_layer_mirror: Callable[[], None] | None = None
         # Speculator layers write their rows after the target forward.
         self.draft_layer = False
         self.index_group_caches: list[HiSparseCacheHandle] = [self]
-        self._batch_block_table: torch.Tensor | None = None
+
+    @cached_property
+    def _batches(self) -> list[_BatchState]:
+        return [_BatchState()]
+
+    def _batch(self) -> _BatchState:
+        ubatch = dbo_current_ubatch_id()
+        while len(self._batches) <= ubatch:
+            self._batches.append(_BatchState())
+        return self._batches[ubatch]
 
     def prepare_group_for_batch(self, attn_metadata: Any | None) -> None:
         assert self.runtime.is_group_leader
@@ -1204,6 +1315,7 @@ class HiSparseCacheHandle:
 
     def _prepare_for_batch(self, attn_metadata: Any | None) -> None:
         self.dummy_batch = attn_metadata is None
+        self.request_offset = dbo_current_ubatch_request_offset()
         self._batch_block_table = None
         self.runtime.begin_forward()
         self.num_actual_tokens = (
@@ -1227,7 +1339,7 @@ class HiSparseCacheHandle:
             indices = self.runtime.request_state_indices
             assert indices is not None
             self._batch_block_table = self.block_table.index_select(
-                0, indices.clamp(min=0)
+                0, indices[self.request_offset :].clamp(min=0)
             )
         return self._batch_block_table
 
@@ -1238,7 +1350,8 @@ class HiSparseCacheHandle:
         num_rows = min(num_input_rows, num_slot_rows, self.num_actual_tokens)
         if self.decode_batch:
             num_rows = min(num_rows, self.runtime.max_num_reqs)
-        return self.view.cache, self.slot_mapping[:num_rows], num_rows
+        start = dbo_current_ubatch_token_offset()
+        return self.view.cache, self.slot_mapping[start : start + num_rows], num_rows
 
     def finish_kv_update(self) -> None:
         if self.dummy_batch:
@@ -1324,6 +1437,7 @@ def create_hisparse_cache_handle(
     kv_dtype: torch.dtype,
     index_group: HiSparseMLAIndexGroup | None = None,
     device: torch.device | str | None = None,
+    num_ubatches: int = 1,
 ) -> HiSparseCacheHandle | None:
     config = ResolvedHiSparseConfig.from_vllm_config(vllm_config, model_top_k)
     if config is None:
@@ -1355,6 +1469,7 @@ def create_hisparse_cache_handle(
             if index_group is not None and index_group.has_indexer
             else None
         ),
+        num_ubatches=num_ubatches,
     )
     if is_index_group_leader and index_group is not None:
         index_group.hisparse_group = runtime.index_group

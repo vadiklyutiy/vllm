@@ -799,6 +799,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             kv_cache, slot_mapping, num_rows = cache.write_target(
                 kv_c_normed.shape[0], slot_mapping.numel()
             )
+            if num_rows == 0:
+                return
             kv_c_normed = kv_c_normed[:num_rows]
             k_pe = k_pe[:num_rows]
         self.impl.do_kv_cache_update(  # type: ignore[attr-defined]

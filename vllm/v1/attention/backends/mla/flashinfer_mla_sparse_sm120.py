@@ -120,6 +120,10 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
         index_group = self.index_group
+        if index_group is not None:
+            topk_indices = index_group.logical_topk(
+                self.index_group_index, topk_indices, 0
+            )
         if isinstance(index_group, HiSparseMLAIndexGroup):
             num_decode_tokens = attn_metadata.num_decode_tokens
             physical_kv_cache = index_group.physical_kv_cache(self.index_group_index)

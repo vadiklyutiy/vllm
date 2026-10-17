@@ -83,6 +83,31 @@ def test_workspace_lanes_compose_with_ubatches(monkeypatch) -> None:
     assert len(pointers) == 4
 
 
+def test_reserve_simultaneous_sizes_every_ubatch_slot(monkeypatch) -> None:
+    """Profiling reserves on ubatch 0, but under DBO the other ubatch reaches
+    the profiled path only after the workspace is locked."""
+    active_ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+
+    manager.reserve_simultaneous(((256,), torch.uint8), ((4,), torch.float32))
+    manager.lock()
+
+    active_ubatch[0] = 1
+    values, scales = manager.get_simultaneous(
+        ((256,), torch.uint8), ((4,), torch.float32)
+    )
+    assert values.numel() == 256
+    assert scales.numel() == 4
+    with (
+        workspace.use_workspace_lane(1),
+        pytest.raises(AssertionError, match="Workspace is locked"),
+    ):
+        manager.get_simultaneous(((256,), torch.uint8))
+
+
 def test_workspace_lock_blocks_growth_and_unlock_restores(monkeypatch) -> None:
     """Once locked, oversized requests fail loudly instead of reallocating the
     buffer that captured CUDA graphs point at; unlock restores growth."""

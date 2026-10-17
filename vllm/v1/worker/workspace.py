@@ -25,6 +25,14 @@ def _compute_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
     return prod(shape) * dtype.itemsize
 
 
+def _byte_sizes(
+    shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+) -> tuple[list[int], list[int]]:
+    """Byte sizes of the tensors, and their 256-byte aligned footprints."""
+    actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
+    return actual_bytes, [round_up(actual, 256) for actual in actual_bytes]
+
+
 # Constants
 _MB = 1024**2
 _GiB = 1024**3
@@ -120,14 +128,17 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
-    def _get_workspace_id(self) -> int:
+    def _current_lane(self) -> int:
         lane = _workspace_lane.get()
         if lane >= self._num_lanes:
             raise RuntimeError(
                 f"Workspace lane {lane} is not configured; manager has "
                 f"{self._num_lanes} lane(s)."
             )
-        return dbo_current_ubatch_id() * self._num_lanes + lane
+        return lane
+
+    def _get_workspace_id(self) -> int:
+        return dbo_current_ubatch_id() * self._num_lanes + self._current_lane()
 
     def get_persistent_resource(self, key: Hashable, factory: Callable[[], T]) -> T:
         """Return the resource cached for ``key`` in the current ubatch and lane.
@@ -190,14 +201,15 @@ class WorkspaceManager:
             List of tensor views into the workspace buffer, one per shape/dtype pair.
 
         """
-        actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
-        aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
+        actual_bytes, aligned_bytes = _byte_sizes(shapes_and_dtypes)
         total_bytes = sum(aligned_bytes)
 
         # Calculate cumulative offsets using itertools.accumulate
         offsets = list(accumulate([0] + aligned_bytes[:-1]))
 
-        current_workspace = self._ensure_workspace_size(total_bytes)
+        current_workspace = self._ensure_workspace_size(
+            total_bytes, self._get_workspace_id()
+        )
 
         return [
             current_workspace[offsets[i] : offsets[i] + actual_bytes[i]]
@@ -206,17 +218,33 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
+    def reserve_simultaneous(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> None:
+        """Size every ubatch slot of the current lane for ``get_simultaneous``.
+
+        Profiling runs one batch, on ubatch 0, but any ubatch can take the
+        profiled path once DBO splits a step. Call it outside microbatched
+        runs: a slot in use would lose the storage its views point into.
+        """
+        total_bytes = sum(_byte_sizes(shapes_and_dtypes)[1])
+        lane = self._current_lane()
+        for ubatch in range(self._num_ubatches):
+            self._ensure_workspace_size(total_bytes, ubatch * self._num_lanes + lane)
+
+    def _ensure_workspace_size(
+        self, required_bytes: int, workspace_id: int
+    ) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
             required_bytes: The number of bytes required.
+            workspace_id: The (ubatch, lane) slot to size.
 
         Returns:
             The current workspace tensor.
 
         """
-        workspace_id = self._get_workspace_id()
         current_workspace = self._current_workspaces[workspace_id]
         current_size = self._workspace_size_bytes(current_workspace)
 

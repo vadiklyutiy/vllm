@@ -1441,6 +1441,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Get topk indices
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        if self.index_group is not None:
+            topk_indices = self.index_group.logical_topk(
+                self.index_group_index, topk_indices, 0
+            )
 
         use_fp8_cache = self.kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS
 

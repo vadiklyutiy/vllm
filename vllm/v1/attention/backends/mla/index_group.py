@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.forward_context import in_piecewise_cudagraph
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import max_decode_query_len
@@ -21,6 +21,12 @@ from vllm.v1.hisparse.runtime import (
     HiSparseCacheHandle,
     HiSparsePrefillStagingPlan,
     create_hisparse_cache_handle,
+)
+from vllm.v1.worker.ubatch_utils import get_num_ubatches
+from vllm.v1.worker.ubatching import (
+    dbo_current_ubatch_id,
+    dbo_current_ubatch_request_offset,
+    dbo_enabled,
 )
 
 
@@ -44,6 +50,39 @@ class SparseMLAIndexGroup:
     physical_topk_ready: torch.Event
     has_indexer: bool
     num_layers: int = 0
+    # Converted rows of DBO microbatches 1..n: the group's later layers read
+    # them after the other microbatches have run the group's first layer.
+    ubatch_topk: list[tuple[torch.Tensor, torch.Tensor, torch.Event]] = field(
+        default_factory=list
+    )
+    # The logical rows, per DBO microbatch, for the same reason. Indexed by
+    # microbatch id, unlike ubatch_topk; shared by the builder's groups.
+    ubatch_logical_topk: list[torch.Tensor] = field(default_factory=list)
+
+    def logical_topk(
+        self, layer_index: int, rows: torch.Tensor, start: int
+    ) -> torch.Tensor:
+        """The logical rows from ``start``: the group's first layer fills this
+        microbatch's copy and keeps ``rows``; later layers read the copy."""
+        if not dbo_enabled() or self.num_layers == 1:
+            return rows
+        ubatch_rows = self.ubatch_logical_topk[dbo_current_ubatch_id()][
+            start : start + rows.shape[0]
+        ]
+        if layer_index == 0:
+            ubatch_rows.copy_(rows)
+            return rows
+        return ubatch_rows
+
+    def _topk_rows(self) -> tuple[torch.Tensor, torch.Tensor, torch.Event]:
+        ubatch = dbo_current_ubatch_id()
+        if ubatch == 0:
+            return (
+                self.physical_topk_indices,
+                self.valid_topk_counts,
+                self.physical_topk_ready,
+            )
+        return self.ubatch_topk[ubatch - 1]
 
     def register_layer(
         self,
@@ -121,6 +160,7 @@ class SparseMLAIndexGroup:
         *,
         block_stride_rows: int | None,
         return_valid_counts: bool,
+        block_table_after_topk: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         num_tokens = logical_topk_indices.shape[0]
         if num_tokens > self.physical_topk_indices.shape[0]:
@@ -134,11 +174,18 @@ class SparseMLAIndexGroup:
                 return_valid_counts=return_valid_counts,
             )
 
-        physical_topk_indices = self.physical_topk_indices[:num_tokens]
-        valid_topk_counts = self.valid_topk_counts[:num_tokens]
+        physical_topk_indices, valid_topk_counts, physical_topk_ready = (
+            self._topk_rows()
+        )
+        physical_topk_indices = physical_topk_indices[:num_tokens]
+        valid_topk_counts = valid_topk_counts[:num_tokens]
         compute_stream = current_stream()
         if layer_index == 0:
-            if self.has_indexer and not in_piecewise_cudagraph():
+            if (
+                self.has_indexer
+                and not in_piecewise_cudagraph()
+                and not block_table_after_topk
+            ):
                 self.side_stream.wait_event(self.logical_topk_ready)
             else:
                 self.side_stream.wait_stream(compute_stream)
@@ -156,8 +203,8 @@ class SparseMLAIndexGroup:
                         valid_topk_counts if return_valid_counts else None
                     ),
                 )
-                self.physical_topk_ready.record(self.side_stream)
-        compute_stream.wait_event(self.physical_topk_ready)
+                physical_topk_ready.record(self.side_stream)
+        compute_stream.wait_event(physical_topk_ready)
 
         if return_valid_counts:
             return physical_topk_indices, valid_topk_counts
@@ -203,6 +250,7 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
             row_width=row_width,
             kv_dtype=kv_dtype,
             index_group=self,
+            num_ubatches=get_num_ubatches(vllm_config.parallel_config),
         )
         assert cache is not None
         self.caches.append(cache)
@@ -250,12 +298,15 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
                 leader.view.block_size,
                 block_stride_rows=leader.view.attention_block_stride,
                 return_valid_counts=return_valid_counts,
+                # The table is gathered on the compute stream after the
+                # indexer recorded logical_topk_ready.
+                block_table_after_topk=True,
             )
         source_block_table = cache.source_block_table
         assert source_block_table is not None
         return cache.swap_in(
             req_id_per_token,
-            block_table=source_block_table,
+            block_table=source_block_table[dbo_current_ubatch_request_offset() :],
             logical_topk_indices=logical_topk_indices,
             block_size=attn_metadata.block_size,
             return_valid_counts=return_valid_counts,
@@ -273,9 +324,12 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         if cache.view is not None and cache.block_table is not None:
             state_indices = cache.runtime.request_state_indices
             assert state_indices is not None
+            first_prefill = (
+                dbo_current_ubatch_request_offset() + attn_metadata.num_decodes
+            )
             staging_plan.ensure_gpu_sources(
                 cache.block_table,
-                state_indices[attn_metadata.num_decodes :],
+                state_indices[first_prefill:],
                 cache.view.block_size,
             )
             resident_cache = cache.view.cache
@@ -299,9 +353,10 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         assert cache.view is not None and cache.block_table is not None
         state_indices = cache.runtime.request_state_indices
         assert state_indices is not None
+        first_prefill = dbo_current_ubatch_request_offset() + attn_metadata.num_decodes
         plan.ensure_gpu_sources(
             cache.block_table,
-            state_indices[attn_metadata.num_decodes :],
+            state_indices[first_prefill:],
             cache.view.block_size,
         )
         assert plan.gpu_row_ids is not None
@@ -355,6 +410,22 @@ class SparseMLAIndexGroupBuilder:
             else max_decode_rows
         )
         self.current_group: SparseMLAIndexGroup | None = None
+        # A microbatch runs its groups in order, so its groups share one copy.
+        self.ubatch_logical_topk: list[torch.Tensor] | None = None
+
+    def _create_topk_rows(self) -> tuple[torch.Tensor, torch.Tensor, torch.Event]:
+        workspace_rows = self.max_decode_rows
+        physical_topk_indices = torch.empty(
+            (workspace_rows + 1, self.logical_topk_indices.shape[1]),
+            dtype=self.logical_topk_indices.dtype,
+            device=self.logical_topk_indices.device,
+        )
+        valid_topk_counts = torch.empty(
+            workspace_rows + 1,
+            dtype=torch.int32,
+            device=self.logical_topk_indices.device,
+        )
+        return physical_topk_indices, valid_topk_counts, _create_event()
 
     def register_layer(
         self,
@@ -371,24 +442,31 @@ class SparseMLAIndexGroupBuilder:
                 and vllm_config.attention_config.hisparse_config is not None
                 else SparseMLAIndexGroup
             )
-            workspace_rows = self.max_decode_rows
-            physical_topk_indices = torch.empty(
-                (workspace_rows + 1, self.logical_topk_indices.shape[1]),
-                dtype=self.logical_topk_indices.dtype,
-                device=self.logical_topk_indices.device,
+            config = (
+                vllm_config
+                if vllm_config is not None
+                else get_current_vllm_config_or_none()
             )
+            num_ubatches = (
+                1 if config is None else get_num_ubatches(config.parallel_config)
+            )
+            topk_rows = [self._create_topk_rows() for _ in range(num_ubatches)]
+            physical_topk_indices, valid_topk_counts, physical_topk_ready = topk_rows[0]
+            if self.ubatch_logical_topk is None:
+                self.ubatch_logical_topk = [
+                    torch.empty_like(self.logical_topk_indices)
+                    for _ in range(num_ubatches if num_ubatches > 1 else 0)
+                ]
             self.current_group = group_cls(
                 logical_topk_indices=self.logical_topk_indices,
                 physical_topk_indices=physical_topk_indices,
-                valid_topk_counts=torch.empty(
-                    workspace_rows + 1,
-                    dtype=torch.int32,
-                    device=self.logical_topk_indices.device,
-                ),
+                valid_topk_counts=valid_topk_counts,
                 side_stream=_create_side_stream(self.logical_topk_indices.device),
                 logical_topk_ready=_create_event(),
-                physical_topk_ready=_create_event(),
+                physical_topk_ready=physical_topk_ready,
                 has_indexer=is_index_producing_layer,
+                ubatch_topk=topk_rows[1:],
+                ubatch_logical_topk=self.ubatch_logical_topk,
             )
         group = self.current_group
         group_index = group.register_layer(

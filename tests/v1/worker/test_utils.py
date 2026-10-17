@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import mmap
+import threading
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
@@ -29,6 +30,8 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
+from vllm.v1.worker import ubatching
+from vllm.v1.worker.ubatching import dbo_yield, make_ubatch_contexts
 from vllm.v1.worker.utils import (
     bind_kv_cache,
     bind_kv_cache_to_layers,
@@ -197,6 +200,85 @@ def test_hisparse_submits_layer_mirror_at_replayed_attention_boundary(
     handle.finish_kv_update()
 
     assert handle.submit_layer_mirror.call_count == expected_calls
+
+
+def _hisparse_prefill(req_ids: list[int]) -> SimpleNamespace:
+    return SimpleNamespace(
+        num_actual_tokens=len(req_ids),
+        num_decode_tokens=0,
+        max_query_len=len(req_ids),
+        num_reqs=len(set(req_ids)),
+        req_id_per_token=torch.tensor(req_ids, dtype=torch.int32),
+    )
+
+
+def _run_hisparse_microbatches(handle, batches, **offsets):
+    """Prepare and write each batch on its own DBO microbatch thread."""
+    compute_stream = object()
+    ready_barrier = threading.Barrier(3)
+    ctxs = make_ubatch_contexts(
+        num_micro_batches=2,
+        compute_stream=compute_stream,
+        comm_stream=object(),
+        forward_contexts=[object(), object()],
+        ready_barrier=ready_barrier,
+        **offsets,
+    )
+    seen: dict[int, tuple[int, list[int]]] = {}
+
+    def run(ctx: ubatching.UBatchContext) -> None:
+        with ctx:
+            handle._prepare_for_batch(batches[ctx.id])
+            # The other microbatch prepares its batch before this one writes.
+            dbo_yield()
+            _, slots, _ = handle.write_target(8, 8)
+            seen[ctx.id] = (handle.num_actual_tokens, slots.tolist())
+
+    with patch.object(ubatching, "current_stream", return_value=compute_stream):
+        threads = [threading.Thread(target=run, args=(ctx,)) for ctx in ctxs]
+        for thread in threads:
+            thread.start()
+        ready_barrier.wait()
+        ctxs[0].cpu_wait_event.set()
+        for thread in threads:
+            thread.join()
+    return seen
+
+
+def _hisparse_handle_with_slots():
+    runtime = SimpleNamespace(
+        begin_forward=lambda: None, eager_host_mirror=True, max_num_reqs=8
+    )
+    handle = hisparse_runtime_module.HiSparseCacheHandle(runtime)
+    handle.view = SimpleNamespace(cache=torch.empty(1))
+    handle.slot_mapping = torch.arange(10, 16)
+    return handle
+
+
+def test_hisparse_handle_keeps_rows_per_microbatch():
+    """Each DBO microbatch writes its own KV rows from its own batch state."""
+    seen = _run_hisparse_microbatches(
+        _hisparse_handle_with_slots(),
+        {0: _hisparse_prefill([0, 1, 1]), 1: _hisparse_prefill([0, 0])},
+        token_offsets=[0, 3],
+    )
+    assert seen == {0: (3, [10, 11, 12]), 1: (2, [13, 14])}
+
+
+def test_hisparse_handle_describes_whole_step_after_microbatches():
+    """The host mirror reads the handle after the forward, for all rows."""
+    handle = _hisparse_handle_with_slots()
+    _run_hisparse_microbatches(
+        handle,
+        {0: _hisparse_prefill([0, 1, 1]), 1: _hisparse_prefill([0, 0])},
+        token_offsets=[0, 3],
+        request_offsets=[0, 2],
+    )
+    assert handle.num_actual_tokens == 5
+    assert handle.host_mirror_required
+    assert handle.req_id_per_token.tolist() == [0, 1, 1, 2, 2]
+    handle.num_actual_tokens = 0
+    assert handle.num_actual_tokens == 0
 
 
 def _hisparse_parallel_config(**overrides):

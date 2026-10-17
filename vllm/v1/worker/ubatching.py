@@ -33,6 +33,7 @@ class UBatchContext:
         gpu_compute_done_event: torch.Event,
         schedule: str = "default",
         token_offset: int = 0,
+        request_offset: int = 0,
     ):
         self.id = id
         self.comm_stream = comm_stream
@@ -46,6 +47,7 @@ class UBatchContext:
         self.gpu_compute_done_event = gpu_compute_done_event
         self.schedule = schedule
         self.token_offset = token_offset
+        self.request_offset = request_offset
         self.recv_hook = None
 
     def __enter__(self):
@@ -168,6 +170,17 @@ def dbo_current_ubatch_token_offset() -> int:
     return ctx.token_offset
 
 
+def dbo_current_ubatch_request_offset() -> int:
+    """Request-row offset of the calling ubatch inside the parent batch.
+
+    Returns 0 when no DBO context is active on this thread.
+    """
+    if len(_THREAD_ID_TO_CONTEXT) == 0:
+        return 0
+    ctx = _CURRENT_CONTEXTS[_THREAD_ID_TO_CONTEXT[threading.get_ident()]]
+    return ctx.request_offset
+
+
 def _register_ubatch_function(func):
     def wrapper(*args, **kwargs):
         if len(_THREAD_ID_TO_CONTEXT) > 0:
@@ -218,6 +231,7 @@ def make_ubatch_contexts(
     ready_barrier: threading.Barrier,
     schedule: str = "default",
     token_offsets: list[int] | None = None,
+    request_offsets: list[int] | None = None,
 ) -> list[UBatchContext]:
     global _NUM_UBATCHES, _CURRENT_CONTEXTS
     assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
@@ -248,6 +262,7 @@ def make_ubatch_contexts(
             gpu_compute_done_event=gpu_compute_done_events[i],
             schedule=schedule,
             token_offset=token_offsets[i] if token_offsets else 0,
+            request_offset=request_offsets[i] if request_offsets else 0,
         )
         ctxs.append(ctx)
 

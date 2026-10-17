@@ -496,7 +496,7 @@ def sparse_attn_indexer(
                 total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
             )
             profile_specs.extend(gather_spec * 2)
-        current_workspace_manager().get_simultaneous(*profile_specs)
+        current_workspace_manager().reserve_simultaneous(*profile_specs)
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
         # FP8 elements so elements == bytes

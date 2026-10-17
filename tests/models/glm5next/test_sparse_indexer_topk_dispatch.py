@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the GLM kpool indexer's top-k backend wiring."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -98,4 +100,51 @@ def test_kpool_decode_topk_backend_never_auto_selects_aiter_under_full_cudagraph
             full_cudagraph=full_cudagraph,
         )
         == expected
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only indexer")
+def test_kpool_profile_run_reserves_every_ubatch_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The profile run is not microbatched, but under DBO microbatch 1 asks for
+    the prefill K-gather buffers only after the workspace is locked."""
+    from vllm.models.glm5next.nvidia import sparse_indexer
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cuda")
+    manager = workspace.WorkspaceManager(device, num_ubatches=2)
+    ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: ubatch[0])
+    monkeypatch.setattr(sparse_indexer, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(
+        sparse_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+    hidden = torch.zeros((16, 128), device=device)
+    sparse_indexer.sparse_attn_indexer_kpool(
+        hidden,
+        "k",
+        torch.empty(0, device=device),
+        hidden,
+        None,
+        None,
+        hidden,
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_pool_len=4096,
+        total_seq_lens=8192,
+        topk_indices_buffer=torch.empty((16, 2048), dtype=torch.int32, device=device),
+        skip_k_cache_insert=True,
+    )
+    manager.lock()
+
+    ubatch[0] = 1
+    manager.get_simultaneous(
+        *sparse_indexer._gather_workspace_shapes(
+            8192, 128, current_platform.fp8_dtype(), False
+        )
     )

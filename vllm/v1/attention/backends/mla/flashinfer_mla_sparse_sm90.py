@@ -609,6 +609,10 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
+        if self.index_group is not None:
+            topk_indices = self.index_group.logical_topk(
+                self.index_group_index, topk_indices, 0
+            )
         kv_c_and_k_pe_cache, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
         )

@@ -462,6 +462,8 @@ class UBatchRunner:
             compute_stream=compute_stream,
             forward_contexts=ubatch_state.forward_contexts,
             ready_barrier=self.ready_barrier,
+            token_offsets=[s.token_slice.start for s in ubatch_slices],
+            request_offsets=[s.request_slice.start for s in ubatch_slices],
         )
 
         outputs: dict[int, Any] = {}

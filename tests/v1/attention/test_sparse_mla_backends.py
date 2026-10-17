@@ -3,6 +3,7 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
+import threading
 from collections import deque
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -26,7 +27,9 @@ from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.config import (
     CUDAGraphMode,
     HiSparseConfig,
+    ParallelConfig,
     SpeculativeConfig,
+    VllmConfig,
     set_current_vllm_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
@@ -85,6 +88,9 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseImpl,
     FlashInferMLASparseTRTLLMBackend,
 )
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
+    FlashInferMLASparseSM90Impl,
+)
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
     FlashInferMLASparseSM120Impl,
 )
@@ -118,6 +124,7 @@ from vllm.v1.hisparse.runtime import (
     hisparse_prefill_staging_remap,
 )
 from vllm.v1.hisparse.types import SparseKVRowMirror
+from vllm.v1.worker.ubatching import dbo_yield, make_ubatch_contexts
 
 if current_platform.is_rocm():
     from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
@@ -2073,6 +2080,266 @@ def test_sparse_mla_index_group_falls_back_for_prefill_sized_batch(monkeypatch):
 
     assert calls == 2
     torch.testing.assert_close(follower_result, leader_result)
+
+
+def _run_two_microbatches(run) -> None:
+    """Run ``run(ctx, ubatch_id)`` on two DBO microbatch threads, in turns."""
+    ready_barrier = threading.Barrier(3)
+    ctxs = make_ubatch_contexts(
+        num_micro_batches=2,
+        compute_stream=current_stream(),
+        comm_stream=torch.Stream(device=DEVICE_TYPE),
+        forward_contexts=[
+            SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE) for _ in range(2)
+        ],
+        ready_barrier=ready_barrier,
+    )
+    threads = [
+        threading.Thread(target=run, args=(ctx, ubatch_id))
+        for ubatch_id, ctx in enumerate(ctxs)
+    ]
+    for thread in threads:
+        thread.start()
+    ready_barrier.wait()
+    ctxs[0].cpu_wait_event.set()
+    for thread in threads:
+        thread.join()
+    torch.accelerator.synchronize()
+
+
+_DBO_VLLM_CONFIG = SimpleNamespace(
+    parallel_config=SimpleNamespace(use_ubatching=True, num_ubatches=2),
+    attention_config=SimpleNamespace(hisparse_config=None),
+)
+
+
+def test_sparse_mla_index_group_keeps_converted_indices_per_microbatch():
+    """Under DBO the other microbatch runs the group's first layer between a
+    microbatch's first layer and its later layers."""
+    device = torch.device(DEVICE_TYPE)
+    logical = torch.full((2, 128), -1, dtype=torch.int32, device=device)
+    logical[:, :3] = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    builder = SparseMLAIndexGroupBuilder(logical)
+    group, leader_index = builder.register_layer(True, _DBO_VLLM_CONFIG)
+    _, follower_index = builder.register_layer(False, _DBO_VLLM_CONFIG)
+
+    def convert(layer_index: int, first_block: int) -> torch.Tensor:
+        metadata = SimpleNamespace(
+            block_table=torch.tensor([[first_block]], dtype=torch.int32, device=device),
+            block_size=4,
+            req_id_per_token=torch.zeros(2, dtype=torch.int32, device=device),
+        )
+        return group.convert_logical_to_physical_topk(
+            layer_index,
+            logical,
+            metadata,
+            block_stride_rows=None,
+            return_valid_counts=False,
+        ).clone()
+
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def run(ctx, ubatch_id: int) -> None:
+        first_block = (2, 5)[ubatch_id]
+        with ctx:
+            group.set_logical_topk_ready(leader_index)
+            leader = convert(leader_index, first_block)
+            dbo_yield()
+            results[ctx.id] = (leader, convert(follower_index, first_block))
+
+    _run_two_microbatches(run)
+
+    assert not torch.equal(results[0][0], results[1][0])
+    for leader, follower in results.values():
+        torch.testing.assert_close(follower, leader)
+
+
+def test_sparse_mla_index_group_without_config_counts_current_microbatches():
+    """A group registered without a config is built under the engine's."""
+    device = torch.device(DEVICE_TYPE)
+    logical = torch.full((2, 128), -1, dtype=torch.int32, device=device)
+    logical[:, :3] = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    builder = SparseMLAIndexGroupBuilder(logical)
+    vllm_config = VllmConfig(
+        parallel_config=ParallelConfig(
+            enable_dbo=True, all2all_backend="deepep_low_latency"
+        )
+    )
+    with set_current_vllm_config(vllm_config):
+        group, index = builder.register_layer(True)
+
+    results: dict[int, list[int]] = {}
+
+    def run(ctx, ubatch_id: int) -> None:
+        metadata = SimpleNamespace(
+            block_table=torch.tensor(
+                [[(2, 5)[ubatch_id]]], dtype=torch.int32, device=device
+            ),
+            block_size=4,
+            req_id_per_token=torch.zeros(2, dtype=torch.int32, device=device),
+        )
+        with ctx:
+            group.set_logical_topk_ready(index)
+            physical = group.convert_logical_to_physical_topk(
+                index,
+                logical,
+                metadata,
+                block_stride_rows=None,
+                return_valid_counts=False,
+            )
+            results[ctx.id] = physical[0, :3].tolist()
+
+    _run_two_microbatches(run)
+
+    assert results == {0: [8, 9, 10], 1: [20, 21, 22]}
+
+
+class _TopkCaptureImpl(SparseMLACommonImpl):
+    def _forward_mqa_kernel(
+        self, q, kv_cache, topk_indices, valid_counts, *, layer, block_size, is_decode
+    ):
+        return topk_indices.clone(), None
+
+
+def test_sparse_mla_later_layers_read_their_microbatch_logical_topk():
+    """Later layers that convert the logical top-k themselves must not see the
+    rows the other microbatch's indexer wrote in between."""
+    device = torch.device(DEVICE_TYPE)
+    logical = torch.full((8, 128), -1, dtype=torch.int32, device=device)
+    # Two converted rows: four-token microbatches convert in every layer.
+    builder = SparseMLAIndexGroupBuilder(logical, max_decode_rows=1)
+    impls = []
+    for is_leader in (True, False):
+        impl = object.__new__(_TopkCaptureImpl)
+        impl.topk_indices_buffer = logical
+        impl.index_group, impl.index_group_index = builder.register_layer(
+            is_leader, _DBO_VLLM_CONFIG
+        )
+        impl.dcp_world_size = 1
+        impls.append(impl)
+    kv_cache = torch.zeros((8, 4, 8), device=device)
+    q = torch.zeros((4, 1, 8), device=device)
+
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def run(ctx, ubatch_id: int) -> None:
+        first_position = (0, 4)[ubatch_id]
+        first_block = (2, 5)[ubatch_id]
+        metadata = SimpleNamespace(
+            num_decode_tokens=0,
+            block_size=4,
+            block_table=torch.tensor(
+                [[first_block, first_block + 1]], dtype=torch.int32, device=device
+            ),
+            req_id_per_token=torch.zeros(4, dtype=torch.int32, device=device),
+        )
+        with ctx:
+            # The group's first layer: its indexer writes the logical rows.
+            logical[:4, :3] = torch.arange(
+                first_position, first_position + 3, dtype=torch.int32, device=device
+            )
+            leader = impls[0].forward_mqa(q, kv_cache, metadata, None)[0]
+            dbo_yield()
+            follower = impls[1].forward_mqa(q, kv_cache, metadata, None)[0]
+            results[ctx.id] = (leader, follower)
+
+    _run_two_microbatches(run)
+
+    assert sorted(results) == [0, 1]
+    assert not torch.equal(results[0][0], results[1][0])
+    for leader, follower in results.values():
+        torch.testing.assert_close(follower, leader)
+
+
+class _FlashMLATopkCapture(FlashMLASparseImpl):
+    kv_cache_dtype = "auto"
+    need_to_return_lse_for_decode = False
+    num_heads = 1
+    q_head_size = 8
+
+    def _bf16_flash_mla_kernel(self, q, kv_cache, topk_indices, lengths, heads):
+        return topk_indices.clone(), None
+
+
+class _SM90TopkCapture(FlashInferMLASparseSM90Impl):
+    num_heads = 1
+    qk_rope_head_dim = 0
+    use_fp8_kv_cache = False
+    head_size = 8
+    kv_lora_rank = 8
+
+
+class _SM120TopkCapture(FlashInferMLASparseSM120Impl):
+    def _run_mqa_kernel(self, q, kv_cache, topk_indices_physical):
+        return topk_indices_physical.clone()
+
+
+@pytest.mark.parametrize(
+    ("impl_cls", "block_size"),
+    [(_FlashMLATopkCapture, 4), (_SM90TopkCapture, 4), (_SM120TopkCapture, 64)],
+)
+def test_sparse_mla_backend_later_layers_read_their_microbatch_logical_topk(
+    impl_cls, block_size
+):
+    """Backends with their own forward_mqa read the logical top-k too."""
+    device = torch.device(DEVICE_TYPE)
+    logical = torch.full((8, 128), -1, dtype=torch.int32, device=device)
+    builder = SparseMLAIndexGroupBuilder(logical, max_decode_rows=1)
+    impls = []
+    for is_leader in (True, False):
+        impl = object.__new__(impl_cls)
+        impl.topk_indices_buffer = logical
+        impl.index_group, impl.index_group_index = builder.register_layer(
+            is_leader, _DBO_VLLM_CONFIG
+        )
+        impls.append(impl)
+    kv_cache = torch.zeros((8, block_size, 8), device=device)
+    # FlashInfer SM90 takes the split query; the others take it whole.
+    q = (
+        (torch.zeros((4, 1, 8), device=device), torch.zeros((4, 1, 0), device=device))
+        if impl_cls is _SM90TopkCapture
+        else torch.zeros((4, 1, 8), device=device)
+    )
+
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def run(ctx, ubatch_id: int) -> None:
+        first_position = (0, 4)[ubatch_id]
+        first_block = (2, 5)[ubatch_id]
+
+        def forward(impl) -> torch.Tensor:
+            packed: list[torch.Tensor] = []
+            metadata = SimpleNamespace(
+                num_decode_tokens=0,
+                num_actual_tokens=4,
+                block_size=block_size,
+                block_table=torch.tensor(
+                    [[first_block, first_block + 1]], dtype=torch.int32, device=device
+                ),
+                req_id_per_token=torch.zeros(4, dtype=torch.int32, device=device),
+                # FlashInfer SM90's planned state: capture the packed indices.
+                state=SimpleNamespace(
+                    pack_indices=lambda slots: packed.append(slots.clone()),
+                    wrapper=SimpleNamespace(run=lambda *args, **kwargs: packed[-1]),
+                ),
+            )
+            return impl.forward_mqa(q, kv_cache, metadata, None)[0]
+
+        with ctx:
+            # The group's first layer: its indexer writes the logical rows.
+            logical[:4, :3] = torch.arange(
+                first_position, first_position + 3, dtype=torch.int32, device=device
+            )
+            leader = forward(impls[0])
+            dbo_yield()
+            results[ctx.id] = (leader, forward(impls[1]))
+
+    _run_two_microbatches(run)
+
+    assert sorted(results) == [0, 1]
+    assert not torch.equal(results[0][0], results[1][0])
+    for leader, follower in results.values():
+        torch.testing.assert_close(follower, leader)
 
 
 def test_sparse_mla_index_groups_own_distinct_physical_buffers():
