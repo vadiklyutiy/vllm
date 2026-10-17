@@ -1530,10 +1530,6 @@ def _fused_moe_lora(
         )
         return
 
-    assert add_inputs or not fully_sharded, (
-        "fused_moe_lora(add_inputs=False) is not supported with fully_sharded=True"
-    )
-
     device = qcurr_hidden_states.device
     num_slices = len(lora_a_stacked)
     w1_lora_b_stacked = lora_b_stacked[0]

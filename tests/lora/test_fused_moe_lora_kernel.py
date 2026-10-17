@@ -695,6 +695,57 @@ def test_fused_moe_lora_kernel_fully_sharded(
     run_torch_spawn(use_fused_moe_lora_kernel_tensor_parallel, nprocs=2)
 
 
+@multi_gpu_test(num_gpus=2)
+@pytest.mark.parametrize("max_lora_rank", [16, 64])
+@pytest.mark.parametrize("column_parallel", [True, False])
+def test_fused_moe_lora_kernel_fully_sharded_no_add_inputs(
+    max_lora_rank,
+    column_parallel,
+):
+    """fully_sharded=True with add_inputs=False, as the FlashInfer TRT-LLM
+    LoRA experts call it, writes the LoRA delta into a zeroed output."""
+    world_size = 2
+    dtype = torch.bfloat16
+    seed = SEED[0]
+    N = 1408
+    K = 2048
+    num_tokens = 100
+    num_sequences = 10
+    top_k_num = 6
+    num_experts = 64
+    max_loras = 4
+    block_size = 16
+    add_inputs = False
+    set_random_seed(seed)
+    topk_ids, topk_weights, token_lora_mapping, lora_ids = sample_data(
+        num_tokens, num_sequences, max_loras, num_experts, top_k_num
+    )
+    torch.multiprocessing.spawn(
+        use_fused_moe_lora_kernel_tensor_parallel,
+        args=(
+            world_size,
+            f"tcp://{os.getenv('LOCALHOST', 'localhost')}:{get_open_port()}",
+            dtype,
+            seed,
+            N,
+            K,
+            num_tokens,
+            topk_ids,
+            topk_weights,
+            token_lora_mapping,
+            max_lora_rank,
+            top_k_num,
+            lora_ids,
+            max_loras,
+            num_experts,
+            block_size,
+            column_parallel,
+            add_inputs,
+        ),
+        nprocs=world_size,
+    )
+
+
 def use_fused_moe_lora_kernel_tensor_parallel(
     local_rank,
     world_size,
@@ -714,6 +765,7 @@ def use_fused_moe_lora_kernel_tensor_parallel(
     num_experts,
     block_size,
     column_parallel,
+    add_inputs=True,
 ):
     def _get_shard_slice(shard_size):
         return slice(local_rank * shard_size, (local_rank + 1) * shard_size)
@@ -820,6 +872,7 @@ def use_fused_moe_lora_kernel_tensor_parallel(
         block_size,
         fully_sharded=True,
         offset=offset,
+        add_inputs=add_inputs,
     )
 
     if column_parallel:

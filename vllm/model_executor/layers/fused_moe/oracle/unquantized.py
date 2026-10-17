@@ -194,6 +194,12 @@ def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend
     )
 
 
+# 'humming' and 'marlin' are quantization-only; an unquantized layer (e.g.
+# excluded via modules_to_not_convert, or an unquantized MTP draft of a
+# quantized model) falls through to auto instead of erroring.
+_AUTO_MOE_BACKENDS = ("auto", "humming", "marlin")
+
+
 def _trtllm_bf16_lora_supported(moe_config: FusedMoEConfig) -> bool:
     """Gate for routing LoRA-enabled BF16 MoE to the FlashInfer TRT-LLM
     gemm1_lora_delta path (PR #3153).
@@ -232,7 +238,11 @@ def select_unquantized_moe_backend(
         return UnquantizedMoeBackend.OOT, None
 
     if moe_config.is_lora_enabled:
-        if _trtllm_bf16_lora_supported(moe_config):
+        # Any other explicit moe_backend keeps LoRA on Triton.
+        if moe_config.moe_backend in (
+            *_AUTO_MOE_BACKENDS,
+            "flashinfer_trtllm",
+        ) and _trtllm_bf16_lora_supported(moe_config):
             from vllm.model_executor.layers.fused_moe.experts.trtllm_lora_moe import (
                 TrtLlmBf16LoRAExperts,
             )
@@ -303,10 +313,7 @@ def select_unquantized_moe_backend(
         )
 
     runner_backend = moe_config.moe_backend
-    # 'humming' and 'marlin' are quantization-only; an unquantized layer (e.g.
-    # excluded via modules_to_not_convert, or an unquantized MTP draft of a
-    # quantized model) falls through to auto instead of erroring.
-    if runner_backend not in ["auto", "humming", "marlin"]:
+    if runner_backend not in _AUTO_MOE_BACKENDS:
         requested_backend = map_unquantized_backend(runner_backend)
         if (
             activation_format == mk.FusedMoEActivationFormat.BatchedExperts

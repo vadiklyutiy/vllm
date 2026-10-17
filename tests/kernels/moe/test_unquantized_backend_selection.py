@@ -629,6 +629,39 @@ def test_select_explicit_triton_backend(is_lora_enabled):
 
 
 @skipif_not_cuda_rocm
+@patch(
+    "vllm.model_executor.layers.fused_moe.experts.trtllm_lora_moe."
+    "_TrtLlmLoRAExpertsBase._supports_current_device",
+    return_value=True,
+)
+@pytest.mark.parametrize(
+    ("moe_backend", "expected_backend"),
+    [
+        ("auto", UnquantizedMoeBackend.FLASHINFER_TRTLLM),
+        ("flashinfer_trtllm", UnquantizedMoeBackend.FLASHINFER_TRTLLM),
+        ("triton", UnquantizedMoeBackend.TRITON),
+        ("flashinfer_cutlass", UnquantizedMoeBackend.TRITON),
+    ],
+)
+def test_select_lora_backend_honors_explicit_backend(
+    mock_supports_current_device, moe_backend, expected_backend
+):
+    """When the TRT-LLM LoRA experts support the config, an explicit
+    non-TRT-LLM backend still keeps LoRA on Triton."""
+    moe_config = make_dummy_moe_config(intermediate_size=128)
+    moe_config.routing_method = RoutingMethodType.Renormalize
+    moe_config.is_lora_enabled = True
+    moe_config.moe_backend = moe_backend
+
+    selected_backend, experts_cls = select_unquantized_moe_backend(
+        moe_config=moe_config
+    )
+
+    assert selected_backend == expected_backend
+    assert experts_cls is not None
+
+
+@skipif_not_cuda_rocm
 @pytest.mark.parametrize("moe_backend", ["humming", "marlin"])
 def test_quantization_only_backend_falls_back_to_auto(moe_backend):
     """A quantization-only --moe-backend also reaches the unquantized MoE
