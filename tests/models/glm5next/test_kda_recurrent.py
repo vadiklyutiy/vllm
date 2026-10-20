@@ -265,6 +265,46 @@ def test_fused_recurrent_kda_more_than_65535_programs(num_seqs: int, num_heads: 
     assert torch.equal(full_state, ref_state)
 
 
+@torch.inference_mode()
+def test_fused_recurrent_kda_non_pow2_head_dim_ignores_memory_past_gate():
+    """The kernel covers ``next_power_of_2(K)`` key lanes. The padding lanes
+    must not read the gate: for the last token they would read past the end
+    of ``g``. Whatever follows ``g`` in memory must not change the output.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    T, K = 3, 100
+    q = torch.randn(1, T, H, K, dtype=torch.bfloat16, device=device)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    beta = torch.randn(1, T, H, dtype=torch.bfloat16, device=device)
+    raw_g = torch.randn(T * H * K, dtype=torch.bfloat16, device=device)
+    state = torch.randn(T + 1, H, K, K, dtype=torch.float32, device=device)
+    a_log = 0.5 * torch.randn(H, dtype=torch.float32, device=device)
+    g_bias = 0.1 * torch.randn(H * K, dtype=torch.float32, device=device)
+    outs = []
+    for tail in (0.0, float("nan")):
+        buf = torch.full((T * H * K + K,), tail, dtype=torch.bfloat16, device=device)
+        buf[: T * H * K] = raw_g
+        out, _ = fused_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=buf[: T * H * K].view(1, T, H, K),
+            beta=beta,
+            initial_state=state.clone(),
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=torch.arange(T + 1, dtype=torch.int32, device=device),
+            ssm_state_indices=torch.arange(1, T + 1, dtype=torch.int32, device=device),
+            sigmoid_beta=True,
+            a_log=a_log,
+            g_bias=g_bias,
+            compute_gate=True,
+            lower_bound=LOWER_BOUND,
+        )
+        outs.append(out)
+    torch.testing.assert_close(outs[1], outs[0], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("offset", [16, 144, 256])
 @pytest.mark.parametrize("dim_first", [False, True])
 @pytest.mark.parametrize("num_spec", [0, 3])
