@@ -163,6 +163,7 @@ class StreamingParserEngine:
             for (state, terminal), tr in config.transitions.items()
             if state in self._TOOL_STATES and tr.next_state not in self._TOOL_STATES
         )
+        self._held_states = config.held_states
 
         self._reasoning_markup_terminals: frozenset[str] = (
             self._compute_reasoning_markup_terminals()
@@ -217,6 +218,7 @@ class StreamingParserEngine:
         self._lexer.reset()
         self._message_header_buffer = ""
         self._message_header_token_count = 0
+        self._held_text = ""
         self._in_skipped_tool_span = False
         self._reset_args_state()
         self._reset_array_state()
@@ -295,6 +297,10 @@ class StreamingParserEngine:
         events = self._process_scanner_items(self._scanner.flush_pending())
 
         events.extend(self._process_lex_tokens(self._lexer.flush()))
+
+        # Text still held never reached its handover, e.g. a tool name cut
+        # short, whose call then stays nameless and is not emitted.
+        self._held_text = ""
 
         if self._args_buffer:
             events.append(
@@ -485,6 +491,9 @@ class StreamingParserEngine:
             self._message_header_buffer += text
             self._message_header_token_count += token_count
             return []
+        if self.state in self._held_states:
+            self._held_text += text
+            return []
         if self.state == ParserState.TOOL_ARGS:
             if self.config.tool_call_body_array:
                 return self._feed_array_text(text)
@@ -525,6 +534,8 @@ class StreamingParserEngine:
         previous_state = self.state
         message_header = ""
         message_header_token_count = 0
+        held = self._held_text
+        self._held_text = ""
 
         if (
             self.state == ParserState.TOOL_ARGS
@@ -548,15 +559,30 @@ class StreamingParserEngine:
 
         self.state = transition.next_state
 
+        # Any terminal that ends a held tool name closes it.
+        if previous_state == ParserState.TOOL_NAME and held:
+            events.append(
+                SemanticEvent(
+                    EventType.TOOL_NAME, value=held, tool_index=self.tool_index
+                )
+            )
+
         for event_type in transition.events:
             if event_type == EventType.TOOL_CALL_START:
                 self.tool_index += 1
-            event_value = (
-                message_header
-                if previous_state == ParserState.MESSAGE_HEADER
+            if (
+                previous_state == ParserState.MESSAGE_HEADER
                 and event_type == EventType.TEXT_CHUNK
-                else value
-            )
+            ):
+                event_value = message_header
+            elif (
+                previous_state == ParserState.TOOL_PREAMBLE
+                and event_type == EventType.TEXT_CHUNK
+            ):
+                # A held tool block without a call, markers included.
+                event_value = held + value
+            else:
+                event_value = value
             if event_type == EventType.TEXT_CHUNK and not event_value:
                 continue
             events.append(
@@ -572,6 +598,9 @@ class StreamingParserEngine:
                     ),
                 )
             )
+
+        if self.state == ParserState.TOOL_PREAMBLE and self.state in self._held_states:
+            self._held_text = value
 
         if self.state == ParserState.TOOL_ARGS:
             self._args_brace_depth = 0

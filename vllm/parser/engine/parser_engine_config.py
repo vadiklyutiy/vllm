@@ -126,6 +126,11 @@ class ParserEngineConfig:
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
 
+    # States whose text is held until a transition out of them hands it over:
+    # TOOL_NAME on any, TOOL_PREAMBLE (opener included) on one listing
+    # TEXT_CHUNK. Text still held at the end is dropped.
+    held_states: frozenset[ParserState] = field(default_factory=frozenset)
+
     def __post_init__(self) -> None:
         if self.arg_value_extender is not None and (
             self.arg_converter is None or not self.stream_arg_deltas

@@ -167,6 +167,15 @@ class TestArgConverter:
         assert result["city"] == "Tokyo"
         assert result["unit"] == "celsi"
 
+    def test_final_keeps_unclosed_last_param(self):
+        raw = self._raw(("city", "true", "Tokyo"))
+        raw += f"<{_PARAM_OPEN.format(name='n', is_str='false')}[1, 2"
+        assert json.loads(_dsml_arg_converter(raw, partial=False)) == {
+            "city": "Tokyo",
+            "n": "[1, 2",
+        }
+        assert json.loads(_dsml_arg_converter(raw, partial=True)) == {"city": "Tokyo"}
+
     def test_partial_no_in_progress(self):
         raw = self._raw(("city", "true", "Tokyo"))
         result = json.loads(_dsml_arg_converter(raw, partial=True))

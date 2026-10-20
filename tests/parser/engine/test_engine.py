@@ -780,6 +780,52 @@ class TestToolPreambleFinish:
         assert engine.state == ParserState.CONTENT
 
 
+def test_preamble_is_not_held_without_opt_in():
+    """Without ``held_states``, a TEXT_CHUNK transition out of TOOL_PREAMBLE
+    carries only its terminal, and preamble text follows ``content_events``."""
+    config = ParserEngineConfig(
+        name="preamble_as_content",
+        terminals={"TOOL_START": "<tools>", "TOOL_END": "</tools>"},
+        transitions={
+            (ParserState.CONTENT, "TOOL_START"): Transition(ParserState.TOOL_PREAMBLE),
+            (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
+                ParserState.CONTENT, (EventType.TEXT_CHUNK,)
+            ),
+        },
+        content_events={
+            ParserState.CONTENT: EventType.TEXT_CHUNK,
+            ParserState.TOOL_PREAMBLE: EventType.TEXT_CHUNK,
+        },
+    )
+    events = StreamingParserEngine(config, tokenizer=None).parse_complete(
+        "Hi <tools>note</tools> Bye"
+    )
+    text = "".join(e.value for e in events if e.type == EventType.TEXT_CHUNK)
+    assert text == "Hi note</tools> Bye"
+
+
+@pytest.mark.parametrize(
+    ("text", "name"), [("<call get_weather>{}</call>", "get_weather"), ("<call ge", "")]
+)
+def test_held_tool_name_is_handed_over_when_closed(text, name):
+    config = ParserEngineConfig(
+        name="held_tool_name",
+        terminals={"CALL": "<call ", "NAME_END": ">", "CALL_END": "</call>"},
+        transitions={
+            (ParserState.CONTENT, "CALL"): Transition(
+                ParserState.TOOL_NAME, (EventType.TOOL_CALL_START,)
+            ),
+            (ParserState.TOOL_NAME, "NAME_END"): Transition(ParserState.TOOL_ARGS),
+            (ParserState.TOOL_ARGS, "CALL_END"): Transition(
+                ParserState.CONTENT, (EventType.TOOL_CALL_END,)
+            ),
+        },
+        held_states=frozenset({ParserState.TOOL_NAME}),
+    )
+    events = StreamingParserEngine(config, tokenizer=None).parse_complete(text)
+    assert "".join(e.value for e in events if e.type == EventType.TOOL_NAME) == name
+
+
 class TestRegexTerminalInfraRemoved:
     """TerminalDef.priority, LexerShape.regex_terminals, and the regex
     matching loop were removed."""

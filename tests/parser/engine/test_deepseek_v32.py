@@ -309,3 +309,43 @@ class TestMissingFunctionCallsWrapper:
         assert collect_function_name(results) == "fn"
         assert json.loads(collect_tool_arguments(results)) == {"k": "v"}
         assert "DSML" not in collect_content(results)
+
+
+class TestMalformedBlock:
+    @pytest.mark.parametrize(
+        ("text", "content"),
+        [
+            (f"{DSML_FUNC_START}\n{DSML_INVOKE_PREFIX}get_wea", ""),
+            (
+                f"Hi\n{DSML_FUNC_START}\njunk\n{DSML_FUNC_END}",
+                f"Hi\n{DSML_FUNC_START}\njunk\n{DSML_FUNC_END}",
+            ),
+        ],
+        ids=["cut_in_name", "block_without_invoke"],
+    )
+    def test_malformed_block_is_not_a_call(
+        self, mock_tokenizer, mock_request, text, content
+    ):
+        parser = DeepSeekV32Parser(mock_tokenizer)
+        result = parser.extract_tool_calls(text, mock_request)
+        assert not result.tool_calls
+        assert (result.content or "") == content
+
+        parser = DeepSeekV32Parser(mock_tokenizer)
+        results = simulate_tool_streaming(parser, mock_request, list(text))
+        results.append((parser.finish_streaming(), text))
+        assert collect_function_name(results) is None
+        assert collect_content(results) == content
+
+    def test_block_without_invoke_after_tool_call_is_dropped(
+        self, mock_tokenizer, mock_request
+    ):
+        """A tool call still ends the turn when a block without invoke follows."""
+        text = (
+            _func_calls(_invoke("fn", _param("k", "true", "v")))
+            + f"\n{DSML_FUNC_START}\njunk\n{DSML_FUNC_END}\nDone."
+        )
+        parser = DeepSeekV32Parser(mock_tokenizer)
+        result = parser.extract_tool_calls(text, mock_request)
+        assert [tc.function.name for tc in result.tool_calls] == ["fn"]
+        assert not (result.content or "").strip()

@@ -84,6 +84,12 @@ def deepseek_v32_config() -> ParserEngineConfig:
                 ParserState.TOOL_ARGS,
                 (),
             ),
+            # A block that closes before any invoke is not a tool call: give
+            # it back as content.
+            (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TEXT_CHUNK,),
+            ),
             (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (EventType.TOOL_CALL_END,),
@@ -98,13 +104,14 @@ def deepseek_v32_config() -> ParserEngineConfig:
                 (EventType.TOOL_CALL_START,),
             ),
             # A tool call ends the turn: stay in TOOL_BETWEEN so any text
-            # after the block is dropped.
+            # after the block is dropped, even inside a later block that has
+            # no invoke. Invokes of a later block are still parsed.
             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (),
             ),
             (ParserState.TOOL_BETWEEN, "TOOL_START"): Transition(
-                ParserState.TOOL_PREAMBLE,
+                ParserState.TOOL_BETWEEN,
                 (),
             ),
         },
@@ -117,6 +124,7 @@ def deepseek_v32_config() -> ParserEngineConfig:
         arg_structural_chars=frozenset(">"),
         strip_content_whitespace_with_tools=False,
         tool_args_json=False,
+        held_states=frozenset({ParserState.TOOL_NAME, ParserState.TOOL_PREAMBLE}),
     )
 
 

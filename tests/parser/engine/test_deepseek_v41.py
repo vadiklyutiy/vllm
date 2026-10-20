@@ -131,6 +131,92 @@ def test_reasoning_adapter_controls_and_usage(
     assert not parser.is_reasoning_end([51, 100, 50])
 
 
+def parse_both_ways(text, special_calls=False):
+    """Return ``(non_streamed, streamed)`` content and tool calls for *text*."""
+    tokenizer, tokens = tokenizer_for(text, special_calls)
+    _, content, calls = parser_for(tokenizer, {"thinking": False}).parse(
+        text,
+        _test_request(tools=DUMMY_TOOLS),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    streamed = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": False}),
+            tokens,
+            chunk_size=1,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+        )
+    )
+    non_streamed = [
+        {"name": call.name, "arguments": call.arguments} for call in calls or []
+    ]
+    return (content or "", non_streamed), (streamed.content, streamed.tool_calls)
+
+
+INVOKE = '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_weather">\n'
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            INVOKE + '<｜DSML｜ parameter name="city" string="true">杭州',
+            {"city": "杭州"},
+        ),
+        (
+            INVOKE + '<｜DSML｜ parameter name="count" string="false">42',
+            {"count": 42},
+        ),
+        (
+            INVOKE + '<｜DSML｜ parameter name="city" string="true">杭州\n'
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+            {"city": "杭州\n"},
+        ),
+    ],
+    ids=["cut_in_string", "cut_in_number", "no_parameter_close"],
+)
+def test_unclosed_last_parameter_keeps_valid_arguments(text, expected):
+    """The final arguments extend what streaming sent for an unclosed value,
+    so they stay valid JSON and match the non-streaming result."""
+    (_, non_streamed), (_, streamed) = parse_both_ways(text)
+    assert non_streamed == streamed
+    assert [call["name"] for call in streamed] == ["get_weather"]
+    assert json.loads(streamed[0]["arguments"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_names"),
+    [
+        ('\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_wea', []),
+        (CALLS[: CALLS.index('name="add"') + len('name="ad')], ["get_weather"]),
+    ],
+    ids=["only_call", "after_complete_call"],
+)
+def test_output_cut_inside_tool_name_is_not_a_call(text, expected_names):
+    (_, non_streamed), (_, streamed) = parse_both_ways(text)
+    assert [call["name"] for call in non_streamed] == expected_names
+    assert [call["name"] for call in streamed] == expected_names
+
+
+@pytest.mark.parametrize("special_calls", [False, True])
+@pytest.mark.parametrize("after", ["", "\nDone."], ids=["block_only", "text_after"])
+def test_block_without_invoke_is_returned_as_content(special_calls, after):
+    text = "Hi\n\n<｜DSML｜ calls>\n<url>https://x.com</url>\n</｜DSML｜ calls>" + after
+    non_streamed, streamed = parse_both_ways(text, special_calls)
+    assert non_streamed == streamed == (text, [])
+
+
+def test_block_without_invoke_after_tool_call_is_dropped():
+    """A tool call still ends the turn when a block without invoke follows."""
+    text = CALLS + "\n<｜DSML｜ calls>\njunk\n</｜DSML｜ calls>\nDone."
+    (content, non_streamed), (streamed_content, streamed) = parse_both_ways(text)
+    assert non_streamed == streamed
+    assert [call["name"] for call in streamed] == ["get_weather", "add"]
+    assert content.strip() == streamed_content.strip() == ""
+
+
 def test_python_argument_conversion_and_partial_values():
     converter = deepseek_v41_config().arg_converter
     raw = (

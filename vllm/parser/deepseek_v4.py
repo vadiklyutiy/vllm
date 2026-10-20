@@ -18,7 +18,6 @@ DeepSeek V4 output format::
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import json
 from typing import TYPE_CHECKING
@@ -99,15 +98,21 @@ def _dsml_arg_converter(
                 params[name] = value
         last_end = m.end()
 
-    if partial:
-        pm = partial_param_re.search(raw_args, last_end)
-        if pm:
-            name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
-            if is_str == "true":
-                params[name] = value
-            else:
-                with contextlib.suppress(json.JSONDecodeError, ValueError):
-                    params[name] = json.loads(value)
+    # An unclosed trailing parameter is kept in both modes: the final JSON must
+    # extend what streaming already sent for it, e.g. when output is cut by
+    # max_tokens or the model omits the parameter closer.
+    pm = partial_param_re.search(raw_args, last_end)
+    if pm:
+        name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
+        if is_str == "true":
+            params[name] = value
+        else:
+            try:
+                params[name] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                # A partial value may still become valid JSON.
+                if not partial:
+                    params[name] = value
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -206,6 +211,12 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_ARGS,
                 (),
             ),
+            # A block that closes before any invoke is not a tool call: give
+            # it back as content.
+            (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TEXT_CHUNK,),
+            ),
             (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (EventType.TOOL_CALL_END,),
@@ -220,13 +231,14 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 (EventType.TOOL_CALL_START,),
             ),
             # A tool call ends the turn: stay in TOOL_BETWEEN so any text
-            # after the block is dropped.
+            # after the block is dropped, even inside a later block that has
+            # no invoke. Invokes of a later block are still parsed.
             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (),
             ),
             (ParserState.TOOL_BETWEEN, "TOOL_START"): Transition(
-                ParserState.TOOL_PREAMBLE,
+                ParserState.TOOL_BETWEEN,
                 (),
             ),
         },
@@ -240,6 +252,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
         arg_structural_chars=frozenset(">"),
         strip_content_whitespace_with_tools=False,
         tool_args_json=False,
+        held_states=frozenset({ParserState.TOOL_NAME, ParserState.TOOL_PREAMBLE}),
     )
 
 
