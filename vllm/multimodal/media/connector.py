@@ -29,7 +29,11 @@ from vllm.connections import (
     MediaRequestDownloadSizeExceededError,
     global_http_connection,
 )
-from vllm.exceptions import VLLMUnprocessableEntityError, VLLMValidationError
+from vllm.exceptions import (
+    VLLMClientError,
+    VLLMUnprocessableEntityError,
+    VLLMValidationError,
+)
 from vllm.logger import init_logger
 from vllm.multimodal.video import get_video_loader_backend_for_processor
 from vllm.utils.registry import ExtensionManager
@@ -55,6 +59,10 @@ MODALITY_IO_MAP: dict[str, type[MediaIO]] = {
     "image": ImageMediaIO,
     "video": VideoMediaIO,
 }
+
+
+class LocalMediaDisabledError(VLLMClientError, RuntimeError):
+    """Raised when a file URL is requested without `--allowed-local-media-path`."""
 
 
 def _wrap_media_fetch_error(
@@ -352,7 +360,7 @@ class MediaConnector:
     ) -> _M:  # type: ignore[type-var]
         allowed_local_media_path = self.allowed_local_media_path
         if allowed_local_media_path is None:
-            raise RuntimeError(
+            raise LocalMediaDisabledError(
                 "Cannot load local files without `--allowed-local-media-path`."
             )
 

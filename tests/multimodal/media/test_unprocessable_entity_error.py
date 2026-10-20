@@ -168,6 +168,21 @@ class TestMediaConnectorErrorHandling:
 
             assert "VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB=256" in str(exc_info.value)
 
+    @pytest.mark.asyncio
+    async def test_fetch_image_local_file_disabled_returns_400(self):
+        """A file URL without --allowed-local-media-path is a client error."""
+        connector = MediaConnector()
+        url = "file:///tmp/image.png"
+
+        with pytest.raises(VLLMClientError) as sync_exc_info:
+            connector.fetch_image(url)
+        with pytest.raises(VLLMClientError) as async_exc_info:
+            await connector.fetch_image_async(url)
+
+        for exc_info in (sync_exc_info, async_exc_info):
+            response = create_error_response(exc_info.value)
+            assert response.error.code == HTTPStatus.BAD_REQUEST.value
+
 
 class TestErrorResponse:
     """Tests for error response creation."""
