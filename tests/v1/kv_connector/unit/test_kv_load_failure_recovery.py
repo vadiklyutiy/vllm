@@ -306,6 +306,55 @@ def test_sync_load_failure_with_shared_blocks(
     assert scheduler.connector.get_num_new_matched_tokens.call_count == 2
 
 
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer"])
+def test_late_sync_load_failure_spares_request_scheduled_after_abort(
+    kv_role: str, policy: str
+):
+    """With overlapping batches, a sync load failure is reported only after the
+    next step is scheduled. Whatever the KV role, the report must not fail or
+    rewind an unrelated request that was scheduled after the owner's abort.
+    """
+    vllm_config = create_vllm_config(
+        kv_role=kv_role, kv_load_failure_policy=policy, max_num_batched_tokens=256
+    )
+    vllm_config.scheduler_config.async_scheduling = True
+    num_prompt_blocks = 8
+    # The null block plus room for exactly one request.
+    scheduler = create_scheduler(vllm_config, num_blocks=num_prompt_blocks + 1)
+    num_prompt_tokens = num_prompt_blocks * scheduler.block_size
+
+    owner = create_request(num_tokens=num_prompt_tokens)
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {owner.request_id: num_prompt_tokens - scheduler.block_size},
+            async_load=False,
+        )
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler.add_request(owner)
+    owner_output = scheduler.schedule()
+    (owner_block_ids,) = scheduler.kv_cache_manager.get_block_ids(owner.request_id)
+    scheduler.finish_requests(owner.request_id, RequestStatus.FINISHED_ABORTED)
+
+    other = create_request(num_tokens=num_prompt_tokens)
+    scheduler.add_request(other)
+    scheduler.schedule()
+    num_computed_before_report = other.num_computed_tokens
+
+    scheduler.update_from_output(
+        owner_output,
+        create_model_runner_output([owner], invalid_block_ids={owner_block_ids[3]}),
+    )
+
+    assert not other.is_finished()
+    assert other.num_computed_tokens == num_computed_before_report
+    assert other.request_id in scheduler.schedule().num_scheduled_tokens
+
+
 @pytest.mark.parametrize(
     "num_prompt_blocks,num_external_computed_blocks,invalid_block_idxs",
     [

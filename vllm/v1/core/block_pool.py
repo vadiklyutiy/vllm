@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -828,17 +829,35 @@ class BlockPool:
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
 
-    def reset_prefix_cache(self) -> bool:
+    def reset_prefix_cache(
+        self, deferred_free_blocks: Iterable[KVCacheBlock] = ()
+    ) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,
         or used for resetting prefix caching status for benchmarking.
+
+        Args:
+            deferred_free_blocks: Freed blocks whose return to the pool waits
+                for an in-flight step. A block referenced only from here is
+                not held by any request, so it does not block the reset.
 
         Returns:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
 
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
+        deferred_refs = Counter(
+            block.block_id
+            for block in deferred_free_blocks
+            if not block.is_null and block.pool is self
+        )
+        num_deferred_only_blocks = sum(
+            self.blocks[block_id].ref_cnt == num_refs
+            for block_id, num_refs in deferred_refs.items()
+        )
+        num_used_blocks = (
+            self.num_gpu_blocks - self.get_num_free_blocks() - num_deferred_only_blocks
+        )
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "

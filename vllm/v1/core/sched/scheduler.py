@@ -184,12 +184,11 @@ class Scheduler(SchedulerInterface):
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
 
             # With overlapping batches (async scheduling or PP), a step may
-            # still be writing a freed request's KV blocks. A consumer KV
-            # Connector can reallocate and fill those blocks via a load that
-            # isn't ordered against that write, so defer freeing them.
-            multiple_inflight_batches = self.vllm_config.max_concurrent_batches > 1
-            if multiple_inflight_batches and kv_transfer_config.is_kv_consumer:
-                self.defer_block_free = True
+            # still be writing a freed request's KV blocks, and its KV load
+            # failures are reported by block ID only after the next step is
+            # scheduled. Defer freeing them, so a new owner is neither filled
+            # by an unordered connector load nor hit by the old owner's failure.
+            self.defer_block_free = self.vllm_config.max_concurrent_batches > 1
 
             self.requires_kv_delivery = self.connector.requires_kv_delivery
 
@@ -2956,7 +2955,9 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
-        reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        reset_successful = self.kv_cache_manager.reset_prefix_cache(
+            [block for _, blocks in self.deferred_frees for block in blocks]
+        )
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "

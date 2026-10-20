@@ -18,6 +18,7 @@ from unittest.mock import PropertyMock, patch
 import pytest
 
 from vllm.config import VllmConfig
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
@@ -244,6 +245,35 @@ def test_preempt_defers_free_and_clears_bookkeeping():
     scheduler.update_from_output(out1, _make_model_runner_output(out1))
     assert not scheduler.deferred_frees
     assert pool.get_num_free_blocks() == num_free_initially
+
+
+def test_reset_prefix_cache_with_inflight_step():
+    # reset_prefix_cache is a utility call, so it can run while a step is in
+    # flight; fenced blocks that no request holds must not block it.
+    scheduler = _create_deferring_scheduler()
+    pool = scheduler.kv_cache_manager.block_pool
+    num_free_initially = pool.get_num_free_blocks()
+    request, out0, out1 = _setup_request_with_inflight_step(scheduler)
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert request.status == RequestStatus.PREEMPTED
+    assert len(scheduler.deferred_frees) == 1
+    assert all(block.block_hash is None for block in pool.blocks)
+
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    assert pool.get_num_free_blocks() == num_free_initially
+
+
+def test_reset_prefix_cache_blocked_by_holder_of_deferred_block():
+    # A deferred block that a live request also holds is still in use.
+    pool = BlockPool(num_gpu_blocks=10, enable_caching=True, hash_block_size=16)
+    deferred = pool.get_new_blocks(2)
+    pool.touch([deferred[0]])
+
+    assert not pool.reset_prefix_cache(deferred)
+    pool.free_blocks([deferred[0]])
+    assert pool.reset_prefix_cache(deferred)
 
 
 @pytest.mark.parametrize(
