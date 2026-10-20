@@ -504,11 +504,13 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_non_spec.dtype,
+                dtype=core_attn_out.dtype,
                 device=core_attn_out_non_spec.device,
             )
             merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            merged_out.index_copy_(
+                1, non_spec_token_indx, core_attn_out_non_spec.to(merged_out.dtype)
+            )
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)

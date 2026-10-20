@@ -1886,7 +1886,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             core_attn_out.index_copy_(0, spec_token_indx, core_attn_out_spec.squeeze(0))
             core_attn_out.index_copy_(
-                0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
+                0,
+                non_spec_token_indx,
+                core_attn_out_non_spec.squeeze(0).to(core_attn_out.dtype),
             )
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)

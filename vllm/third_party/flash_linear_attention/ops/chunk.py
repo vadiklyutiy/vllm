@@ -58,6 +58,15 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+    # fp16 cannot hold the range of a wider state, so keep the state-sized
+    # tensors (h, v_new, o) in fp32, the dtype the kernel keeps the state in.
+    state_dtype = k.dtype
+    if (
+        k.dtype == torch.float16
+        and initial_state is not None
+        and initial_state.dtype != k.dtype
+    ):
+        state_dtype = torch.float32
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -68,6 +77,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        state_dtype=state_dtype,
     )
     o = chunk_fwd_o(
         q=q,
@@ -131,7 +141,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 "core_attn_out buffer reuse is only supported for inference"
             )
             assert q.dtype == o.dtype, "Incompatible dtype for inplace computation"
-        return o.to(q.dtype), final_state
+        return o, final_state
 
 
 @torch.compiler.disable
@@ -176,7 +186,8 @@ def chunk_gated_delta_rule(
             consistent with the FlashAttention API.
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]`.
+            Outputs of shape `[B, T, H, V]`. They are fp32 if `q` is fp16 and
+            `initial_state` is not, since fp16 cannot hold such a state.
         final_state (torch.Tensor):
             Final state of shape `[N, H, V, K]` if `output_final_state=True` else `None`.
 

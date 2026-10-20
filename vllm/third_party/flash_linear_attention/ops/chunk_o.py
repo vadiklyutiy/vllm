@@ -111,7 +111,7 @@ def chunk_fwd_kernel_o(
         b_h = tl.load(p_h, mask=(o_v[:, None] < V) & m_k[None, :], other=0.0)
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o += tl.dot(b_q, tl.trans(b_h))
+        b_o += tl.dot(b_q.to(b_h.dtype), tl.trans(b_h))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
 
