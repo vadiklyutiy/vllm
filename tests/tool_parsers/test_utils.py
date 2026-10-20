@@ -214,6 +214,20 @@ class TestCoerceToSchemaType:
         def test_falls_through_to_string(self):
             assert coerce_to_schema_type("hello", ["integer", "string"]) == "hello"
 
+        @pytest.mark.parametrize("value", ["0017", "+17", "1_000", ".5"])
+        @pytest.mark.parametrize(
+            "schema_type", [["string", "integer"], ["string", "number"]]
+        )
+        def test_non_json_number_kept_as_string(self, value, schema_type):
+            """int() and float() accept these, but they are not JSON numbers."""
+            assert coerce_to_schema_type(value, schema_type) == value
+
+        def test_json_number_tried_before_string(self):
+            assert coerce_to_schema_type("3.14", ["number", "string"]) == 3.14
+
+        def test_non_json_integer_coerced_without_string(self):
+            assert coerce_to_schema_type("0017", "integer") == 17
+
     class TestFallback:
         def test_unknown_type_returns_string(self):
             assert coerce_to_schema_type("hello", "unknown_type") == "hello"

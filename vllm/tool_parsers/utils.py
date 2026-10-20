@@ -1150,12 +1150,24 @@ _TYPE_ALIASES: dict[str, str] = {
 }
 
 
+def _is_json_number(value: str) -> bool:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return False
+    return type(parsed) in (int, float)
+
+
 def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     """Best-effort coercion of a raw string value to a JSON Schema type.
 
     Tries each type in priority order (null > integer > number > boolean >
     object > array > string) and returns the first successful coercion.
     Falls back to the original string when no coercion succeeds.
+
+    When ``string`` is one of the types, ``integer`` and ``number`` only
+    accept JSON number literals, so text such as ``0017``, ``+17`` or
+    ``1_000`` is kept as the string the model wrote.
 
     Args:
         value: The raw string value from the model output.
@@ -1181,6 +1193,8 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
         "string",
     ]
 
+    string_allowed = "string" in normalized_types
+
     for candidate_type in type_priority:
         if candidate_type not in normalized_types:
             continue
@@ -1193,9 +1207,12 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
             return value
         if candidate_type == "integer":
             try:
-                return int(value)
+                int_val = int(value)
             except (ValueError, TypeError):
                 continue
+            if string_allowed and not _is_json_number(value):
+                continue
+            return int_val
         if candidate_type == "number":
             try:
                 val = float(value)
@@ -1206,6 +1223,8 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
                 # the value is preserved as a string instead of crashing
                 # (int(float("inf")) raises OverflowError) or emitting
                 # invalid JSON (json.dumps(inf) -> "Infinity").
+                continue
+            if string_allowed and not _is_json_number(value):
                 continue
             return val if val != int(val) else int(val)
         if candidate_type == "boolean":
