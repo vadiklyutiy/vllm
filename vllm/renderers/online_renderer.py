@@ -115,7 +115,8 @@ def _reused_prompt_token_ids(
     Returns None without checking the ids when ``echo`` is set or ``messages``
     has non-text content, since both need ``messages`` to be rendered.
     Otherwise raises VLLMValidationError if the ids are malformed or out of
-    vocabulary.
+    vocabulary, and returns None if no KV connector is configured, since the
+    ids are only meant for disaggregated serving.
     """
     kv = getattr(request, "kv_transfer_params", None)
     if not isinstance(kv, dict):
@@ -148,6 +149,12 @@ def _reused_prompt_token_ids(
         )
     # The engine checks this too, but only after a streamed response starts.
     renderer.validate_token_ids(ids, parameter="kv_transfer_params.prompt_token_ids")
+    if renderer.config.kv_transfer_config is None:
+        logger.debug(
+            "Ignoring kv_transfer_params['prompt_token_ids']: "
+            "no KV connector is configured, so messages are rendered instead."
+        )
+        return None
     return ids
 
 

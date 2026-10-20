@@ -20,7 +20,7 @@ from tests.entrypoints.openai.utils import (
 )
 from tests.utils import RemoteOpenAIServer
 from vllm._aiter_ops import is_aiter_found_and_supported
-from vllm.config import MultiModalConfig
+from vllm.config import KVTransferConfig, MultiModalConfig
 from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
     RequestResponseMetadata,
@@ -3186,6 +3186,54 @@ async def test_chat_kv_transfer_prompt_token_ids_ignored_with_echo(ids):
     assert [msg["role"] for msg in conversation] == ["user"]
     assert engine_inputs[0]["prompt_token_ids"] != ids
     assert request.kv_transfer_params == {"do_remote_prefill": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_kv_connector", [True, False])
+async def test_chat_kv_transfer_prompt_token_ids_need_kv_connector(has_kv_connector):
+    """The ids stand in for ``messages`` only on a server with a KV connector."""
+    mock_engine = _build_mock_engine()
+    mock_engine.renderer.config.kv_transfer_config = (
+        KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_both")
+        if has_kv_connector
+        else None
+    )
+    serving_chat = _build_serving_chat(mock_engine)
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        kv_transfer_params={"prompt_token_ids": [10, 20, 30]},
+    )
+    result = await serving_chat.render_chat_request(request)
+    assert not isinstance(result, ErrorResponse)
+
+    conversation, engine_inputs = result
+    if has_kv_connector:
+        assert conversation == []
+        assert engine_inputs[0]["prompt_token_ids"] == [10, 20, 30]
+    else:
+        assert [msg["role"] for msg in conversation] == ["user"]
+        assert engine_inputs[0]["prompt_token_ids"] != [10, 20, 30]
+    assert request.kv_transfer_params == {}
+
+
+def test_harmony_kv_transfer_prompt_token_ids_ignored_without_kv_connector():
+    engine = MockEngine()
+    engine.model_config.hf_config = MockHFConfig(model_type="gpt_oss")
+    engine.renderer.config.kv_transfer_config = None
+    models = OpenAIServingModels(engine, BASE_MODEL_PATHS)
+    online_renderer = _build_online_renderer(engine, models.registry)
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        kv_transfer_params={"prompt_token_ids": [10, 20, 30]},
+    )
+    conversation, engine_inputs = online_renderer._make_request_with_harmony(request)
+
+    assert conversation
+    assert engine_inputs[0]["prompt_token_ids"] != [10, 20, 30]
 
 
 @pytest.mark.parametrize(
