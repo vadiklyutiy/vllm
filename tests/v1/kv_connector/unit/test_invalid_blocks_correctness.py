@@ -3,11 +3,13 @@
 
 """Tests for correctness in invalid block handling.
 
-These tests verify correct behavior in three scenarios:
+These tests verify correct behavior in four scenarios:
 1. Sync recompute case: Blocks should not be freed for running requests
    that need to recompute invalid blocks
 2. Sync fail case: Invalid blocks must be evicted from cache when request fails
 3. Async recompute case: Invalid blocks should not be cached after transfer
+4. Sync finished case: Invalid blocks must be evicted from cache when the
+   request finished before the step that loaded them was processed
 """
 
 from collections.abc import Callable
@@ -475,3 +477,108 @@ def test_async_recompute_blocks_not_cached_when_invalid(
 
     # request should be in the running queue
     assert request in recompute_scheduler.running
+
+
+def _create_sync_load_request(
+    scheduler: Scheduler, delay_free_blocks: bool = False
+) -> Request:
+    """Create an 8-block request and install a mock connector that loads its
+    first 7 blocks synchronously."""
+    num_prompt_tokens = 8 * scheduler.block_size
+    request = create_request(
+        num_tokens=num_prompt_tokens, common_prefix_len=num_prompt_tokens
+    )
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {request.request_id: 7 * scheduler.block_size}, False
+        )
+    )
+    scheduler.connector.request_finished.return_value = (delay_free_blocks, None)
+    scheduler.connector.take_events.return_value = ()
+    return request
+
+
+def _assert_invalid_blocks_not_reused(
+    scheduler: Scheduler,
+    finished_request: Request,
+    req_block_ids: list[int],
+    invalid_block_idx: int,
+):
+    block_pool = scheduler.kv_cache_manager.block_pool
+    cached = [block_pool.blocks[b].block_hash is not None for b in req_block_ids]
+    assert cached == [i < invalid_block_idx for i in range(len(req_block_ids))]
+
+    # A request with the same prompt hits only the blocks before the invalid one.
+    request = create_request(
+        num_tokens=finished_request.num_prompt_tokens,
+        common_prefix_len=finished_request.num_prompt_tokens,
+    )
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    num_local_hit_tokens = (
+        request.num_computed_tokens
+        - scheduler_output.num_scheduled_tokens[request.request_id]
+    )
+    assert num_local_hit_tokens == invalid_block_idx * scheduler.block_size
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("delay_free_blocks", [False, True])
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+def test_sync_invalid_blocks_evicted_when_request_finished_mid_step(
+    policy: str, delay_free_blocks: bool, async_scheduling: bool
+):
+    """A request aborted while its sync load runs leaves no owner to recompute
+    the blocks the load failed to fill, so they must leave the prefix cache."""
+    invalid_block_idx = 3
+    vllm_config = create_vllm_config(kv_load_failure_policy=policy)
+    vllm_config.scheduler_config.async_scheduling = async_scheduling
+    scheduler = create_scheduler(vllm_config)
+    request = _create_sync_load_request(scheduler, delay_free_blocks)
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    (req_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            [request], invalid_block_ids={req_block_ids[invalid_block_idx]}
+        ),
+    )
+
+    _assert_invalid_blocks_not_reused(
+        scheduler, request, req_block_ids, invalid_block_idx
+    )
+
+
+def test_sync_invalid_blocks_evicted_when_request_finished_two_steps_in_flight(
+    fail_scheduler: Scheduler,
+):
+    """With two steps in flight (async scheduling or PP), the step that runs the
+    aborted request's load may be processed after an earlier step."""
+    invalid_block_idx = 3
+    request = _create_sync_load_request(fail_scheduler)
+    earlier_request = create_request(num_tokens=fail_scheduler.block_size)
+    fail_scheduler.add_request(earlier_request)
+    earlier_output = fail_scheduler.schedule()
+
+    fail_scheduler.add_request(request)
+    scheduler_output = fail_scheduler.schedule()
+    (req_block_ids,) = fail_scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    fail_scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    fail_scheduler.update_from_output(
+        earlier_output, create_model_runner_output([earlier_request])
+    )
+    fail_scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            [earlier_request, request],
+            invalid_block_ids={req_block_ids[invalid_block_idx]},
+        ),
+    )
+
+    _assert_invalid_blocks_not_reused(
+        fail_scheduler, request, req_block_ids, invalid_block_idx
+    )

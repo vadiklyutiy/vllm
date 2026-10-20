@@ -246,6 +246,12 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # KV Connector: requests finished while scheduled in a step not yet
+        # processed, whose sync KV loads may still be reported as invalid.
+        # req_id -> (num tokens in flight, block IDs per KV cache group)
+        self.finished_in_flight_block_ids: dict[
+            str, tuple[int, tuple[list[int], ...]]
+        ] = {}
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -2153,6 +2159,19 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+        if self.connector is not None:
+            # Forget a finished request once every step it was scheduled in
+            # is processed.
+            for req_id in (
+                self.finished_in_flight_block_ids.keys() & num_scheduled_tokens.keys()
+            ):
+                num_in_flight, block_ids = self.finished_in_flight_block_ids.pop(req_id)
+                num_in_flight -= num_scheduled_tokens[req_id]
+                if num_in_flight > 0:
+                    self.finished_in_flight_block_ids[req_id] = (
+                        num_in_flight,
+                        block_ids,
+                    )
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -2811,6 +2830,11 @@ class Scheduler(SchedulerInterface):
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
         self._set_kv_fetch_stage(request, None)
+        if self.connector is not None and request.num_in_flight_tokens > 0:
+            self.finished_in_flight_block_ids[request.request_id] = (
+                request.num_in_flight_tokens,
+                self.kv_cache_manager.get_block_ids(request.request_id),
+            )
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -3493,6 +3517,17 @@ class Scheduler(SchedulerInterface):
 
         total_failed_requests += len(sync_failed_req_ids)
         total_failed_tokens += num_failed_tokens
+
+        # Finished requests leave no owner to recompute their invalid blocks,
+        # so evict them under either policy.
+        finished_blocks_to_evict: set[int] = set()
+        for _, (req_block_ids,) in self.finished_in_flight_block_ids.values():
+            for idx, block_id in enumerate(req_block_ids):
+                if block_id in invalid_block_ids:
+                    finished_blocks_to_evict.update(req_block_ids[idx:])
+                    break
+        if finished_blocks_to_evict:
+            self.kv_cache_manager.evict_blocks(finished_blocks_to_evict)
 
         if not total_failed_requests:
             return set()
