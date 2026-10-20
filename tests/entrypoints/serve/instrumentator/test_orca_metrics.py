@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import openai
+import prometheus_client
 import pytest
 import pytest_asyncio
 
 from tests.utils import RemoteOpenAIServer
+from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 
 # any model with a chat template should work here
 MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -38,6 +40,33 @@ def server(request, monkeypatch_module):
 async def client(server):
     async with server.get_async_client() as async_client:
         yield async_client
+
+
+def test_orca_header_aggregates_engines(monkeypatch):
+    """Under data parallel, the header reports the whole endpoint: waiting
+    requests summed and KV cache usage averaged across engines."""
+    registry = prometheus_client.CollectorRegistry()
+    monkeypatch.setattr("vllm.v1.metrics.reader.REGISTRY", registry)
+    labelnames = ["model_name", "engine"]
+    usage = prometheus_client.Gauge(
+        "vllm:kv_cache_usage_perc", "", labelnames, registry=registry
+    )
+    waiting = prometheus_client.Gauge(
+        "vllm:num_requests_waiting", "", labelnames, registry=registry
+    )
+    usage.labels("m", "0").set(0.95)
+    waiting.labels("m", "0").set(40)
+    usage.labels("m", "1").set(0.05)
+    waiting.labels("m", "1").set(0)
+
+    assert metrics_header("TEXT") == {
+        "endpoint-load-metrics": "TEXT named_metrics.kv_cache_usage_perc=0.5, "
+        "named_metrics.num_requests_waiting=40.0"
+    }
+    assert metrics_header("JSON") == {
+        "endpoint-load-metrics": 'JSON {"named_metrics": '
+        '{"kv_cache_usage_perc": 0.5, "num_requests_waiting": 40.0}}'
+    }
 
 
 @pytest.mark.asyncio

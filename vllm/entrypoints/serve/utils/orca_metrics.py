@@ -3,7 +3,10 @@
 """Utility functions that create ORCA endpoint load report response headers."""
 
 import json
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Callable, Mapping
+from math import fsum
+from statistics import fmean
 
 from vllm.logger import init_logger
 from vllm.v1.metrics.reader import Gauge, get_metrics_snapshot
@@ -80,19 +83,26 @@ def get_named_metrics_from_prometheus() -> list[tuple[str, float]]:
     - list[tuple[str, float]]: List of tuples of metric names and their values.
 
     """
-    named_metrics: list[tuple[str, float]] = []
-    # Map from prometheus metric names to ORCA named metrics.
-    prometheus_to_orca_metrics = {
-        "vllm:kv_cache_usage_perc": "kv_cache_usage_perc",
-        "vllm:num_requests_waiting": "num_requests_waiting",
+    # Map from prometheus metric names to ORCA named metrics, and how to combine
+    # the per-engine values under data parallel (as AggregatedLoggingStatLogger).
+    prometheus_to_orca_metrics: dict[
+        str, tuple[str, Callable[[list[float]], float]]
+    ] = {
+        "vllm:kv_cache_usage_perc": ("kv_cache_usage_perc", fmean),
+        "vllm:num_requests_waiting": ("num_requests_waiting", fsum),
     }
+    values_by_name: dict[str, list[float]] = defaultdict(list)
     metrics = get_metrics_snapshot()
     for metric in metrics:
-        orca_name = prometheus_to_orca_metrics.get(metric.name)
         # If this metric is mapped into ORCA, then add it to the report.
         # Note: Only Gauge metrics are currently supported.
-        if orca_name is not None and isinstance(metric, Gauge):
-            named_metrics.append((str(orca_name), float(metric.value)))
+        if metric.name in prometheus_to_orca_metrics and isinstance(metric, Gauge):
+            values_by_name[metric.name].append(float(metric.value))
+
+    named_metrics: list[tuple[str, float]] = []
+    for name, values in values_by_name.items():
+        orca_name, aggregate = prometheus_to_orca_metrics[name]
+        named_metrics.append((orca_name, aggregate(values)))
     return named_metrics
 
 
