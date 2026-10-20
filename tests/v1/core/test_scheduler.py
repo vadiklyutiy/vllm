@@ -7035,6 +7035,65 @@ def test_drafter_lookahead_encoder_cache_cap_respects_token_budget(
     assert output.scheduled_encoder_inputs["req"] == [0]
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "budget", "block_drop", "expected_chunk_ends"),
+    [
+        # The last cacheable boundary (48) lies in the look-ahead window: skip
+        # it and finish the prompt in one chunk.
+        (49, 512, False, [49]),
+        # A budget-aligned end (64) in the window moves back to the boundary
+        # below it, and the next chunk runs past the window to the end.
+        (65, 64, False, [48, 65]),
+        # The budget cannot fund 32 -> 49, so no chunk end satisfies both rules.
+        # Mamba alignment wins over the look-ahead.
+        (49, 16, True, [16, 32, 48, 49]),
+    ],
+)
+def test_mamba_align_multi_module_mtp_lookahead_makes_progress(
+    num_tokens, budget, block_drop, expected_chunk_ends
+):
+    """Regression test for #61762: the multi-module MTP look-ahead clamp moved
+    a Mamba-aligned chunk end off the block grid. The next chunk then had to
+    stop at a boundary inside the look-ahead window, which the clamp cut to 0
+    tokens on every step."""
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=budget,
+        block_size=block_size,
+        enable_prefix_caching=True,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.use_eagle_block_drop = block_drop
+    scheduler.num_prefill_lookahead = 3
+
+    request = create_requests(
+        num_requests=1,
+        num_tokens=num_tokens,
+        max_tokens=1,
+        block_size=block_size,
+        req_ids=["req"],
+    )[0]
+    scheduler.add_request(request)
+
+    chunk_ends = []
+    while request.num_computed_tokens < num_tokens:
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens.get("req", 0) > 0
+        chunk_ends.append(request.num_computed_tokens)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=["req"],
+                req_id_to_index={"req": 0},
+                sampled_token_ids=[[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+    assert chunk_ends == expected_chunk_ends
+
+
 def test_free_encoder_inputs_unchanged_without_spec_decode():
     """Without speculative decoding, encoder inputs are freed as soon as
     num_computed_tokens passes the placeholder range, as before."""

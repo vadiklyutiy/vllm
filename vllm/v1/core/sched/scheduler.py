@@ -476,6 +476,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        num_prefill_lookahead: int = 0,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -484,6 +485,8 @@ class Scheduler(SchedulerInterface):
         boundary, a detected shared-prefix junction). If a block is larger
         than the configured prefill chunk limit, intermediate chunks keep
         private running state until they reach the next cacheable position.
+        Cache stops within `num_prefill_lookahead` of the prefill end are
+        skipped, since no chunk may end there (`_reserve_prefill_lookahead`).
         """
         start = (
             request.num_computed_tokens
@@ -565,12 +568,7 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
-        stops = (
-            # Same invariant: a chunk starting mid-block stops at the boundary
-            # rather than running past it.
-            next_block_boundary
-            if start % block_size != 0 and not use_internal_checkpoint
-            else 0,
+        cache_stops = (
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
             # Stop at the prompt checkpoint unless the backend saves it internally.
@@ -580,6 +578,19 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
+        )
+        stops = (
+            # Same invariant: a chunk starting mid-block stops at the boundary
+            # rather than running past it.
+            next_block_boundary
+            if start % block_size != 0 and not use_internal_checkpoint
+            else 0,
+            # Running past a cache stop only loses its cache entry.
+            *(
+                s
+                for s in cache_stops
+                if request.num_tokens - s >= num_prefill_lookahead
+            ),
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
@@ -612,10 +623,27 @@ class Scheduler(SchedulerInterface):
         sampled drafts, permanently polluting the trailing modules' KV caches.
         Either finish the prefill or leave at least num_prefill_lookahead for
         the next chunk. No-op for eagle-family drafters (lookahead 1).
+
+        With Mamba "align", the shorter chunk must still end where the Mamba
+        split allows. If no such end precedes the window, keep the split's end:
+        a chunk ending off the block grid would publish a wrong Mamba state,
+        and the next chunk could not leave the window.
         """
         remaining = request.num_tokens - num_computed_tokens - num_new_tokens
         if 0 < remaining < self.num_prefill_lookahead:
-            num_new_tokens -= self.num_prefill_lookahead - remaining
+            reserved = num_new_tokens - (self.num_prefill_lookahead - remaining)
+            if self.need_mamba_block_aligned_split:
+                reserved = (
+                    self._mamba_block_aligned_split(
+                        request,
+                        reserved,
+                        num_computed_tokens - request.num_computed_tokens,
+                        0,
+                        self.num_prefill_lookahead,
+                    )
+                    or num_new_tokens
+                )
+            num_new_tokens = reserved
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -778,7 +806,7 @@ class Scheduler(SchedulerInterface):
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, 0, 0, self.num_prefill_lookahead
                 )
 
             # Schedule encoder inputs.
@@ -1231,6 +1259,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            self.num_prefill_lookahead,
                         )
                         if num_new_tokens == 0:
                             break
