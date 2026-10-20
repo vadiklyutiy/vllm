@@ -9,6 +9,9 @@ slightly different policy than the CPU one: when multiple n-gram matches of
 the same length exist, the GPU kernel picks the right-most (most recent)
 match inside the active context, whereas the CPU implementation returns the
 left-most. The expectations below reflect the GPU behavior.
+
+The last test checks that the V1 ``NgramProposerGPU`` follows
+``compilation_config.mode``.
 """
 
 from __future__ import annotations
@@ -18,12 +21,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.compilation.counter import compilation_counter
 from vllm.config import (
+    CompilationConfig,
+    CompilationMode,
     ModelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
+    set_current_vllm_config,
 )
+from vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU
 from vllm.v1.worker.gpu.spec_decode.ngram.speculator import NgramGPUSpeculator
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -277,3 +285,49 @@ def test_construction_validates_speculative_config():
     # No-op hooks must not raise.
     spec.init_cudagraph_manager(None)
     spec.capture()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE],
+    ids=lambda mode: mode.name,
+)
+def test_v1_proposer_follows_compilation_mode(mode: CompilationMode):
+    """The V1 ``NgramProposerGPU`` kernel must not be compiled in modes where
+    ``@support_torch_compile`` modules stay eager (#62134)."""
+    max_model_len = 32
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    cfg = VllmConfig(
+        model_config=ModelConfig(
+            model="facebook/opt-125m", max_model_len=max_model_len
+        ),
+        scheduler_config=SchedulerConfig.default_factory(
+            max_num_seqs=8, max_model_len=max_model_len
+        ),
+        speculative_config=SpeculativeConfig(
+            method="ngram_gpu",
+            prompt_lookup_min=2,
+            prompt_lookup_max=2,
+            num_speculative_tokens=2,
+        ),
+        compilation_config=CompilationConfig(mode=mode),
+    )
+    with set_current_vllm_config(cfg), compilation_counter.expect(num_models_seen=0):
+        proposer = NgramProposerGPU(cfg, device)
+
+    token_ids = torch.zeros((1, max_model_len), dtype=torch.int32, device=device)
+    token_ids[0, :4] = torch.tensor([1, 2, 3, 1], dtype=torch.int32)
+    with torch.inference_mode():
+        drafts, num_valid = proposer.propose(
+            num_speculative_tokens=2,
+            num_tokens_no_spec=torch.tensor([4], dtype=torch.int32, device=device),
+            token_ids_gpu=token_ids,
+            valid_sampled_token_ids_gpu=torch.tensor(
+                [[2, -1, -1]], dtype=torch.int32, device=device
+            ),
+            valid_sampled_tokens_count=torch.tensor(
+                [1], dtype=torch.int32, device=device
+            ),
+        )
+    assert drafts.tolist() == [[3, 1]]
+    assert num_valid.tolist() == [2]

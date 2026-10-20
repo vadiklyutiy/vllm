@@ -12,7 +12,6 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CompilationConfig,
-    CompilationMode,
     CUDAGraphMode,
     VllmConfig,
 )
@@ -219,7 +218,7 @@ class NgramProposerGPU:
         assert vllm_config.speculative_config.prompt_lookup_max is not None
 
         compilation_config = CompilationConfig(
-            mode=CompilationMode.VLLM_COMPILE,
+            mode=vllm_config.compilation_config.mode,
             custom_ops=["none"],
             splitting_ops=[],
             compile_sizes=[],
