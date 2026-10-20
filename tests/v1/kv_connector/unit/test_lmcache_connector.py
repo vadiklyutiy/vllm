@@ -93,6 +93,15 @@ class TestGetKVConnectorKVCacheEvents:
 
         assert result is None
 
+    def test_returns_none_when_engine_lacks_get_kv_events(self, mock_connector):
+        """Test that engines without get_kv_events (e.g. the native adapter)
+        report no events instead of raising AttributeError."""
+        mock_connector._lmcache_engine = MagicMock(spec=[])
+
+        result = mock_connector.get_kv_connector_kv_cache_events()
+
+        assert result is None
+
     def test_converts_single_event(self, mock_connector, mock_lmcache_engine_event):
         """Test conversion of a single event from lmcache engine format."""
         mock_connector._lmcache_engine.get_kv_events.return_value = [
