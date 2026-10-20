@@ -81,7 +81,9 @@ class SchedulerConfig:
     longer than this number of tokens. 0 disables the cap (default).
 
     The cap is not applied when the request is the only one in the batch,
-    since there is no other request for it to starve."""
+    since there is no other request for it to starve. With
+    disable_chunked_mm_input, a chunk that starts on a multimodal item may
+    exceed the cap so that no item is split."""
 
     long_prefill_token_threshold_adaptive: bool = Field(default=False)
     """Floor the effective long prefill token threshold at a fair share of

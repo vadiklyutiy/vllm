@@ -618,6 +618,60 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _cap_long_prefill(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        long_prefill_token_threshold: int,
+        token_budget: int,
+        max_token_budget: int,
+    ) -> int:
+        """Cap a prefill chunk at long_prefill_token_threshold.
+
+        With disable_chunked_mm_input, a chunk that cannot cover a multimodal
+        item is rolled back to the drafter look-ahead before it. When that
+        leaves nothing to schedule, or would cut into an item the chunk already
+        covers, the cap is raised to cover the item instead. A raised chunk
+        that does not fit in token_budget would be cut inside the item, so the
+        request waits for a step with enough budget, unless no step can fit it.
+        """
+        if not 0 < long_prefill_token_threshold < num_new_tokens:
+            return num_new_tokens
+        cap = long_prefill_token_threshold
+        if (
+            self.scheduler_config.disable_chunked_mm_input
+            and request.has_encoder_inputs
+        ):
+            mm_features = request.mm_features
+            lo, _ = get_mm_features_in_window(
+                mm_features, start=num_computed_tokens, end=num_computed_tokens + 1
+            )
+            # A rollback to num_computed_tokens itself also leaves nothing.
+            end = num_computed_tokens + 1
+            for mm_feature in mm_features[lo:]:
+                mm_position = mm_feature.mm_position
+                if mm_position.offset < num_computed_tokens:
+                    continue
+                if mm_position.offset - self.num_prefill_lookahead >= end:
+                    break
+                end = mm_position.offset + mm_position.length
+            num_raised_tokens = end - num_computed_tokens
+            if num_raised_tokens > cap:
+                if (
+                    self._reserve_prefill_lookahead(
+                        request, num_computed_tokens, num_raised_tokens
+                    )
+                    < num_raised_tokens
+                ):
+                    num_raised_tokens = request.num_tokens - num_computed_tokens
+                if (
+                    num_raised_tokens <= token_budget
+                    or num_raised_tokens > max_token_budget
+                ):
+                    cap = num_raised_tokens
+        return min(cap, num_new_tokens)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -642,6 +696,7 @@ class Scheduler(SchedulerInterface):
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
+        max_request_token_budget = min(token_budget, input_budget - draft_slots)
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -760,8 +815,14 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = long_prefill_token_threshold
+            num_new_tokens = self._cap_long_prefill(
+                request,
+                request.num_computed_tokens,
+                num_new_tokens,
+                long_prefill_token_threshold,
+                min(token_budget, input_budget - draft_slots),
+                max_request_token_budget,
+            )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -1207,8 +1268,14 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    if 0 < long_prefill_token_threshold < num_new_tokens:
-                        num_new_tokens = long_prefill_token_threshold
+                    num_new_tokens = self._cap_long_prefill(
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        long_prefill_token_threshold,
+                        request_token_budget,
+                        max_request_token_budget,
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked

@@ -1152,6 +1152,97 @@ def test_no_mm_input_chunking_at_item_boundary():
     assert ask(400, 800) == 800
 
 
+@pytest.mark.parametrize(
+    "mm_positions, prefill_lookahead, expected_chunks",
+    [
+        # The first chunk of the waiting request starts on the image.
+        ([PlaceholderRange(offset=0, length=576)], 0, [576, 400]),
+        # The first chunk stops before the image, so the running request's
+        # next chunk starts on it.
+        ([PlaceholderRange(offset=400, length=576)], 0, [400, 576]),
+        # With an EAGLE drafter the first chunk stops one token earlier, so the
+        # next chunk starts within the drafter look-ahead of the image.
+        ([PlaceholderRange(offset=400, length=576)], 1, [399, 577]),
+        # The drafter look-ahead past the first image reads into the adjacent
+        # second one, so both are covered in one chunk.
+        (
+            [
+                PlaceholderRange(offset=0, length=576),
+                PlaceholderRange(offset=576, length=400),
+            ],
+            1,
+            [976],
+        ),
+        # A multi-module MTP drafter (look-ahead 3) may not end a chunk within
+        # its look-ahead of the prompt end, so the chunk also takes the 2
+        # tokens after the image.
+        ([PlaceholderRange(offset=398, length=576)], 3, [395, 581]),
+    ],
+)
+def test_no_mm_input_chunking_with_smaller_long_prefill_threshold(
+    mm_positions: list[PlaceholderRange],
+    prefill_lookahead: int,
+    expected_chunks: list[int],
+):
+    """A long prefill threshold smaller than a multimodal item must not stall
+    a chunk that starts on the item: the item is scheduled whole instead.
+
+    Regression test for issue #62031: rolling back to before the item left
+    such a chunk with zero tokens on every step.
+    """
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=2048,
+        max_model_len=4096,
+        long_prefill_token_threshold=500,
+        disable_chunked_mm_input=True,
+    )
+    scheduler.num_prefill_lookahead = prefill_lookahead
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=976,
+        mm_positions=[mm_positions] * 2,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    for expected in expected_chunks:
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {
+            request.request_id: expected for request in requests
+        }
+        _model_output(scheduler, output, [[] for _ in requests])
+
+
+def test_no_mm_input_chunking_raised_chunk_waits_for_budget():
+    """A chunk raised over the long prefill threshold to cover adjacent
+    multimodal items is not cut by the token budget, which would end it inside
+    an item. The request waits for a step with enough budget instead.
+    """
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=1600,
+        max_model_len=4096,
+        long_prefill_token_threshold=500,
+        disable_chunked_mm_input=True,
+    )
+    scheduler.num_prefill_lookahead = 1
+    mm_positions = [
+        PlaceholderRange(offset=0, length=576),
+        PlaceholderRange(offset=576, length=400),
+    ]
+    requests = create_requests(
+        num_requests=2, num_tokens=976, mm_positions=[mm_positions] * 2
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    for expected in ({"0": 976}, {"1": 976}):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == expected
+        _model_output(scheduler, output, [[]])
+
+
 @pytest.mark.parametrize("enable_prefix_caching", [True, False])
 def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     """Test scheduling behavior with concurrent partial requests.
