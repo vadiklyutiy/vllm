@@ -547,6 +547,39 @@ def test_fused_moe_int64_overflow(workspace_init):
         )
 
 
+@pytest.mark.parametrize("m", [1, 1024])
+def test_fused_moe_fp32_default_config(m: int, workspace_init):
+    """Regression test for fp32 default tiles exceeding shared memory.
+
+    The default tiles are sized for 16-bit elements; fp32 must not need more
+    shared memory, or it fails to launch on GPUs with 99 KB per block (SM89)
+    at decode (m=1) and prefill (m=1024) sizes.
+    """
+    set_random_seed(7)
+
+    n, k, e, topk = 512, 1024, 8, 2
+    dtype = torch.float32
+
+    a = torch.randn((m, k), device=DEVICE_TYPE, dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device=DEVICE_TYPE, dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device=DEVICE_TYPE, dtype=dtype) / 10
+    score = torch.randn((m, e), device=DEVICE_TYPE, dtype=dtype)
+
+    fused_moe_fn = functools.partial(fused_moe, renormalize=False)
+
+    with set_current_vllm_config(vllm_config):
+        run_moe_test(
+            torch_moe,
+            fused_moe_fn,
+            a=a,
+            w1=w1,
+            w2=w2,
+            score=score,
+            topk=topk,
+            global_num_experts=e,
+        )
+
+
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS_SMALL_M)
 @pytest.mark.parametrize("e", NUM_EXPERTS_LARGE)
 @pytest.mark.parametrize("topk", TOP_KS_SMALL)
