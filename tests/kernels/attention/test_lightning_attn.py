@@ -266,3 +266,28 @@ def test_lightning_attention_reference(
 
     assert ref_output.shape == (batch_size, num_heads, seq_len, head_size)
     assert ref_kv_cache.shape == actual_kv_cache.shape
+
+
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@torch.inference_mode()
+def test_lightning_attention_across_blocks(num_heads: int, head_size: int):
+    """The state carried into a block, from kv_history or from the previous
+    256-token block, must decay once per token like the recurrence."""
+    torch.set_default_device(DEVICE)
+    set_random_seed(42)
+
+    seq_len = 300
+    q = torch.randn(1, num_heads, seq_len, head_size)
+    k = torch.randn(1, num_heads, seq_len, head_size)
+    v = torch.randn(1, num_heads, seq_len, head_size)
+    ed = 0.1 * torch.arange(1, num_heads + 1, dtype=torch.float32)
+    kv_history = torch.randn(1, num_heads, head_size, head_size)
+
+    ref_output, _ = reference_lightning_attention(q, k, v, ed, 256, kv_history)
+
+    from vllm.model_executor.layers.lightning_attn import lightning_attention
+
+    actual_output, _ = lightning_attention(q, k, v, ed, 256, kv_history)
+
+    torch.testing.assert_close(actual_output, ref_output, rtol=1e-1, atol=1e-1)
