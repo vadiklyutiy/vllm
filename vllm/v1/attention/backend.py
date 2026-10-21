@@ -226,6 +226,19 @@ class AttentionBackend(ABC):
         return not cls.is_ssm()
 
     @classmethod
+    def supports_varlen_decode_cudagraph(cls) -> bool:
+        """Whether this backend's FULL cudagraphs can replay decode batches of 1 to
+        max_decode_query_len() tokens per request, which adaptive verification
+        replays for the verifier.
+
+        Selection asks this before any KV cache spec exists, so a backend opts out
+        only when its builder cannot replay such batches for any spec. The worker
+        checks each verifier group again with its spec; see
+        get_varlen_cudagraph_unsupported_backend().
+        """
+        return True
+
+    @classmethod
     def supports_pcp(cls) -> bool:
         try:
             return cls.get_impl_cls().supports_pcp
@@ -294,6 +307,7 @@ class AttentionBackend(ABC):
         use_adaptive_verification: bool = False,
         use_dcp: bool = False,
         use_rswa: bool = False,
+        use_varlen_decode_cudagraph: bool = False,
     ) -> list[str]:
         invalid_reasons = []
         if not cls.supports_head_size(head_size):
@@ -348,6 +362,11 @@ class AttentionBackend(ABC):
         ):
             invalid_reasons.append(
                 "device-cpu query lens mismatch not supported, "
+                "this is needed for adaptive verification"
+            )
+        if use_varlen_decode_cudagraph and not cls.supports_varlen_decode_cudagraph():
+            invalid_reasons.append(
+                "varlen decode cudagraphs not supported, "
                 "this is needed for adaptive verification"
             )
         combination_reason = cls.supports_combination(

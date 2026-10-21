@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import MagicMock, patch
 
@@ -572,6 +573,48 @@ def test_non_causal_autoselect_backend():
             kv_cache_dtype=None,
         )
         assert backend.supports_non_causal()
+
+
+@pytest.mark.skipif(
+    CudaPlatform is None, reason="CUDA platform is required for this test"
+)
+@pytest.mark.parametrize(
+    "model_tag,flash_attn_version,expected",
+    [
+        ("backbone", 2, "TRITON_ATTN"),
+        ("backbone", 3, "FLASH_ATTN"),
+        # The worker does not require varlen decode cudagraphs of the drafter.
+        ("eagle_head", 2, "FLASH_ATTN"),
+    ],
+)
+def test_adaptive_verification_autoselect_needs_varlen_decode_cudagraphs(
+    model_tag: str, flash_attn_version: int, expected: str
+):
+    """Adaptive verification replays the target model's FULL decode cudagraphs at
+    device-decided query lengths. Auto-selection must skip a backend that cannot
+    replay them (FA2), which the worker would reject at startup."""
+    from vllm.compilation.backends import set_model_tag
+
+    vllm_config = VllmConfig(cache_config=CacheConfig(block_size=16))
+    vllm_config.speculative_config = SimpleNamespace(enable_adaptive_verification=True)
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+        patch(
+            "vllm.platforms.cuda._get_backend_priorities",
+            return_value=[
+                AttentionBackendEnum.FLASH_ATTN,
+                AttentionBackendEnum.TRITON_ATTN,
+            ],
+        ),
+        patch(
+            "vllm.v1.attention.backends.flash_attn.get_flash_attn_version",
+            return_value=flash_attn_version,
+        ),
+        nullcontext() if model_tag == "backbone" else set_model_tag(model_tag),
+    ):
+        backend = get_attn_backend(128, torch.bfloat16, None)
+    assert backend.get_name() == expected
 
 
 @pytest.mark.parametrize(

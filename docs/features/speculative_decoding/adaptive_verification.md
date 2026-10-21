@@ -53,6 +53,7 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 ## Requirements and limitations
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.
+- The target model's attention backend must also replay full decode cudagraphs whose per-request query lengths vary. The attention selector skips backends that cannot, such as FlashAttention 2, so where FlashAttention runs as FA2 (SM 8.x, SM 12.x) the target model gets the next valid backend, usually TRITON_ATTN. Draft models keep their own backend choice.
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
 - Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries) or pipeline parallelism (cost curves and confidences exist only on the last rank).
 - Without a confidence head, `use_local_argmax_reduction` is rejected. The estimator needs the full draft logits, which local argmax reduction never materializes.

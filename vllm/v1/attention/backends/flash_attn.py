@@ -411,6 +411,11 @@ class FlashAttentionBackend(AttentionBackend):
         fa_version = get_flash_attn_version()
         return fa_version is not None and fa_version >= 3
 
+    @classmethod
+    def supports_varlen_decode_cudagraph(cls) -> bool:
+        # FA2 graphs replay only uniform batches, see FlashAttentionMetadataBuilder.
+        return get_flash_attn_version() in (3, 4)
+
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
         return FlashAttentionImpl
