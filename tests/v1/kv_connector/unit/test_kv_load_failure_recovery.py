@@ -6,7 +6,7 @@ from collections.abc import Callable
 import pytest
 
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import FinishReason, Request, RequestStatus
 
 from .utils import (
     create_mock_connector,
@@ -304,6 +304,230 @@ def test_sync_load_failure_with_shared_blocks(
             request.num_computed_tokens == expected_computed_tokens[request.request_id]
         )
     assert scheduler.connector.get_num_new_matched_tokens.call_count == 2
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("requires_kv_delivery", [True, False])
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+def test_sync_load_failure_reported_after_preemption(
+    policy: str, requires_kv_delivery: bool
+):
+    """A sync load failure reported after KV pressure preempted its request.
+
+    The preemption already freed the request's blocks into the prefix cache,
+    so the failed block and the blocks after it must still be evicted, the
+    failure policy applied, and the sample of the failed step not delivered.
+    """
+    vllm_config = create_vllm_config(
+        kv_role="kv_producer", kv_load_failure_policy=policy
+    )
+    vllm_config.scheduler_config.async_scheduling = True
+    # The null block and 10 usable blocks.
+    scheduler = create_scheduler(vllm_config, num_blocks=11)
+    # Covers both the drop and the deliver mode of the in-flight output.
+    scheduler.requires_kv_delivery = requires_kv_delivery
+    block_size = scheduler.block_size
+
+    req_num_new_matched_tokens: dict[str, int] = {}
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(req_num_new_matched_tokens, async_load=False)
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+    scheduler.connector.has_pending_block_frees.return_value = False
+
+    # request0 needs a third block two steps later.
+    request0 = create_request(num_tokens=2 * block_size - 1)
+    scheduler.add_request(request0)
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output, create_model_runner_output([request0])
+    )
+
+    # Step N loads 7 of request1's 8 blocks synchronously and fills the pool.
+    request1 = create_request(num_tokens=8 * block_size)
+    req_num_new_matched_tokens[request1.request_id] = 7 * block_size
+    scheduler.add_request(request1)
+    scheduler_output = scheduler.schedule()
+    (req1_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request1.request_id)
+
+    # Step N+1 preempts request1 before the output of step N arrives.
+    scheduler.schedule()
+    assert request1.status == RequestStatus.PREEMPTED
+
+    invalid_block_idx = 3
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            [request0, request1],
+            invalid_block_ids={req1_block_ids[invalid_block_idx]},
+        ),
+    )
+
+    block_pool = scheduler.kv_cache_manager.block_pool
+    hashed = [block_pool.blocks[i].block_hash is not None for i in req1_block_ids]
+    assert hashed == [True] * invalid_block_idx + [False] * (
+        len(req1_block_ids) - invalid_block_idx
+    )
+    assert request1.num_output_tokens == 0
+    req1_outputs = [
+        output
+        for engine_outputs in outputs.values()
+        for output in engine_outputs.outputs
+        if output.request_id == request1.request_id
+    ]
+    if policy == "fail":
+        assert request1.status == RequestStatus.FINISHED_ERROR
+        assert [output.finish_reason for output in req1_outputs] == [FinishReason.ERROR]
+    else:
+        assert request1.status == RequestStatus.PREEMPTED
+        assert not req1_outputs
+
+
+@pytest.mark.cpu_test
+def test_sync_load_failure_after_preemption_spares_later_step_block():
+    """A late load-failure report does not fail a preempted request of that
+    step that was given the failed block for its next prefill chunk."""
+    vllm_config = create_vllm_config(kv_role="kv_producer", max_num_batched_tokens=48)
+    vllm_config.scheduler_config.async_scheduling = True
+    vllm_config.scheduler_config.long_prefill_token_threshold = 32
+    # The null block and 13 usable blocks.
+    scheduler = create_scheduler(vllm_config, num_blocks=14)
+    block_size = scheduler.block_size
+
+    req_num_new_matched_tokens: dict[str, int] = {}
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(req_num_new_matched_tokens, async_load=False)
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+    scheduler.connector.has_pending_block_frees.return_value = False
+
+    request2 = create_request(num_tokens=7 * block_size)
+    scheduler.add_request(request2)
+    scheduler_output = scheduler.schedule()
+    model_runner_output = create_model_runner_output([request2])
+    # A partial prefill chunk samples no token.
+    model_runner_output.sampled_token_ids = [[]]
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    # Step N runs request2's second chunk and loads 7 of request1's 8 blocks
+    # synchronously; request1 is then aborted.
+    request1 = create_request(num_tokens=8 * block_size)
+    req_num_new_matched_tokens[request1.request_id] = 7 * block_size
+    scheduler.add_request(request1)
+    scheduler_output = scheduler.schedule()
+    (req1_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request1.request_id)
+    scheduler.finish_requests(request1.request_id, RequestStatus.FINISHED_ABORTED)
+
+    # Step N+1 gives request1's blocks to request2's third chunk; request2 is
+    # preempted before the output of step N arrives.
+    scheduler.schedule()
+    (req2_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request2.request_id)
+    invalid_block_id = next(b for b in req2_block_ids if b in req1_block_ids[:7])
+    scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            [request1, request2], invalid_block_ids={invalid_block_id}
+        ),
+    )
+    assert request2.status == RequestStatus.PREEMPTED
+
+
+@pytest.mark.cpu_test
+def test_sync_load_failure_after_preemption_spares_block_reloader():
+    """A late load-failure report does not fail a preempted request that was
+    given the failed block as a new block and loaded its own KV into it."""
+    vllm_config = create_vllm_config(kv_role="kv_producer", max_num_batched_tokens=256)
+    vllm_config.scheduler_config.async_scheduling = True
+    # The null block and 8 usable blocks.
+    scheduler = create_scheduler(vllm_config, num_blocks=9)
+    block_size = scheduler.block_size
+
+    req_num_new_matched_tokens: dict[str, int] = {}
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(req_num_new_matched_tokens, async_load=False)
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+    scheduler.connector.has_pending_block_frees.return_value = False
+
+    # Step N loads 7 of request1's 8 blocks synchronously, then it is aborted.
+    request1 = create_request(num_tokens=8 * block_size)
+    req_num_new_matched_tokens[request1.request_id] = 7 * block_size
+    scheduler.add_request(request1)
+    scheduler_output = scheduler.schedule()
+    (req1_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request1.request_id)
+    scheduler.finish_requests(request1.request_id, RequestStatus.FINISHED_ABORTED)
+
+    # Step N+1 gives request1's blocks to request2, which loads its own KV
+    # into 7 of them synchronously and is then preempted.
+    request2 = create_request(num_tokens=8 * block_size)
+    req_num_new_matched_tokens[request2.request_id] = 7 * block_size
+    scheduler.add_request(request2)
+    scheduler.schedule()
+    (req2_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request2.request_id)
+    invalid_block_id = next(b for b in req2_block_ids[:7] if b in req1_block_ids[:7])
+    scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output([request1], invalid_block_ids={invalid_block_id}),
+    )
+    assert request2.status == RequestStatus.PREEMPTED
+
+
+@pytest.mark.cpu_test
+def test_sync_load_failure_after_preemption_spares_readmitted_reloader():
+    """A late load-failure report does not fail a request of that step that
+    was readmitted, loaded its own KV into the failed block, and was
+    preempted again before the report."""
+    vllm_config = create_vllm_config(kv_role="kv_producer", max_num_batched_tokens=256)
+    vllm_config.scheduler_config.async_scheduling = True
+    # The null block and 12 usable blocks.
+    scheduler = create_scheduler(vllm_config, num_blocks=13)
+    block_size = scheduler.block_size
+
+    req_num_new_matched_tokens: dict[str, int] = {}
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(req_num_new_matched_tokens, async_load=False)
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+    scheduler.connector.has_pending_block_frees.return_value = False
+
+    # Step N runs request2 and loads 7 of request1's 8 blocks synchronously.
+    request2 = create_request(num_tokens=4 * block_size)
+    request1 = create_request(num_tokens=8 * block_size)
+    req_num_new_matched_tokens[request1.request_id] = 7 * block_size
+    scheduler.add_request(request2)
+    scheduler.add_request(request1)
+    scheduler_output = scheduler.schedule()
+    (req1_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request1.request_id)
+    scheduler.finish_requests(request1.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    # Step N+1 readmits request2, which loads its own KV into 3 blocks, some
+    # of them request1's; it is preempted again before step N's output.
+    req_num_new_matched_tokens[request2.request_id] = 3 * block_size
+    scheduler.schedule()
+    (req2_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request2.request_id)
+    invalid_block_id = next(b for b in req2_block_ids[:3] if b in req1_block_ids[:7])
+    scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    scheduler.update_from_output(
+        scheduler_output,
+        create_model_runner_output(
+            [request1, request2], invalid_block_ids={invalid_block_id}
+        ),
+    )
+    assert request2.status == RequestStatus.PREEMPTED
 
 
 @pytest.mark.parametrize(

@@ -166,6 +166,13 @@ class Request:
         # Drop the stale output instead, for same-step preempt + resume
         # (reset_prefix_cache).
         self.drop_stale_output = False
+        # KV Connector: block IDs freed at preemption while output was in
+        # flight, the tokens computed before that output, and the in-flight
+        # tokens scheduled since the last admission; the output may still
+        # report some of these blocks as failed loads.
+        self.preempted_block_ids: tuple[list[int], ...] | None = None
+        self.preempted_num_computed_tokens = 0
+        self.preempted_num_in_flight_tokens = 0
 
         # Tokens of steps whose output is not yet processed (async scheduling
         # and PP run ahead of the GPU); `num_computed_tokens` counts them

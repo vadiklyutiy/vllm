@@ -1666,6 +1666,22 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
+        # The in-flight output may still report blocks that failed to load
+        # (see _handle_invalid_blocks), after they are freed here.
+        request.preempted_block_ids = None
+        if self.connector is not None and request.num_in_flight_tokens:
+            request.preempted_block_ids = self.kv_cache_manager.get_block_ids(
+                request.request_id
+            )
+            # In-flight tokens scheduled since the request was last admitted;
+            # an undrained stale share predates these blocks.
+            request.preempted_num_in_flight_tokens = (
+                request.num_in_flight_tokens - request.num_stale_output_tokens
+            )
+            # Only blocks computed before the in-flight steps can hold loaded KV.
+            request.preempted_num_computed_tokens = (
+                request.num_computed_tokens - request.preempted_num_in_flight_tokens
+            )
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -3429,6 +3445,64 @@ class Scheduler(SchedulerInterface):
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
+    def _update_preempted_requests_with_invalid_blocks(
+        self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
+    ) -> tuple[set[str], int, set[int]]:
+        """Identify preempted requests affected by invalid KV cache blocks.
+
+        A request of the reported step that was preempted before its output
+        arrived has already freed its blocks, so the block IDs recorded at
+        preemption are scanned. The affected request's in-flight output was
+        computed on the invalid blocks, so it is dropped.
+
+        Args:
+            invalid_block_ids: IDs of invalid blocks.
+            num_scheduled_tokens: req_id -> number of scheduled tokens.
+
+        Returns:
+            tuple:
+                - affected_req_ids (set[str]): IDs of requests impacted by
+                invalid blocks.
+                - total_affected_tokens (int): Total number of tokens that must
+                be recomputed across all affected requests.
+                - blocks_to_evict (set[int]): Block IDs to evict from cache,
+                including invalid blocks and downstream dependent blocks.
+
+        """
+        affected_req_ids: set[str] = set()
+        total_affected_tokens = 0
+        blocks_to_evict: set[int] = set()
+        for req_id in num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            # Block IDs are reused once freed, so a request is matched only
+            # against the blocks it held in the reported step: it must be in
+            # that step and not readmitted since, else that step's output is
+            # still in the stale share from before its last admission.
+            if (
+                request is None
+                or request.status != RequestStatus.PREEMPTED
+                or request.preempted_block_ids is None
+                or request.num_stale_output_tokens
+                > request.preempted_num_in_flight_tokens
+            ):
+                continue
+            (req_block_ids,) = request.preempted_block_ids
+            # We iterate only over blocks that may contain externally computed
+            # tokens, but evict all blocks computed on top of an invalid one.
+            num_computed_blocks = cdiv(
+                request.preempted_num_computed_tokens, self.block_size
+            )
+            for idx, block_id in enumerate(req_block_ids[:num_computed_blocks]):
+                if block_id in invalid_block_ids:
+                    total_affected_tokens += (
+                        request.preempted_num_computed_tokens - idx * self.block_size
+                    )
+                    blocks_to_evict.update(req_block_ids[idx:])
+                    request.drop_stale_output = True
+                    affected_req_ids.add(request.request_id)
+                    break
+        return affected_req_ids, total_affected_tokens, blocks_to_evict
+
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
         """Fail closed for layouts whose block IDs are not globally unique."""
         affected_req_ids: set[str] = set()
@@ -3494,6 +3568,16 @@ class Scheduler(SchedulerInterface):
         total_failed_requests += len(sync_failed_req_ids)
         total_failed_tokens += num_failed_tokens
 
+        # handle sync loads of requests preempted before this report
+        preempted_failed_req_ids, num_failed_tokens, preempted_blocks_to_evict = (
+            self._update_preempted_requests_with_invalid_blocks(
+                invalid_block_ids, num_scheduled_tokens
+            )
+        )
+
+        total_failed_requests += len(preempted_failed_req_ids)
+        total_failed_tokens += num_failed_tokens
+
         if not total_failed_requests:
             return set()
 
@@ -3502,9 +3586,14 @@ class Scheduler(SchedulerInterface):
         # and reused by other requests sharing them)
         if sync_blocks_to_evict and not self.recompute_kv_load_failures:
             self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
+        # preempted requests no longer hold their blocks to recompute them
+        if preempted_blocks_to_evict:
+            self.kv_cache_manager.evict_blocks(preempted_blocks_to_evict)
 
         if should_fail:
-            all_failed_req_ids = async_failed_req_ids | sync_failed_req_ids
+            all_failed_req_ids = (
+                async_failed_req_ids | sync_failed_req_ids | preempted_failed_req_ids
+            )
             logger.error(
                 "Failing %d request(s) due to KV load failure "
                 "(failure_policy=fail, %d tokens affected). Request IDs: %s",
