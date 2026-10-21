@@ -818,6 +818,26 @@ def selective_scan_fn(
             last_chunk_indices,
         )
     else:
+        # The CUDA kernel only takes ssm_states in the input dtype or float32,
+        # so other cache dtypes are scanned on a float32 copy of the used slots.
+        cache_ssm_states = None
+        if (
+            ssm_states.dtype not in (u.dtype, torch.float32)
+            and cache_indices is not None
+            and cache_indices.dim() == 1
+        ):
+            cache_ssm_states, state_slots = ssm_states, cache_indices
+            ssm_states = cache_ssm_states[state_slots].float()
+            cache_indices = torch.where(
+                state_slots == null_block_id,
+                -1,
+                torch.arange(
+                    state_slots.numel(),
+                    dtype=state_slots.dtype,
+                    device=state_slots.device,
+                ),
+            )
+            null_block_id = -1
         ops.selective_scan_fwd(
             u,
             delta,
@@ -840,6 +860,8 @@ def selective_scan_fn(
             cu_chunk_seqlen,
             last_chunk_indices,
         )
+        if cache_ssm_states is not None:
+            cache_ssm_states[state_slots] = ssm_states.to(cache_ssm_states.dtype)
 
     if z is None:
         return delta  # output written inplace to delta

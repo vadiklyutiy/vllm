@@ -708,6 +708,64 @@ def test_selective_scan_varlen(
     )
 
 
+@pytest.mark.parametrize(
+    "itype,state_dtype",
+    [
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+        (torch.float32, torch.float16),
+    ],
+)
+@skip_unless_cuda_alike
+def test_selective_scan_varlen_state_dtype(itype, state_dtype):
+    """An SSM cache dtype that is neither the input dtype nor float32 gives
+    the float32-cache result, rounded into the cache."""
+    device = "cuda"
+    set_random_seed(0)
+    dim, dstate, total_entries = 64, 16, 10
+    seqlens = torch.tensor([5, 9, 3, 7])
+    query_start_loc = F.pad(seqlens.cumsum(0), (1, 0)).to(device, torch.int32)
+    seqlen = int(seqlens.sum())
+    # The last sequence is padding.
+    state_indices = torch.tensor(
+        [3, 7, 1, NULL_BLOCK_ID], dtype=torch.int32, device=device
+    )
+    has_initial_state = torch.tensor([True, False, True, True], device=device)
+
+    u = torch.randn(dim, seqlen, device=device, dtype=itype)
+    delta = 0.5 * torch.rand(dim, seqlen, device=device, dtype=itype)
+    A = -0.5 * torch.rand(dim, dstate, device=device)
+    B = torch.randn(1, dstate, seqlen, device=device, dtype=itype)
+    C = torch.randn(1, dstate, seqlen, device=device, dtype=itype)
+    D = torch.randn(dim, device=device)
+    z = torch.randn(dim, seqlen, device=device, dtype=itype)
+    delta_bias = 0.5 * torch.rand(dim, device=device)
+    state = torch.randn(total_entries, dim, dstate, device=device).to(state_dtype)
+    state_ref = state.float()
+
+    def scan(ssm_states):
+        return selective_scan_fn(
+            u,
+            ssm_states,
+            delta.clone(),
+            A,
+            B,
+            C,
+            D,
+            z.clone(),
+            delta_bias,
+            True,
+            query_start_loc,
+            state_indices,
+            has_initial_state,
+        )
+
+    out = scan(state)
+    out_ref = scan(state_ref)
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    torch.testing.assert_close(state, state_ref.to(state_dtype), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("has_z", [True])
 @pytest.mark.parametrize("dstate", [16, 64])
