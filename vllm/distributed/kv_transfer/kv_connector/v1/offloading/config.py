@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
     OffloadingConfig,
@@ -173,11 +174,14 @@ def build_offloading_config(
     canonical_layout = bool(extra_config.get("canonical_layout", False))
 
     # Only a single non-MLA full-attention group with genuinely head-sharded
-    # pages is parallelism-invariant: replicated latent or GQA heads,
+    # pages is parallelism-invariant, and only under BHLNC: heads outermost in
+    # each block make the workers' blocks, joined in rank order, the same bytes
+    # at any TP size. Other layouts, replicated latent or GQA heads,
     # per-token-head scales, CP token sharding, and the V2 model runner's
     # layout are all excluded.
     is_parallelism_agnostic = (
         not vllm_config.use_v2_model_runner
+        and vllm_config.cache_config.kv_cache_layout == KVCacheLayout.BHLNC.name
         and single_group_spec is not None
         and isinstance(single_group_spec, FullAttentionSpec)
         and not isinstance(single_group_spec, MLAAttentionSpec)

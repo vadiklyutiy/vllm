@@ -1154,6 +1154,27 @@ def test_parallelism_agnostic_excluded(kv_cache_groups: list[KVCacheGroupSpec]):
 
 
 @pytest.mark.parametrize(
+    ("kv_cache_layout", "agnostic"),
+    [("LBHNC", False), ("BLHNC", False), ("BHLNC", True)],
+)
+def test_direct_layout_parallelism_agnostic_needs_heads_outermost(
+    kv_cache_layout: str, agnostic: bool
+):
+    """Workers' direct blocks join into the TP=1 block only when heads are
+    outermost in each block."""
+    config = _make_vllm_config()
+    config.use_v2_model_runner = False
+    config.cache_config.kv_cache_layout = kv_cache_layout
+    kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=_groups(_full_attention_spec()),
+    )
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    assert offloading_config.parallel.is_parallelism_agnostic is agnostic
+
+
+@pytest.mark.parametrize(
     ("kv_cache_groups", "certified"),
     [
         pytest.param(_groups(_mla_spec(head_size=576)), True, id="mla-latent"),

@@ -55,10 +55,10 @@ class OffloadingParallelConfig:
     # Local rank of the data parallel group, set only in SPMD mode.
     data_parallel_rank_local: int | None
     # True when the bytes that will be persisted for a block are portable
-    # across parallelism configurations: for the direct layout, concatenating
-    # the block's data across all workers in rank order yields the same bytes
-    # under any topology; for the canonical layout, the canonical page itself
-    # is topology-free.
+    # across parallelism configurations: for the direct BHLNC layout,
+    # concatenating the block's data across all workers in rank order yields
+    # the same bytes under any TP size; for the canonical layout, the canonical
+    # page itself is topology-free.
     is_parallelism_agnostic: bool
 
 
