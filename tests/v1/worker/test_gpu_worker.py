@@ -11,6 +11,7 @@ import torch
 from tests.utils import create_new_process_for_each_test
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.mem_utils import MemorySnapshot
 from vllm.v1.worker import gpu_worker, startup_plan
 from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
 from vllm.v1.worker.startup_plan import (
@@ -131,6 +132,44 @@ def test_scoped_max_split_keeps_freed_large_blocks_releasable():
         SimpleNamespace(), max_split_size_mb=20
     )
     assert reserved_while_small_is_live(scoped) - baseline < large
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike()
+    or not torch.accelerator.is_available()
+    or torch.cuda.memory.get_allocator_backend() != "native",
+    reason="needs the native CUDA or ROCm allocator",
+)
+@create_new_process_for_each_test("spawn")
+def test_kv_cache_memory_bytes_profile_run_leaves_no_cached_memory():
+    """With kv_cache_memory_bytes set, the profiling run must not leave freed
+    blocks reserved in the default pool: with sleep mode the KV cache is
+    allocated from the CuMem pool, which cannot use them."""
+    large = 512 * 1024 * 1024
+    small = 2 * 1024 * 1024
+    scratch = []
+
+    def profile_run(*, randomize_inputs=False):
+        torch.empty(large, dtype=torch.uint8, device="cuda")
+        # Kept alive after the run, like a kernel library's cached scratch buffer.
+        scratch.append(torch.empty(small, dtype=torch.uint8, device="cuda"))
+
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(),
+        randomize_dummy_inputs=False,
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=GiB_bytes),
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(),
+        model_runner=SimpleNamespace(profile_run=profile_run, model_memory_usage=0),
+        init_snapshot=MemorySnapshot(),
+        _scoped_allocator_max_split=lambda **kwargs: (
+            gpu_worker.Worker._scoped_allocator_max_split(SimpleNamespace(), **kwargs)
+        ),
+    )
+    baseline = torch.accelerator.memory_reserved()
+
+    assert gpu_worker.Worker.determine_available_memory(worker) == GiB_bytes
+    assert torch.accelerator.memory_reserved() - baseline < large
 
 
 @pytest.mark.skipif(

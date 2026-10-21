@@ -650,14 +650,29 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
-            with set_current_vllm_config(self.vllm_config):
-                self.model_runner.profile_run(
-                    randomize_inputs=self.randomize_dummy_inputs
-                )
+        # Execute a forward pass with dummy inputs to profile the memory usage
+        # of the model. With kv_cache_memory_bytes set the result is unused, but
+        # the pass still compiles the model for max_num_batched_tokens and must
+        # leave the allocator as clean as a profiling run does: a KV cache in the
+        # CuMem pool (sleep mode) cannot use memory held by the default pool.
+        with (
+            memory_profiling(
+                self.init_snapshot,
+                weights_memory=int(self.model_runner.model_memory_usage),
+            ) as profile_result,
+            # Workspaces (e.g. the MoE workspace) grow in steps during this pass,
+            # freeing each smaller buffer. Without a split limit, a later small
+            # allocation can be carved out of a freed multi-GiB block and pin the
+            # whole segment past the empty_cache() in memory_profiling, so it is
+            # counted as consumed and taken from the KV cache. Blocks above the
+            # limit are never split, so they stay releasable. Exits before
+            # memory_profiling measures, restoring the original limit.
+            self._scoped_allocator_max_split(max_split_size_mb=20),
+            set_current_vllm_config(self.vllm_config),
+        ):
+            self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
 
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
@@ -676,25 +691,6 @@ class Worker(WorkerBase):
                 self.model_config.multimodal_config,
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
-
-        # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
-        with (
-            memory_profiling(
-                self.init_snapshot,
-                weights_memory=int(self.model_runner.model_memory_usage),
-            ) as profile_result,
-            # Workspaces (e.g. the MoE workspace) grow in steps during this pass,
-            # freeing each smaller buffer. Without a split limit, a later small
-            # allocation can be carved out of a freed multi-GiB block and pin the
-            # whole segment past the empty_cache() in memory_profiling, so it is
-            # counted as consumed and taken from the KV cache. Blocks above the
-            # limit are never split, so they stay releasable. Exits before
-            # memory_profiling measures, restoring the original limit.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
-            set_current_vllm_config(self.vllm_config),
-        ):
-            self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
