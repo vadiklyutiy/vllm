@@ -124,7 +124,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_TRITON_JIT_WARMUP_NUM_THREADS: int = 4
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
-    VLLM_SKIP_P2P_CHECK: bool = False
+    VLLM_SKIP_P2P_CHECK: bool | None = None
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
@@ -1188,13 +1188,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
         in ("1", "true")
     ),
-    # We assume drivers can report p2p status correctly.
-    # If the program hangs when using custom allreduce,
-    # potantially caused by a bug in the driver (535 series),
-    # if might be helpful to set VLLM_SKIP_P2P_CHECK=0
-    # so that vLLM can verify if p2p is actually working.
+    # If set to 1, trust the driver's p2p report; if set to 0, verify p2p.
+    # If unset, trust it only for NVLink-connected GPUs: drivers can report
+    # PCIe p2p as available when it is not (e.g. the 535 series), which hangs
+    # custom allreduce.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
-    "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    "VLLM_SKIP_P2P_CHECK": lambda: (
+        os.environ["VLLM_SKIP_P2P_CHECK"] == "1"
+        if "VLLM_SKIP_P2P_CHECK" in os.environ
+        else None
+    ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection

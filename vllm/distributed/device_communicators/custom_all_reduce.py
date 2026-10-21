@@ -83,21 +83,30 @@ def _group_can_attempt_mnnvl(
     return _all_ranks_true(group, local_support)
 
 
-def _can_p2p(rank: int, world_size: int) -> bool:
-    for i in range(world_size):
-        if i == rank:
-            continue
-        if envs.VLLM_SKIP_P2P_CHECK:
-            logger.debug("Skipping P2P check and trusting the driver's P2P report.")
-            # can_device_access_peer takes visible device ordinals, while
-            # rank and i are logical local IDs.
-            return torch.cuda.can_device_access_peer(
-                current_platform.logical_device_id_to_visible_device_id(rank),
-                current_platform.logical_device_id_to_visible_device_id(i),
-            )
-        if not gpu_p2p_access_check(rank, i):
-            return False
-    return True
+def _can_p2p(
+    group: ProcessGroup, rank: int, world_size: int, fully_connected: bool
+) -> bool:
+    skip_check = envs.VLLM_SKIP_P2P_CHECK
+    if skip_check is None:
+        # Drivers can report PCIe P2P as available while peer writes are lost,
+        # which hangs custom allreduce, so by default only NVLink skips it.
+        skip_check = fully_connected
+    peers = [i for i in range(world_size) if i != rank]
+    # can_device_access_peer takes visible device ordinals, while
+    # rank and i are logical local IDs.
+    to_visible = current_platform.logical_device_id_to_visible_device_id
+    driver_p2p = all(
+        torch.cuda.can_device_access_peer(to_visible(rank), to_visible(i))
+        for i in peers
+    )
+    if skip_check:
+        logger.debug("Skipping P2P check and trusting the driver's P2P report.")
+        return driver_p2p
+    # Only a driver's "yes" can be wrong, so a "no" needs no real check.
+    if not _all_ranks_true(group, driver_p2p):
+        return False
+    # Other groups may skip this check, so it must not sync the world.
+    return all(gpu_p2p_access_check(rank, i, group) for i in peers)
 
 
 def _supports_mnnvl_multimem_reduce_scatter(
@@ -281,7 +290,7 @@ class CustomAllreduce:
         if (
             same_node
             and not current_platform.is_rocm()
-            and not _can_p2p(rank, world_size)
+            and not _can_p2p(group, rank, world_size, fully_connected)
         ):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "

@@ -341,8 +341,13 @@ def can_actually_p2p(
 _gpu_p2p_access_cache: dict[str, bool] | None = None
 
 
-def gpu_p2p_access_check(src: int, tgt: int) -> bool:
-    """Check if GPU src can access GPU tgt."""
+def gpu_p2p_access_check(
+    src: int, tgt: int, group: dist.ProcessGroup | None = None
+) -> bool:
+    """Check if GPU src can access GPU tgt.
+
+    Every rank of the CPU `group` (default: the world group) must call this.
+    """
     # if the cache variable is already calculated,
     # read from the cache instead of checking it again
     global _gpu_p2p_access_cache
@@ -370,10 +375,14 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     from vllm.distributed.parallel_state import get_world_group
 
-    if (not is_distributed or get_world_group().local_rank == 0) and (
-        not os.path.exists(path)
-    ):
-        # only the local master process (with local_rank == 0) can
+    if not is_distributed:
+        is_writer = True
+    elif group is None:
+        is_writer = get_world_group().local_rank == 0
+    else:
+        is_writer = dist.get_rank(group) == 0
+    if is_writer and not os.path.exists(path):
+        # only one process per node (or per calling group) can
         #  enter this block to calculate the cache
         logger.info("generating GPU P2P access cache in %s", path)
         cache: dict[str, bool] = {}
@@ -420,10 +429,16 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         id_to_local = {device_id: local for local, device_id in enumerate(ids)}
         for _i, _j, r in zip(batch_src, batch_tgt, result):
             cache[f"{id_to_local[_i]}->{id_to_local[_j]}"] = r
-        with open(path, "w") as f:
+        # Writers of several groups on one node may write the file at once.
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(cache, f, indent=4)
+        os.replace(tmp_path, path)
     if is_distributed:
-        get_world_group().barrier()
+        if group is None:
+            get_world_group().barrier()
+        else:
+            dist.barrier(group=group)
     logger.info("reading GPU P2P access cache from %s", path)
     with open(path) as f:
         cache = json.load(f)

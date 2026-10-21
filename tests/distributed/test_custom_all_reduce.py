@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
+from vllm.distributed.device_communicators import all_reduce_utils as aru
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
 from vllm.platforms import current_platform
@@ -300,6 +301,69 @@ def test_local_multicast_support_rejects_non_cuda(monkeypatch):
     monkeypatch.setattr(car.current_platform, "is_cuda", lambda: False)
 
     assert not car._has_local_multicast_support(torch.device("cuda:0"))
+
+
+@pytest.mark.parametrize(
+    ("skip_check", "fully_connected", "expected"),
+    [(None, False, False), (None, True, True), ("1", False, True)],
+)
+def test_p2p_gate_tests_pcie_peers_despite_driver_report(
+    monkeypatch, skip_check, fully_connected, expected
+):
+    """A driver can report PCIe P2P whose peer writes are lost, which hangs
+    custom allreduce, so by default only NVLink peers skip the real P2P test."""
+    if skip_check is None:
+        monkeypatch.delenv("VLLM_SKIP_P2P_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SKIP_P2P_CHECK", skip_check)
+    monkeypatch.setattr(car.torch.cuda, "can_device_access_peer", lambda *_: True)
+    monkeypatch.setattr(
+        car.current_platform, "logical_device_id_to_visible_device_id", lambda i: i
+    )
+    monkeypatch.setattr(car, "gpu_p2p_access_check", lambda *_: False)
+    monkeypatch.setattr(car.dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+    assert car._can_p2p(object(), 0, 2, fully_connected) is expected
+
+
+def test_p2p_gate_does_not_test_peers_the_driver_rejects(monkeypatch):
+    """Only a driver's "yes" can be wrong, so a "no" must not cost a P2P test."""
+    monkeypatch.delenv("VLLM_SKIP_P2P_CHECK", raising=False)
+    monkeypatch.setattr(car.torch.cuda, "can_device_access_peer", lambda *_: False)
+    monkeypatch.setattr(
+        car.current_platform, "logical_device_id_to_visible_device_id", lambda i: i
+    )
+
+    def p2p_test(*_):
+        raise AssertionError("the driver already rejected P2P")
+
+    monkeypatch.setattr(car, "gpu_p2p_access_check", p2p_test)
+    monkeypatch.setattr(car.dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+    assert car._can_p2p(object(), 0, 2, False) is False
+
+
+def test_p2p_access_check_syncs_only_the_calling_group(monkeypatch, tmp_path):
+    """NVLink groups skip the P2P check, so a PCIe group that runs it must sync
+    only its own ranks: a world barrier would wait forever for the others."""
+    (tmp_path / "gpu_p2p_access_cache_for_0,1.json").write_text('{"0->1": false}')
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setattr("vllm.platforms.interface._assigned_physical_gpu_ids", None)
+    monkeypatch.setattr(aru, "_gpu_p2p_access_cache", None)
+    monkeypatch.setattr(aru.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(aru.dist, "get_rank", lambda group: 1)
+    barriers = []
+    monkeypatch.setattr(aru.dist, "barrier", lambda group: barriers.append(group))
+
+    def world_group():
+        raise AssertionError("the P2P check must not use the world group")
+
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_world_group", world_group)
+
+    group = object()
+    assert aru.gpu_p2p_access_check(0, 1, group) is False
+    assert barriers == [group]
 
 
 @pytest.mark.parametrize(
