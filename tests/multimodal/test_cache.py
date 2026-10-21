@@ -340,6 +340,25 @@ def test_mm_cache_miss_raises_and_recovers():
     assert p1.get_and_update_item(None, mm_hash) == item
 
 
+def test_mm_cache_invalidate_keeps_entry_for_in_flight_request():
+    """The engine output handler can invalidate a hash between the `is_cached`
+    and `get_and_update_item` of a request being processed on another thread
+    (#62121). That request must still merge; the next one must resend the data.
+    """
+    p0 = LruKeyReplicatedSenderCache(_StubModelConfig(mm_processor_cache_gb=1))
+    mm_hash = "image_A"
+    item = MultiModalKwargsItem.dummy(nbytes=64)
+    p0.get_and_update_item((item, []), mm_hash)
+
+    assert p0.is_cached_item(mm_hash)
+    p0.invalidate(mm_hash)
+    assert p0.get_and_update_item(None, mm_hash)[0] is None
+
+    assert not p0.is_cached_item(mm_hash)
+    assert p0.get_and_update_item((item, []), mm_hash)[0] is item
+    assert p0.is_cached_item(mm_hash)
+
+
 def test_receiver_cache_replaces_stale_item_when_payload_resent():
     """A P0 miss can resend a different item under the same identity.
 

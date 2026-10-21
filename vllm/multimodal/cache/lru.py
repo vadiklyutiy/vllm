@@ -43,10 +43,15 @@ class LruKeyReplicatedSenderCache(BaseMultiModalProcessorCache):
             mm_config.mm_processor_cache_gb,
             MultiModalProcessorCacheItemMetadata,
         )
+        # Filled by `invalidate`, which may run on another thread than the one
+        # processing requests. A marked entry is only dropped when its data is
+        # resent, so a request between `is_cached` and `get_and_update_item`
+        # still finds it.
+        self._invalidated = set[str]()
 
     @override
     def is_cached_item(self, mm_hash: str) -> bool:
-        return mm_hash in self._cache
+        return mm_hash in self._cache and mm_hash not in self._invalidated
 
     @override
     def get_and_update_item(
@@ -54,6 +59,10 @@ class LruKeyReplicatedSenderCache(BaseMultiModalProcessorCache):
         mm_item: MultiModalProcessorCacheInItem,
         mm_hash: str,
     ) -> MultiModalProcessorCacheOutItem:
+        if mm_item is not None and mm_hash in self._invalidated:
+            self._invalidated.discard(mm_hash)
+            self._cache.pop(mm_hash, None)
+
         if (cached_item := self._cache.get(mm_hash)) is not None:
             return None, cached_item.prompt_updates
 
@@ -71,6 +80,7 @@ class LruKeyReplicatedSenderCache(BaseMultiModalProcessorCache):
     @override
     def clear_cache(self) -> None:
         self._cache.clear()
+        self._invalidated.clear()
 
     @override
     def make_stats(self, *, delta: bool = False) -> CacheInfo:
@@ -78,9 +88,9 @@ class LruKeyReplicatedSenderCache(BaseMultiModalProcessorCache):
 
     @override
     def invalidate(self, mm_hash: str) -> None:
-        # Drop our stale shadow entry so the next request for this hash re-sends the
+        # Mark our stale shadow entry so the next request for this hash re-sends the
         # data and repopulates P1 (see MultiModalCacheMissError).
-        self._cache.pop(mm_hash, None)
+        self._invalidated.add(mm_hash)
 
 
 class LruKeyReplicatedReceiverCache(BaseMultiModalReceiverCache):
