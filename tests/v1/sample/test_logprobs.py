@@ -6,7 +6,7 @@ import math
 from collections.abc import Generator
 from types import SimpleNamespace
 from typing import get_args
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -27,6 +27,7 @@ from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import Logprob
 from vllm.platforms import current_platform
+from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.input_processor import InputProcessor
 
 from ...conftest import HfRunner, VllmRunner
@@ -529,6 +530,23 @@ def test_prompt_logprob_token_ids_require_v2_model_runner():
         processor.vllm_config.cache_config.kv_sharing_fast_prefill = True
         with pytest.raises(VLLMValidationError, match="fast-prefill"):
             InputProcessor._validate_params(processor, params, ("generate",))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_logprobs", [0, 1])
+async def test_kv_sharing_fast_prefill_rejects_prompt_logprobs(prompt_logprobs: int):
+    """prompt_logprobs=0 (also set by the echo routes) still scores every
+    prompt row, which kv-sharing fast prefill never computes."""
+    llm = AsyncLLM.__new__(AsyncLLM)
+    llm.engine_core = MagicMock()
+    llm.engine_core.resources.engine_dead = False
+    llm.output_handler = None
+    llm.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=True)
+    )
+    params = SamplingParams(prompt_logprobs=prompt_logprobs)
+    with pytest.raises(VLLMValidationError, match="fast-prefill"):
+        await llm.add_request("req", "Hello", params)
 
 
 def test_none_logprobs(vllm_model, example_prompts):
