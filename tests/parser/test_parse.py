@@ -598,3 +598,55 @@ def test_prompt_reasoning_streaming_matches_non_streaming(tokenizer, case):
 
     assert (streamed_reasoning, streamed_content) == non_streaming
     assert parser.count_reasoning_tokens(output_ids) == non_streaming_count
+
+
+@pytest.mark.parametrize("tool_parser_name", [None, "qwen3_coder"])
+@pytest.mark.parametrize(
+    ("output", "expected_content"),
+    [
+        (REASONED_OUTPUT, PLAIN_TEXT),
+        ("<think>\nlet me think\n</think>\n\n", None),
+    ],
+)
+@pytest.mark.parametrize("tokens_per_delta", [1, None])
+def test_qwen3_content_drops_newlines_after_think_end(
+    tokenizer, tool_parser_name, output, expected_content, tokens_per_delta
+):
+    """The Qwen3 template writes "</think>\\n\\n" before the answer, so the
+    newlines are markup, not content (#61972)."""
+    prompt_ids, _, _ = prompt_case(tokenizer, "reasoning_open")
+    request = make_request(tools=TOOLS)
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name=tool_parser_name,
+        reasoning_parser_name="qwen3",
+        enable_auto_tools=tool_parser_name is not None,
+        tokenizer=tokenizer,
+    )
+    assert parser_cls is not None
+    output_ids = encode(tokenizer, output)
+
+    parser = parser_cls(tokenizer, None)
+    parser.set_prompt_token_ids(prompt_ids)
+    _, content, _ = parser.parse(
+        output,
+        request,
+        enable_auto_tools=tool_parser_name is not None,
+        model_output_token_ids=output_ids,
+    )
+    assert content == expected_content
+
+    parser = parser_cls(tokenizer, None)
+    step = tokens_per_delta or len(output_ids)
+    streamed_content = None
+    for start in range(0, len(output_ids), step):
+        delta_ids = output_ids[start : start + step]
+        delta = parser.parse_delta(
+            tokenizer.decode(delta_ids),
+            delta_ids,
+            request,
+            prompt_token_ids=prompt_ids,
+            finished=start + step >= len(output_ids),
+        )
+        if delta is not None and delta.content:
+            streamed_content = (streamed_content or "") + delta.content
+    assert streamed_content == expected_content

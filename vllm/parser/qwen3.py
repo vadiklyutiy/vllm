@@ -32,10 +32,12 @@ from vllm.parser.engine.parser_engine_config import (
 )
 
 if TYPE_CHECKING:
+    from vllm.entrypoints.generate.base.protocol import DeltaMessage
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
     )
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.parser.engine.parser_engine import SemanticEvent
     from vllm.tokenizers import TokenizerLike
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
@@ -307,6 +309,8 @@ class Qwen3Parser(ParserEngine):
     TOOL_START = TOOL_CALL_START
     TOOL_END = TOOL_CALL_END
     TURN_BOUNDARIES: frozenset[str] = CHATML_TURN_BOUNDARIES
+    # The chat template writes newlines between THINK_END and the answer.
+    STRIP_NEWLINES_AFTER_THINK_END = True
 
     def __init__(
         self,
@@ -333,6 +337,38 @@ class Qwen3Parser(ParserEngine):
             tools,
             **kwargs,
         )
+        self._separator_pending = self._expects_separator()
+
+    def _expects_separator(self) -> bool:
+        # Only output that starts in reasoning has content after THINK_END.
+        return (
+            self.STRIP_NEWLINES_AFTER_THINK_END
+            and self._engine.state is ParserState.REASONING
+        )
+
+    @property
+    def reasoning_ended(self) -> bool:
+        # DelegatingParser passes later deltas through without the engine,
+        # so report the end only once the separator has been dropped.
+        return self._reasoning_ended and not self._separator_pending
+
+    def _reset(self, initial_state: ParserState | None = None) -> None:
+        super()._reset(initial_state=initial_state)
+        self._separator_pending = self._expects_separator()
+
+    def _events_to_delta(
+        self,
+        events: list[SemanticEvent],
+        finished: bool = False,
+    ) -> DeltaMessage | None:
+        delta = super()._events_to_delta(events, finished=finished)
+        if self._separator_pending and delta is not None and delta.content:
+            delta.content = delta.content.lstrip("\n") or None
+            if delta.content is not None:
+                self._separator_pending = False
+            elif delta.reasoning is None and not delta.tool_calls:
+                return None
+        return delta
 
     def extract_reasoning(
         self,
@@ -341,4 +377,7 @@ class Qwen3Parser(ParserEngine):
     ) -> tuple[str | None, str | None]:
         if not self.thinking_enabled:
             return None, model_output
-        return super().extract_reasoning(model_output, request)
+        reasoning, content = super().extract_reasoning(model_output, request)
+        if self._separator_pending and content is not None:
+            content = content.lstrip("\n") or None
+        return reasoning, content

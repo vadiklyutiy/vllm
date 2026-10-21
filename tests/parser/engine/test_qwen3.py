@@ -19,7 +19,9 @@ from tests.parser.engine.streaming_helpers import (
     collect_tool_arguments,
     simulate_tool_streaming,
 )
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.parser.engine.parser_engine import ParserEngine
+from vllm.parser.parser_manager import ParserManager
 from vllm.parser.qwen3 import (
     TOOL_CALL_END,
     TOOL_CALL_START,
@@ -1440,3 +1442,46 @@ def test_mimo_preserves_verbatim_parameter_values(
     )
     assert collect_function_name(results) == "run"
     assert json.loads(collect_tool_arguments(results)) == {"text": value}
+
+
+@pytest.mark.parametrize(
+    ("reasoning_parser_name", "think_end", "separator", "expected_content"),
+    [
+        ("qwen3", "</think>", "\n\n", "Answer."),
+        ("minicpmv", "</think>", "\n\n", "Answer."),
+        ("nemotron_v3", "</think>", "\n", "Answer."),
+        ("seed_oss", "</seed:think>", "\n", "Answer."),
+        ("step3p5", "</think>", "\n", "Answer."),
+        # MiMo's template writes the answer right after "</think>".
+        ("mimo", "</think>", "\n", "\nAnswer."),
+    ],
+)
+def test_template_newlines_after_think_end_are_not_content(
+    reasoning_parser_name, think_end, separator, expected_content
+):
+    tokenizer = make_mock_tokenizer({think_end: 51})
+    request = ChatCompletionRequest(
+        model="m", messages=[{"role": "user", "content": "hi"}]
+    )
+    parser_cls = ParserManager.get_parser(reasoning_parser_name=reasoning_parser_name)
+    assert parser_cls is not None
+    chunks = [
+        ("Plan.", [100]),
+        (think_end, [51]),
+        (separator, [100]),
+        ("Answer.", [100]),
+    ]
+
+    text = "".join(delta_text for delta_text, _ in chunks)
+    _, content, _ = parser_cls(tokenizer, None).parse(text, request)
+    assert content == expected_content
+
+    parser = parser_cls(tokenizer, None)
+    streamed_content = ""
+    for i, (delta_text, delta_ids) in enumerate(chunks):
+        delta = parser.parse_delta(
+            delta_text, delta_ids, request, finished=i == len(chunks) - 1
+        )
+        if delta is not None and delta.content:
+            streamed_content += delta.content
+    assert streamed_content == expected_content

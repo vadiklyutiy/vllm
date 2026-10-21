@@ -54,6 +54,10 @@ class GraniteThinkingParser(NemotronV3Parser):
     ``_events_to_delta`` (and therefore our stripping logic).
     """
 
+    # Granite strips these newlines in its own overrides below: also outside
+    # reasoning, and only after the force-content swap saw the raw content.
+    STRIP_NEWLINES_AFTER_THINK_END = False
+
     def __init__(
         self,
         tokenizer: TokenizerLike,
