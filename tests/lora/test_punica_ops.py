@@ -411,7 +411,7 @@ test_params = {
     "max_ranks": [1, 4, 8, 16, 32, 64, 128, 256],
 }
 
-DTYPES = [torch.float16, torch.bfloat16]
+DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 DEVICES = [f"{DEVICE_TYPE}:{0}"]
 SEED = [0]
 

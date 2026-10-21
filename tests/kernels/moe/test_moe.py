@@ -457,6 +457,29 @@ def test_fused_moe(
         )
 
 
+@pytest.mark.parametrize("m", [1, 33, 4096])
+def test_fused_moe_float32(m: int, workspace_init):
+    """float32 has no tuned configs, so it runs on the default config. Its
+    tiles must still fit in the shared memory of GPUs such as sm89."""
+    set_random_seed(7)
+    e, n, k, topk = 8, 1024, 1024, 2
+    a = torch.randn((m, k), device=DEVICE_TYPE, dtype=torch.float32) / 10
+    w1 = torch.randn((e, 2 * n, k), device=DEVICE_TYPE, dtype=torch.float32) / 10
+    w2 = torch.randn((e, k, n), device=DEVICE_TYPE, dtype=torch.float32) / 10
+    score = torch.randn((m, e), device=DEVICE_TYPE, dtype=torch.float32)
+
+    with set_current_vllm_config(vllm_config):
+        run_moe_test(
+            torch_moe,
+            functools.partial(fused_moe, renormalize=False),
+            a=a,
+            w1=w1,
+            w2=w2,
+            score=score,
+            topk=topk,
+        )
+
+
 def test_fused_shared_expert_alignment(workspace_init):
     set_random_seed(7)
     m, n, k = 4, 64, 128

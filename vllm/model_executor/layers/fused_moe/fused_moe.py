@@ -1386,6 +1386,10 @@ def get_default_config(
         # while large batches prefer more output parallelism.
         # FP8 elements are half-width so larger K tiles are always cheap.
         block_k = 128 if dtype == "fp8_w8a8" or M <= 64 else 64
+        # FP32 elements are double-width, so halve the K tile to keep the
+        # shared memory footprint of the 16-bit defaults.
+        if dtype == "float32":
+            block_k //= 2
 
         # Grouping adjacent M-blocks lets them share weight tiles in L2.
         # Only helps when there are enough M-blocks per expert to group;

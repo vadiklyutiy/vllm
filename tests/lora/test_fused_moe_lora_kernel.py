@@ -634,6 +634,42 @@ def test_fused_moe_lora_kernel_naive_block_assignment(
     torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("max_lora_rank", [1, 16, 64, 128])
+@pytest.mark.parametrize("device", DEVICES)
+def test_fused_moe_lora_kernel_float32(max_lora_rank, device):
+    """A float32 model gets float32 LoRA weights. Prefill (block size 128) and
+    decode must still fit in the shared memory of GPUs such as sm89, and rank 1
+    must not build TMA descriptors with 4-byte strides."""
+    test_fused_moe_lora_kernel(
+        num_tokens=100,
+        top_k_num=6,
+        num_experts=64,
+        max_loras=4,
+        N=1408,
+        K=2048,
+        max_lora_rank=max_lora_rank,
+        block_size=128,
+        num_slices=2,
+        dtype=torch.float32,
+        device=device,
+        seed=42,
+    )
+    test_fused_moe_lora_kernel_naive_block_assignment(
+        num_tokens=8,
+        top_k_num=2,
+        num_experts=64,
+        max_loras=4,
+        N=1408,
+        K=2048,
+        max_lora_rank=max_lora_rank,
+        block_size=16,
+        num_slices=2,
+        dtype=torch.float32,
+        device=device,
+        seed=42,
+    )
+
+
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("num_tokens", [100])
 @pytest.mark.parametrize("top_k_num", [6])

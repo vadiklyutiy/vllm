@@ -1509,26 +1509,30 @@ def _fused_moe_lora(
         # moe_lora_align_block_size used; both shrink and expand pass the
         # same value (asserted by `shrink_block_size_m == expand_block_size_m`
         # below).
-        _run_fused_moe_lora_one_shot(
-            output,
-            qcurr_hidden_states,
-            lora_a_stacked,
-            lora_b_stacked,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            token_lora_mapping,
-            max_lora_rank,
-            top_k_num,
-            lora_ids,
-            num_active_loras,
-            adapter_enabled,
-            mul_routed_weight,
-            shrink_block_size_m,
-            add_inputs=add_inputs,
-        )
-        return
+        # The one-shot kernel's float32 tiles do not fit in the shared memory
+        # of GPUs such as sm89; the two-kernel path takes its tiles from the
+        # MoE config.
+        if qcurr_hidden_states.dtype != torch.float32:
+            _run_fused_moe_lora_one_shot(
+                output,
+                qcurr_hidden_states,
+                lora_a_stacked,
+                lora_b_stacked,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                token_lora_mapping,
+                max_lora_rank,
+                top_k_num,
+                lora_ids,
+                num_active_loras,
+                adapter_enabled,
+                mul_routed_weight,
+                shrink_block_size_m,
+                add_inputs=add_inputs,
+            )
+            return
 
     assert add_inputs or not fully_sharded, (
         "fused_moe_lora(add_inputs=False) is not supported with fully_sharded=True"
@@ -1551,8 +1555,13 @@ def _fused_moe_lora(
     )
 
     # TMA is not currently compatiple with fully_sharded due to the non-determinism
-    # of token id sorting across ranks.
-    use_tma = supports_tma(device) and not fully_sharded
+    # of token id sorting across ranks. TMA descriptors over the rank dim need
+    # 16-byte aligned strides.
+    use_tma = (
+        supports_tma(device)
+        and not fully_sharded
+        and max_lora_rank * output.element_size() % 16 == 0
+    )
 
     intermediate_cache_shape = (
         num_slices,
