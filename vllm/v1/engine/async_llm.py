@@ -1010,7 +1010,9 @@ class AsyncLLM(EngineClient):
                 draining. Set to ``False`` to preserve cache for faster resume.
 
         """
-        if clear_cache:
+        if clear_cache and self.renderer.can_clear_mm_cache(
+            requests_kept=mode != "abort"
+        ):
             await self.renderer.clear_mm_cache_async()
         await self.engine_core.pause_generation_async(
             mode=mode, clear_cache=clear_cache
@@ -1194,7 +1196,9 @@ class AsyncLLM(EngineClient):
         await self.engine_core.reset_encoder_cache_async()
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
-        if level >= 1:
+        if level >= 1 and self.renderer.can_clear_mm_cache(
+            requests_kept=mode != "abort"
+        ):
             await self.renderer.clear_mm_cache_async()
         await self.engine_core.sleep_async(level, mode)
 
@@ -1202,7 +1206,11 @@ class AsyncLLM(EngineClient):
             self.logger_manager.record_sleep_state(1, level)
 
     async def release_kv_cache_memory(self) -> None:
-        await self.renderer.clear_mm_cache_async()
+        if (
+            self.renderer.can_clear_mm_cache(requests_kept=True)
+            or not await self.engine_core.has_kept_requests_async()
+        ):
+            await self.renderer.clear_mm_cache_async()
         await self.engine_core.release_kv_cache_memory_async()
 
         if self.logger_manager is not None:

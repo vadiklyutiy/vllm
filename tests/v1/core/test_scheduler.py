@@ -2133,6 +2133,27 @@ def test_kv_cache_release_after_keep_pause_preserves_requests():
     assert resumed.num_scheduled_tokens == {running.request_id: running.num_tokens}
 
 
+@pytest.mark.parametrize("mode", ["abort", "keep"])
+def test_has_kept_requests_across_kv_cache_release(mode):
+    """The frontend asks the engine whether queued requests outlive a release."""
+    scheduler = create_scheduler(max_num_seqs=1, enable_prefix_caching=True)
+    for request in create_requests(num_requests=2):
+        scheduler.add_request(request)
+
+    core = object.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.model_executor = Mock(is_sleeping=False)
+    core.mm_receiver_cache = None
+    core.batch_queue = None
+
+    core.pause_scheduler(mode=mode, clear_cache=False)
+    scheduler.schedule()
+
+    assert core.has_kept_requests() is (mode == "keep")
+    core.release_kv_cache_memory()
+    assert core.has_kept_requests() is (mode == "keep")
+
+
 @pytest.mark.parametrize(
     "sleeping_tags",
     [{"weights", "kv_cache"}, {"weights"}, {"kv_cache"}],

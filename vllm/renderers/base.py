@@ -260,6 +260,14 @@ class BaseRenderer(ABC, Generic[_T]):
         if self._mm_cache_stats is not None:
             self._mm_cache_stats.reset = True
 
+    def can_clear_mm_cache(self, *, requests_kept: bool) -> bool:
+        mm_processor_cache = self._mm_processor_cache
+        return not (
+            requests_kept
+            and mm_processor_cache is not None
+            and mm_processor_cache.clear_invalidates_queued_requests
+        )
+
     def _warmup_mm_processor(
         self,
         processor: BaseMultiModalProcessor,

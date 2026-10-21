@@ -72,6 +72,9 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
     - If the item is not in the cache, store the data in shared memory.
     """
 
+    # P1 reads a request's handle only once the request is scheduled.
+    clear_invalidates_queued_requests = True
+
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__()
 

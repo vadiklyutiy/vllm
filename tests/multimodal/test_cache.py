@@ -1099,6 +1099,129 @@ async def test_release_kv_cache_resends_mm_payload(use_async, release_error):
     assert receiver.get_and_update_item(payload, mm_hash) is item
 
 
+def _engine_with_shm_cache(requests_kept: bool = True):
+    """A frontend engine whose renderer uses a small SHM sender cache, and a
+    receiver that reads the same storage."""
+    ctx = build_model_context(
+        "llava-hf/llava-v1.6-mistral-7b-hf",
+        mm_processor_kwargs=None,
+        limit_mm_per_prompt={"image": 1},
+        mm_processor_cache_gb=1,
+    )
+    renderer = renderer_from_config(VllmConfig(model_config=ctx.model_config))
+    vllm_config = _small_shm_vllm_config()
+    sender = ShmObjectStoreSenderCache(vllm_config)
+    receiver = ShmObjectStoreReceiverCache(vllm_config, mp.Lock())
+    renderer._mm_processor_cache = sender
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def has_kept_requests_async():
+        return requests_kept
+
+    engine = SimpleNamespace(
+        renderer=renderer,
+        engine_core=SimpleNamespace(
+            pause_generation_async=noop,
+            sleep_async=noop,
+            sleep=lambda *args: None,
+            release_kv_cache_memory_async=noop,
+            release_kv_cache_memory=lambda: None,
+            has_kept_requests_async=has_kept_requests_async,
+            has_kept_requests=lambda: requests_kept,
+        ),
+        logger_manager=Mock(),
+    )
+    return engine, sender, receiver
+
+
+def _image_feature(data: MultiModalKwargsItem, mm_hash: str) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=data,
+        modality="image",
+        identifier=mm_hash,
+        mm_position=PlaceholderRange(offset=0, length=1),
+        mm_hash=mm_hash,
+    )
+
+
+@pytest.mark.parametrize(
+    "reset",
+    ["pause-keep", "pause-wait", "sleep", "sleep-sync", "release", "release-sync"],
+)
+@pytest.mark.asyncio
+async def test_engine_cache_reset_keeps_shm_handles_valid(reset):
+    """A request kept across an engine cache reset still holds an SHM handle,
+    which P1 resolves only once the request is scheduled."""
+    engine, sender, receiver = _engine_with_shm_cache()
+    item = MultiModalKwargsItem.dummy(1024)
+
+    try:
+        kept_item, _ = sender.get_and_update_item((item, []), "image_A")
+
+        if reset == "pause-keep":
+            await AsyncLLM.pause_generation(engine, mode="keep")
+        elif reset == "pause-wait":
+            await AsyncLLM.pause_generation(engine, mode="wait")
+        elif reset == "sleep":
+            await AsyncLLM.sleep(engine, level=1, mode="keep")
+        elif reset == "sleep-sync":
+            LLMEngine.sleep(engine, level=1, mode="keep")
+        elif reset == "release":
+            await AsyncLLM.release_kv_cache_memory(engine)
+        else:
+            LLMEngine.release_kv_cache_memory(engine)
+
+        sender.get_and_update_item((MultiModalKwargsItem.dummy(2048), []), "image_B")
+
+        kept = _image_feature(kept_item, "image_A")
+        receiver.get_and_update_features([kept])
+        assert kept.data == item
+    finally:
+        receiver._shm_cache.close()
+        sender.close()
+
+
+@pytest.mark.parametrize(
+    "reset", ["pause", "sleep", "sleep-sync", "release", "release-sync"]
+)
+@pytest.mark.asyncio
+async def test_abort_cache_reset_reclaims_unread_shm_items(reset):
+    """A request aborted before it was scheduled never reads its SHM item, so
+    only a reset that no request outlives can reclaim it."""
+    engine, sender, receiver = _engine_with_shm_cache(requests_kept=False)
+    size = 256 * 1024
+
+    try:
+        sender.get_and_update_item((MultiModalKwargsItem.dummy(size), []), "aborted")
+
+        if reset == "pause":
+            await AsyncLLM.pause_generation(engine, mode="abort")
+        elif reset == "sleep":
+            await AsyncLLM.sleep(engine, level=1, mode="abort")
+        elif reset == "sleep-sync":
+            LLMEngine.sleep(engine, level=1, mode="abort")
+        elif reset == "release":
+            await AsyncLLM.sleep(engine, level=0, mode="abort")
+            await AsyncLLM.release_kv_cache_memory(engine)
+        else:
+            LLMEngine.sleep(engine, level=0, mode="abort")
+            LLMEngine.release_kv_cache_memory(engine)
+
+        # Write more than the ring holds; each item is read once scheduled.
+        for i in range(16):
+            mm_hash = f"image_{i}"
+            handle, _ = sender.get_and_update_item(
+                (MultiModalKwargsItem.dummy(size), []), mm_hash
+            )
+            assert handle is not None and "address" in handle
+            receiver.get_and_update_features([_image_feature(handle, mm_hash)])
+    finally:
+        receiver._shm_cache.close()
+        sender.close()
+
+
 _SLEEP_VISION_PROMPT = (
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>"
     "\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"

@@ -314,6 +314,10 @@ class BaseMultiModalProcessorCache(
 ):
     """The required interface for caches on P0."""
 
+    # Whether requests queued in the engine hold handles into this cache, so
+    # that clearing it invalidates them.
+    clear_invalidates_queued_requests: bool = False
+
     @abstractmethod
     def is_cached_item(self, mm_hash: str) -> bool:
         """Check whether a multi-modal item is

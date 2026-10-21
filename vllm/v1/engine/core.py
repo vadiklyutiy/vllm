@@ -1046,6 +1046,10 @@ class EngineCore:
         self._reset_caches()
         self.model_executor.discard(("kv_cache",))
 
+    def has_kept_requests(self) -> bool:
+        """Whether the scheduler still holds any running or waiting request."""
+        return any(self.scheduler.get_request_counts())
+
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
