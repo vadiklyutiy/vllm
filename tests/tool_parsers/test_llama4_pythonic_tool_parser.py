@@ -61,6 +61,14 @@ ESCAPED_STRING_FUNCTION_CALL = FunctionCall(
 PYTHON_TAG_FUNCTION_OUTPUT = (
     "<|python_start|>[get_weather(city='LA', metric='C')]<|python_end|>"
 )
+# A raw newline inside a string argument is invalid Python but unambiguous.
+MULTILINE_STRING_FUNCTION_OUTPUT = (
+    "[write_file(path='a.txt', content='line1\nline2'), get_weather()]"
+)
+MULTILINE_STRING_FUNCTION_CALL = FunctionCall(
+    name="write_file",
+    arguments='{"path": "a.txt", "content": "line1\\nline2"}',
+)
 
 
 @pytest.mark.parametrize("streaming", [True, False])
@@ -199,6 +207,30 @@ TEST_CASES = [
             FunctionCall(name="register_user", arguments='{"name": "Doe", "age": 9}'),
         ],
         id="parallel_calls_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        MULTILINE_STRING_FUNCTION_OUTPUT,
+        [MULTILINE_STRING_FUNCTION_CALL, PARAMETERLESS_FUNCTION_CALL],
+        id="multiline_string_streaming",
+    ),
+    pytest.param(
+        False,
+        MULTILINE_STRING_FUNCTION_OUTPUT,
+        [MULTILINE_STRING_FUNCTION_CALL, PARAMETERLESS_FUNCTION_CALL],
+        id="multiline_string_nonstreaming",
+    ),
+    pytest.param(
+        True,
+        "[write_file(path='a.txt', content=r'''line1\nline2''')]",
+        [MULTILINE_STRING_FUNCTION_CALL],
+        id="raw_multiline_string_streaming",
+    ),
+    pytest.param(
+        False,
+        "[write_file(path='a.txt', content=r'''line1\nline2''')]",
+        [MULTILINE_STRING_FUNCTION_CALL],
+        id="raw_multiline_string_nonstreaming",
     ),
 ]
 
