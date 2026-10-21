@@ -8,6 +8,7 @@ Differences from the reference:
 - `developer` messages are supported and render as user turns.
 - Images arrive as placeholders; deepseek_v41.py flattens content first.
 - Tool namespaces (`ns::name`) are not supported.
+- `reasoning_effort` also accepts the API names `minimal`, `medium` and `xhigh`.
 
 Message normalization and serving controls live in deepseek_v41.py.
 """
@@ -193,7 +194,9 @@ REASONING_EFFORT_TEMPLATE = (
     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    "minimal": 50,
     "low": 50,
+    "medium": 75,
     "high": 75,
     "xhigh": 75,
     "max": 100,

@@ -244,6 +244,8 @@ fn maps_reasoning_effort_to_reference_numeric_budget() {
         (Some(EffortValue::from("xhigh")), 75),
         (Some(EffortValue::from("max")), 100),
         (Some(EffortValue::Number(37.into())), 37),
+        (Some(EffortValue::from("minimal")), 50),
+        (Some(EffortValue::from("medium")), 75),
     ] {
         let mut request = request();
         request.chat_options.reasoning_effort = effort;
@@ -324,6 +326,21 @@ fn rejects_undefined_effort_names_and_invalid_numeric_budgets() {
     for effort in [EffortValue::from("minimal"), EffortValue::from("medium")] {
         let mut request = request();
         request.chat_options.reasoning_effort = Some(effort);
+        let error = DeepSeekV41ChatRenderer::default().render(&request).unwrap_err();
+        assert!(error.is_request_validation_error());
+    }
+}
+
+#[test]
+fn rejects_unknown_effort_name() {
+    let mut from_kwargs = request();
+    from_kwargs
+        .chat_options
+        .template_kwargs
+        .insert("reasoning_effort".into(), json!("extreme"));
+    let mut from_request = request();
+    from_request.chat_options.reasoning_effort = Some(EffortValue::from("extreme"));
+    for request in [from_kwargs, from_request] {
         let error = DeepSeekV41ChatRenderer::default().render(&request).unwrap_err();
         assert!(error.is_request_validation_error());
     }

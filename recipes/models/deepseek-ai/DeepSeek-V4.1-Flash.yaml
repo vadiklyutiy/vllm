@@ -577,8 +577,8 @@ guide: |
   | `reasoning_effort` | `low` (25), `high` (50), `xhigh` (75), `max` (100), **or an integer 1-100** |
 
   The top-level OpenAI `reasoning_effort` field also works, where `"none"` turns
-  thinking off. `"minimal"` and `"medium"` are rejected — they are not part of this
-  model's set.
+  thinking off. As on the DeepSeek API, `"minimal"` maps to `low` and `"medium"` to
+  `high`.
 
   Note that the DeepSeek API maps its `low` / `high` / `max` tiers to 50 / 75 / 100,
   while the open-source prompt encoder (and therefore vLLM) maps `low` / `high` /
