@@ -26,6 +26,7 @@ from tests.kernels.utils import opcheck, stack_and_dev, torch_experts, torch_moe
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import (
     MoEActivation,
+    fused_experts,
     fused_topk,
 )
 from vllm.model_executor.layers.fused_moe.activation import (
@@ -33,8 +34,12 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
     apply_moe_activation_supported,
 )
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_make_prepare_finalize,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
+    FusedMoEQuantConfig,
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
@@ -42,6 +47,8 @@ from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
+from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_use_td_hw_supported,
 )
@@ -499,6 +506,107 @@ def test_fused_shared_expert_alignment(workspace_init):
         )
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
+
+
+class _DeferredInputQuantTritonExperts(TritonExperts):
+    """Quantizes the MoE input in apply(), as with LoRA + DP/EP all2all."""
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize("path", ["modular", "deferred_input_quant", "legacy"])
+@pytest.mark.parametrize(
+    "quant_dtype,dtype",
+    [
+        (current_platform.fp8_dtype(), torch.bfloat16),
+        # int8 dynamic per-tensor quant fails with bf16 activations today.
+        (torch.int8, torch.float32),
+    ],
+)
+def test_per_tensor_act_quant_ignores_skipped_rows(
+    quant_dtype, dtype, path, workspace_init
+):
+    """Rows routed to no expert (topk_id == -1, e.g. CUDA graph padding) must
+    not move the real rows' dynamic per-tensor activation scales: neither via
+    their own hidden states nor via what the previous call left in the MoE
+    workspace. Otherwise a request's output depends on the one before it."""
+    if quant_dtype == current_platform.fp8_dtype() and not (
+        current_platform.supports_fp8()
+    ):
+        pytest.skip("FP8 is not supported on this platform.")
+    set_random_seed(7)
+    m, num_real, n, k, e, topk = 8, 5, 256, 128, 16, 2
+
+    qmax = (
+        torch.iinfo(quant_dtype).max
+        if quant_dtype == torch.int8
+        else torch.finfo(quant_dtype).max
+    )
+
+    def per_tensor_weight(*shape):
+        w = torch.randn(shape, device=DEVICE_TYPE) * qmax / 4
+        return w.clamp(-qmax, qmax).to(quant_dtype)
+
+    w1 = per_tensor_weight(e, 2 * n, k)
+    w2 = per_tensor_weight(e, k, n)
+    w_scale = torch.full((e,), 1 / qmax, device=DEVICE_TYPE)
+    quant_config = FusedMoEQuantConfig.make(
+        quant_dtype, w1_scale=w_scale, w2_scale=w_scale
+    )
+    moe_config = make_dummy_moe_config()
+    experts_cls = (
+        _DeferredInputQuantTritonExperts
+        if path == "deferred_input_quant"
+        else TritonExperts
+    )
+    modular_moe = FusedMoEKernel(
+        maybe_make_prepare_finalize(
+            moe=moe_config,
+            quant_config=quant_config,
+            allow_new_interface=True,
+            use_monolithic=False,
+        ),
+        experts_cls(moe_config, quant_config),
+    )
+
+    a = torch.randn((m, k), device=DEVICE_TYPE, dtype=dtype) / 10
+    score = torch.randn((m, e), device=DEVICE_TYPE, dtype=dtype)
+    topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
+    padded_topk_weights = topk_weights.clone()
+    padded_topk_ids = topk_ids.clone()
+    padded_topk_weights[num_real:] = 0
+    padded_topk_ids[num_real:] = -1
+
+    def moe(hidden_states, topk_weights, topk_ids):
+        if path == "legacy":
+            return fused_experts(
+                hidden_states, w1, w2, topk_weights, topk_ids, quant_config=quant_config
+            )
+        return modular_moe.apply(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=e,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+
+    def real_rows_after(magnitude: float) -> torch.Tensor:
+        moe(a * magnitude, topk_weights, topk_ids)
+        hidden_states = a.clone()
+        hidden_states[num_real:] *= magnitude
+        return moe(hidden_states, padded_topk_weights, padded_topk_ids)[:num_real]
+
+    with set_current_vllm_config(vllm_config):
+        expected = real_rows_after(1.0)
+        actual = real_rows_after(1000.0)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_fused_moe_int64_overflow(workspace_init):

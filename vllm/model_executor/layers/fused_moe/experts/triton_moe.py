@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     moe_kernel_quantize_input,
     swiglu_limit_func,
+    zero_unrouted_rows_inplace,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     is_deep_gemm_e8m0_used,
@@ -296,6 +297,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 self.per_act_token_quant,
                 self.block_shape,
                 quantization_emulation=self.quantization_emulation,
+                topk_ids=topk_ids,
             )
 
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
@@ -518,6 +520,11 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             self.activation(
                 activation, intermediate_cache2, intermediate_cache1.view(-1, N)
             )
+            if a2_scale_is_global:
+                # The alignment drops slots with topk_id == -1 (e.g. CUDA graph
+                # padding), so their rows hold stale workspace data; zero them
+                # to keep them out of the per-tensor amax.
+                zero_unrouted_rows_inplace(intermediate_cache2, topk_ids.view(-1, 1))
 
             qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
                 intermediate_cache2,

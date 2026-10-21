@@ -15,6 +15,7 @@ def _quantize_input(
     a1: torch.Tensor,
     quant_config: FusedMoEQuantConfig,
     defer_input_quant: bool = False,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # Defer input quant to moe kernel for backends (e.g. AITER, FI)
     # which use a single kernel call for quant + experts.
@@ -33,6 +34,7 @@ def _quantize_input(
         is_scale_swizzled=quant_config.is_scale_swizzled,
         is_scale_transposed=quant_config.is_scale_transposed,
         mx_alignment=quant_config.mx_alignment,
+        topk_ids=topk_ids,
     )
 
     return a1q, a1q_scale
@@ -79,7 +81,7 @@ class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
-        a1q, a1q_scale = _quantize_input(a1, quant_config, defer_input_quant)
+        a1q, a1q_scale = _quantize_input(a1, quant_config, defer_input_quant, topk_ids)
 
         return a1q, a1q_scale, None, None, None
 

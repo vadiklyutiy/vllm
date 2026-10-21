@@ -1769,6 +1769,7 @@ def fused_experts_impl(
         quant_dtype=quant_dtype,
         per_act_token_quant=per_channel_quant,
         block_shape=block_shape,
+        topk_ids=topk_ids,
     )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
@@ -1818,6 +1819,7 @@ def fused_experts_impl(
         quant_dtype=quant_dtype,
         per_act_token_quant=per_channel_quant,
         block_shape=block_shape,
+        topk_ids=topk_ids.view(-1, 1),
     )
 
     if expert_map is not None:

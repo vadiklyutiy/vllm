@@ -323,17 +323,67 @@ def _nvfp4_quantize(
     return ops.scaled_fp4_quant(A, A_scale, is_sf_swizzled_layout=is_sf_swizzled_layout)
 
 
+@triton.jit
+def _zero_unrouted_rows_inplace_kernel(
+    a_ptr,
+    topk_ids_ptr,
+    a_row_stride,
+    ids_row_stride,
+    ids_col_stride,
+    num_cols,
+    topk,
+    BLOCK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    k = tl.arange(0, TOPK_BLOCK)
+    ids = tl.load(
+        topk_ids_ptr + row * ids_row_stride + k * ids_col_stride,
+        mask=k < topk,
+        other=-1,
+    )
+    if tl.max(ids, axis=0) >= 0:
+        return
+    offs = tl.arange(0, BLOCK)
+    for start in range(0, num_cols, BLOCK):
+        cols = start + offs
+        tl.store(a_ptr + row * a_row_stride + cols, 0.0, mask=cols < num_cols)
+
+
+def zero_unrouted_rows_inplace(A: torch.Tensor, topk_ids: torch.Tensor) -> None:
+    """Zero in place the rows A[i] whose top-k ids topk_ids[i] are all -1 (e.g.
+    CUDA graph padding), so that they stay out of a dynamic per-tensor amax.
+    Only those rows are written.
+    """
+    topk = topk_ids.size(1)
+    _zero_unrouted_rows_inplace_kernel[(A.size(0),)](
+        A,
+        topk_ids,
+        A.stride(0),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        A.size(1),
+        topk,
+        BLOCK=1024,
+        TOPK_BLOCK=triton.next_power_of_2(topk),
+    )
+
+
 def _fp8_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
     is_scale_transposed: bool = False,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform fp8 quantization on the inputs.  If a block_shape
     is provided, the output will be blocked.
     """
     if block_shape is None:
+        if A_scale is None and not per_act_token and topk_ids is not None:
+            A = A.clone()
+            zero_unrouted_rows_inplace(A, topk_ids)
         # TODO(luka): use QuantFP8 custom op
         #  https://github.com/vllm-project/vllm/issues/20711
         A, A_scale = ops.scaled_fp8_quant(
@@ -356,6 +406,7 @@ def _int8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform int8 quantization on the inputs.  If a block_shape
     is provided, the output will be blocked.
@@ -371,6 +422,9 @@ def _int8_quantize(
             A, A_scale, _ = ops.scaled_int8_quant(A, scale=A_scale)
         elif A_scale is None:
             # Dynamic per-tensor: compute scale then quantize via kernel
+            if topk_ids is not None:
+                A = A.clone()
+                zero_unrouted_rows_inplace(A, topk_ids)
             A_scale = torch.clamp(A.abs().max() / 127.0, min=1e-10)
             A, A_scale, _ = ops.scaled_int8_quant(A, scale=A_scale)
     else:
@@ -471,13 +525,19 @@ def moe_kernel_quantize_input(
     is_scale_transposed: bool = False,
     quantization_emulation: bool = False,
     mx_alignment: int = 0,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if quant_dtype == current_platform.fp8_dtype():
         if quantization_emulation:
             return _fp8_quantize_dequantize(A, A_scale)
         else:
             return _fp8_quantize(
-                A, A_scale, per_act_token_quant, block_shape, is_scale_transposed
+                A,
+                A_scale,
+                per_act_token_quant,
+                block_shape,
+                is_scale_transposed,
+                topk_ids,
             )
     elif quant_dtype == torch.int8:
         if quantization_emulation:
@@ -485,7 +545,7 @@ def moe_kernel_quantize_input(
                 "moe_kernel_quantize_input does not support quant_dtype=torch.int8"
                 " MOE quantization emulation. Please open an issue."
             )
-        return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
+        return _int8_quantize(A, A_scale, per_act_token_quant, block_shape, topk_ids)
     elif quant_dtype == "nvfp4":
         if not quantization_emulation:
             return _nvfp4_quantize(A, A_scale, is_sf_swizzled_layout=is_scale_swizzled)
