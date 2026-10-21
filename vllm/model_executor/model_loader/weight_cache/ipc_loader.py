@@ -6,6 +6,7 @@ daemon via CUDA IPC instead of loading from disk."""
 import dataclasses
 import socket
 import time
+import weakref
 from collections.abc import Callable
 from copy import copy
 from typing import TypeVar
@@ -307,20 +308,35 @@ class IpcModelLoader(BaseModelLoader):
             module = modules.get(module_name)
             if module is None:
                 raise RuntimeError(f"Cached tensor {name} has no matching module")
-            # Replace via registration rather than param.data assignment,
-            # which fails for meta tensors. Entries may also introduce
-            # post-quantization tensors absent from the meta model.
-            module._parameters.pop(leaf, None)
-            module._buffers.pop(leaf, None)
+            placeholder = module._parameters.pop(leaf, None)
+            if placeholder is None:
+                placeholder = module._buffers.pop(leaf, None)
+            obj: torch.Tensor = (
+                nn.Parameter(tensor, requires_grad=False)
+                if is_param and not isinstance(tensor, nn.Parameter)
+                else tensor
+            )
+            # Swap into the meta placeholder so references held outside the
+            # module tree see the cached tensor, as after a disk load
+            # (param.data assignment fails for meta tensors). Placeholders
+            # swap_tensors may refuse (non-leaves, views, weak references,
+            # __slots__) are replaced; the daemon exports views separately.
+            # Aliases keep their canonical object, and entries may introduce
+            # tensors absent from the meta model.
+            if (
+                placeholder is not None
+                and placeholder.is_meta
+                and placeholder.is_leaf
+                and placeholder._use_count() == 1
+                and not weakref.getweakrefs(placeholder)
+                and not hasattr(type(placeholder), "__slots__")
+                and name not in state.aliases
+            ):
+                torch.utils.swap_tensors(placeholder, obj)
+                obj = placeholder
             if is_param:
-                obj: torch.Tensor = (
-                    tensor
-                    if isinstance(tensor, nn.Parameter)
-                    else nn.Parameter(tensor, requires_grad=False)
-                )
                 module.register_parameter(leaf, obj)
             else:
-                obj = tensor
                 module.register_buffer(leaf, obj)
             registered[name] = obj
 

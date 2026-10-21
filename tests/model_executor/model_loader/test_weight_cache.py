@@ -641,3 +641,77 @@ def test_ipc_loader_copy_mode_reports_no_external_weight_memory():
     )
     loader = IpcModelLoader(copy_mode)
     assert loader.get_external_weight_memory(None) == 0
+
+
+def test_ipc_loader_fills_placeholders_referenced_outside_the_model():
+    """References to a parameter held outside the module tree (e.g. a MoE
+    router's e_score_correction_bias) must see the cached data, not the meta
+    placeholder. Placeholders that cannot or must not be swapped still load."""
+    import weakref
+
+    import torch
+
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.weight_cache.ipc_loader import (
+        IpcModelLoader,
+    )
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        TensorEntry,
+        WeightCacheState,
+    )
+
+    class SlottedParameter(torch.nn.Parameter):
+        __slots__ = ("tag",)
+
+    with torch.device("meta"):
+        model = torch.nn.Module()
+        model.gate = torch.nn.Module()
+        model.gate.bias = torch.nn.Parameter(torch.empty(4))
+        # Tied only in the daemon's model: the alias has its own placeholder.
+        model.experts = torch.nn.Module()
+        model.experts.bias = torch.nn.Parameter(torch.empty(4))
+        # Tied only in this model: the daemon exports both names.
+        model.head = torch.nn.Module()
+        model.head.bias = model.gate.bias
+        # Like MambaMixer2's conv1d.weight: a view of it is a buffer.
+        model.conv = torch.nn.Module()
+        model.conv.weight = torch.nn.Parameter(torch.empty(4, 1, 2))
+        model.conv.register_buffer("view", model.conv.weight.view(4, 2))
+        model.norm = torch.nn.Module()
+        model.norm.weight = torch.nn.Parameter(torch.empty(4))
+        model.norm.weight_ref = weakref.ref(model.norm.weight)
+        model.scale = torch.nn.Module()
+        model.scale.weight = SlottedParameter(torch.empty(4), requires_grad=False)
+        # A non-leaf buffer: retain_grad() keeps a C++ weak reference to it.
+        model.act = torch.nn.Module()
+        model.act.register_buffer("scale", torch.empty(4, requires_grad=True) * 2)
+        model.act.scale.retain_grad()
+    router_bias = model.gate.bias
+
+    bias = torch.arange(4.0)
+    conv_weight = torch.arange(8.0).view(4, 1, 2)
+    state = WeightCacheState(
+        entries={
+            "gate.bias": TensorEntry(kind="param", cpu_tensor=bias),
+            "head.bias": TensorEntry(kind="param", cpu_tensor=torch.ones(4)),
+            "conv.weight": TensorEntry(kind="param", cpu_tensor=conv_weight),
+            "conv.view": TensorEntry(kind="buffer", cpu_tensor=conv_weight.view(4, 2)),
+            "norm.weight": TensorEntry(kind="param", cpu_tensor=torch.ones(4)),
+            "scale.weight": TensorEntry(kind="param", cpu_tensor=torch.ones(4)),
+            "act.scale": TensorEntry(kind="buffer", cpu_tensor=torch.ones(4)),
+        },
+        aliases={"experts.bias": "gate.bias"},
+        attrs={},
+    )
+    IpcModelLoader(LoadConfig(load_format="ipc_cache"))._apply_entries(
+        model, state, device_index=0
+    )
+
+    torch.testing.assert_close(router_bias, bias)
+    assert model.gate.bias is router_bias and model.experts.bias is router_bias
+    torch.testing.assert_close(model.head.bias, torch.ones(4))
+    torch.testing.assert_close(model.conv.weight, conv_weight)
+    torch.testing.assert_close(model.conv.view, conv_weight.view(4, 2))
+    torch.testing.assert_close(model.norm.weight, torch.ones(4))
+    torch.testing.assert_close(model.scale.weight, torch.ones(4))
+    torch.testing.assert_close(model.act.scale, torch.ones(4))
