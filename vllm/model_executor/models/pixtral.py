@@ -268,8 +268,9 @@ class PixtralMultiModalProcessor(BaseMultiModalProcessor[PixtralProcessingInfo])
 
         return ProcessorInputs(prompt=dummy_tokens, mm_data_items=dummy_mm_items)
 
-    # The tokens are already inserted by the chat template,
-    # so we just double check that they exist
+    # The chat template already inserted the image tokens, but sized them from
+    # mistral-common's own decoding of each image, which can differ from the
+    # image processed here (e.g. EXIF orientation), so we replace them.
     def _maybe_apply_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
@@ -279,13 +280,30 @@ class PixtralMultiModalProcessor(BaseMultiModalProcessor[PixtralProcessingInfo])
         self._validate_mm_kwargs(mm_res.kwargs, mm_item_counts)
         self._validate_mm_updates(mm_res.prompt_updates, mm_item_counts)
 
+        processor = self.info.get_hf_processor()
+        prompt_ids = list[int]()
+        prev_end_idx = 0
+        for (update,) in mm_res.prompt_updates.get("image", []):
+            try:
+                start_idx = mm_res.prompt_ids.index(
+                    processor.image_token_id, prev_end_idx
+                )
+                end_idx = mm_res.prompt_ids.index(processor.image_end_id, start_idx)
+            except ValueError:
+                # No more image runs; images without one fail the check below
+                break
+            prompt_ids.extend(mm_res.prompt_ids[prev_end_idx:start_idx])
+            prompt_ids.extend(update.content.full)
+            prev_end_idx = end_idx + 1
+        prompt_ids.extend(mm_res.prompt_ids[prev_end_idx:])
+
         mm_placeholders = self._find_mm_placeholders(
-            mm_res.prompt_ids,
+            prompt_ids,
             mm_res.prompt_updates,
         )
         self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
 
-        return mm_res.prompt_ids, mm_placeholders
+        return prompt_ids, mm_placeholders
 
     def _get_mm_fields_config(
         self,
