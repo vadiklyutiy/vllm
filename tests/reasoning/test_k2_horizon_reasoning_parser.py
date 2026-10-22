@@ -155,6 +155,92 @@ def test_character_split_reasoning_stream(reasoning: str):
     assert "".join(content_parts) == "answer"
 
 
+OTHER_EFFORT_END_TOKENS = [
+    (effort, end_token)
+    for effort in EFFORT_TOKENS
+    for _, end_token in EFFORT_TOKENS.values()
+    if end_token != EFFORT_TOKENS[effort][1]
+]
+
+
+@pytest.mark.parametrize(("effort", "end_token"), OTHER_EFFORT_END_TOKENS)
+def test_other_effort_end_token_ends_reasoning(effort: str, end_token: str):
+    """The model may close e.g. medium reasoning with </ifm|think>."""
+    tokenizer = _k2_tokenizer()
+    vocab = tokenizer.get_vocab()
+    end_token_id = vocab[end_token]
+    parser = K2HorizonReasoningParser(
+        tokenizer,
+        chat_template_kwargs={"reasoning_effort": effort},
+    )
+
+    assert parser.extract_reasoning(f"plan{end_token}answer", _request()) == (
+        "plan",
+        "answer",
+    )
+    assert parser.is_reasoning_end([parser.start_token_id, end_token_id])
+    assert parser.is_reasoning_end_streaming([], [end_token_id])
+    assert parser.extract_content_ids([vocab["p"], end_token_id, vocab["a"]]) == [
+        vocab["a"]
+    ]
+
+
+@pytest.mark.parametrize(("effort", "end_token"), OTHER_EFFORT_END_TOKENS)
+def test_other_effort_end_token_ends_reasoning_stream(effort: str, end_token: str):
+    parser = K2HorizonReasoningParser(
+        _k2_tokenizer(),
+        chat_template_kwargs={"reasoning_effort": effort},
+    )
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+
+    for char in f"plan{end_token}answer":
+        delta = parser.extract_reasoning_streaming(
+            previous_text="",
+            current_text="",
+            delta_text=char,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+        )
+        if delta is not None:
+            if delta.reasoning is not None:
+                reasoning_parts.append(delta.reasoning)
+            if delta.content is not None:
+                content_parts.append(delta.content)
+
+    assert "".join(reasoning_parts) == "plan"
+    assert "".join(content_parts) == "answer"
+
+
+@pytest.mark.parametrize("end_token", [end for _, end in EFFORT_TOKENS.values()])
+@pytest.mark.parametrize("effort", EFFORT_TOKENS)
+def test_end_token_inside_tool_calls_is_content(effort: str, end_token: str):
+    """When reasoning ends implicitly at tool calls, the earliest boundary wins."""
+    tokenizer = _k2_tokenizer()
+    vocab = tokenizer.get_vocab()
+    parser = K2HorizonReasoningParser(
+        tokenizer,
+        chat_template_kwargs={"reasoning_effort": effort},
+    )
+    calls = f"{TOOL_CALLS_START}x{end_token}y"
+
+    assert parser.extract_reasoning(f"plan{calls}", _request()) == ("plan", calls)
+    assert parser.extract_content_ids(
+        [vocab["p"], vocab[TOOL_CALLS_START], vocab[end_token], vocab["y"]]
+    ) == [vocab[TOOL_CALLS_START], vocab[end_token], vocab["y"]]
+    delta = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text="",
+        delta_text=f"plan{calls}",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+    )
+    assert delta is not None
+    assert (delta.reasoning, delta.content) == ("plan", calls)
+
+
 def test_latest_boundary_controls_reasoning_state():
     tokenizer = _k2_tokenizer()
     parser = K2HorizonReasoningParser(tokenizer)

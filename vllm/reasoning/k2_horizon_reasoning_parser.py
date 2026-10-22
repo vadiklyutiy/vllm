@@ -3,6 +3,8 @@
 
 from collections.abc import Iterable, Sequence
 
+import regex as re
+
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
@@ -34,6 +36,16 @@ class K2HorizonReasoningParser(DeepSeekR1ReasoningParser):
         self._start_token, self._end_token = self._EFFORT_TOKENS[effort]
         super().__init__(tokenizer, *args, **kwargs)
         self._tool_calls_start_id = self.vocab.get(self._TOOL_CALLS_START)
+        # The model may close its reasoning with the end tag of another effort,
+        # e.g. medium and low often end with </ifm|think>.
+        self._end_tokens = (
+            self.end_token,
+            *(end for _, end in self._EFFORT_TOKENS.values()),
+        )
+        self._end_pattern = re.compile("|".join(map(re.escape, self._end_tokens)))
+        self._end_token_ids = {
+            self.vocab[end] for end in self._end_tokens if end in self.vocab
+        }
         self._stream_buffer = ""
         self._stream_at_start = True
         self._stream_finished = False
@@ -51,11 +63,13 @@ class K2HorizonReasoningParser(DeepSeekR1ReasoningParser):
 
     def _split_model_output(self, model_output: str) -> tuple[str, str | None]:
         output = self._without_generated_start(model_output)
-        if self.end_token in output:
-            reasoning, _, content = output.partition(self.end_token)
-            return reasoning, content or None
-
         tool_start = output.find(self._TOOL_CALLS_START)
+        end = self._end_pattern.search(
+            output, 0, tool_start if tool_start != -1 else len(output)
+        )
+        if end is not None:
+            return output[: end.start()], output[end.end() :] or None
+
         if tool_start != -1:
             return output[:tool_start], output[tool_start:]
 
@@ -73,7 +87,7 @@ class K2HorizonReasoningParser(DeepSeekR1ReasoningParser):
         for token_id in reversed(input_ids):
             if token_id == self.start_token_id:
                 return False
-            if token_id == self.end_token_id or token_id == self._tool_calls_start_id:
+            if token_id in self._end_token_ids or token_id == self._tool_calls_start_id:
                 return True
         return False
 
@@ -83,18 +97,14 @@ class K2HorizonReasoningParser(DeepSeekR1ReasoningParser):
         delta_ids: Iterable[int],
     ) -> bool:
         del input_ids
-        return self._stream_finished or super().is_reasoning_end_streaming(
-            (), delta_ids
-        )
+        return self._stream_finished or not self._end_token_ids.isdisjoint(delta_ids)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        if self.end_token_id in input_ids:
-            return input_ids[input_ids.index(self.end_token_id) + 1 :]
-        if (
-            self._tool_calls_start_id is not None
-            and self._tool_calls_start_id in input_ids
-        ):
-            return input_ids[input_ids.index(self._tool_calls_start_id) :]
+        for index, token_id in enumerate(input_ids):
+            if token_id in self._end_token_ids:
+                return input_ids[index + 1 :]
+            if token_id == self._tool_calls_start_id:
+                return input_ids[index:]
         return input_ids if self._stream_finished else []
 
     def _strip_stream_start(self) -> bool:
@@ -133,18 +143,22 @@ class K2HorizonReasoningParser(DeepSeekR1ReasoningParser):
         if not self._strip_stream_start():
             return None
 
-        explicit_end = self._stream_buffer.find(self.end_token)
         tool_start = self._stream_buffer.find(self._TOOL_CALLS_START)
-        if explicit_end != -1:
-            reasoning = self._stream_buffer[:explicit_end]
-            content = self._stream_buffer[explicit_end + len(self.end_token) :]
+        explicit_end = self._end_pattern.search(
+            self._stream_buffer,
+            0,
+            tool_start if tool_start != -1 else len(self._stream_buffer),
+        )
+        if explicit_end is not None:
+            reasoning = self._stream_buffer[: explicit_end.start()]
+            content = self._stream_buffer[explicit_end.end() :]
         elif tool_start != -1:
             reasoning = self._stream_buffer[:tool_start]
             content = self._stream_buffer[tool_start:]
         else:
             overlap = max(
-                partial_tag_overlap(self._stream_buffer, self.end_token),
-                partial_tag_overlap(self._stream_buffer, self._TOOL_CALLS_START),
+                partial_tag_overlap(self._stream_buffer, tag)
+                for tag in (*self._end_tokens, self._TOOL_CALLS_START)
             )
             sendable_end = len(self._stream_buffer) - overlap
             reasoning = self._stream_buffer[:sendable_end]
