@@ -124,6 +124,11 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def implicit_reasoning_end_token_ids(self) -> frozenset[int]:
         return self._parser_engine.implicit_reasoning_end_token_ids
 
+    @property
+    def parser_state(self) -> ParserState:
+        """Current parsing state; before any output is fed, where it starts."""
+        return self._parser_engine._engine.state
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

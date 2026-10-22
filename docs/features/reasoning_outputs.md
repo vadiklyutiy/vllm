@@ -422,6 +422,7 @@ assert "reasoning" not in types
 ## Limitations
 
 - The reasoning content is only available for online serving's chat completion endpoint (`/v1/chat/completions`), Anthropic Messages API (`/v1/messages`) and the Responses API (`/v1/responses`).
+- On these endpoints, stop strings (`stop`, `stop_sequences`) skip the reasoning and match only the answer when the reasoning parser is built on the parser engine in `vllm/parser/` (for example `deepseek_v4`, `deepseek_v41`, `qwen3`), its reasoning ends on a special token, and the output starts in reasoning. With other reasoning parsers, stop strings also match the reasoning text.
 
 ## How to support a new reasoning model
 

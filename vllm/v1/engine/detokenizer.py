@@ -9,6 +9,9 @@ from tokenizers import Tokenizer
 from transformers import TokenizersBackend
 
 from vllm.logger import init_logger
+from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
+from vllm.parser.engine.parser_engine_config import ParserState
+from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import (
     convert_prompt_ids_to_tokens,
@@ -51,6 +54,7 @@ class IncrementalDetokenizer:
         cls,
         tokenizer: TokenizerLike | None,
         request: EngineCoreRequest,
+        reasoning_parser: str = "",
     ) -> "IncrementalDetokenizer":
         assert request.sampling_params is not None
 
@@ -58,16 +62,33 @@ class IncrementalDetokenizer:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
 
+        # Stop strings must not match the reasoning that the frontend splits
+        # from the answer. Only engine-based parsers can tell where it ends
+        # from token ids alone, without the serving layer's stream state.
+        reasoner = None
+        if (
+            reasoning_parser
+            and request.reasoning_parser_kwargs is not None
+            and request.sampling_params.stop
+        ):
+            reasoner_cls = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+            if issubclass(reasoner_cls, ParserEngineReasoningAdapter):
+                reasoner = reasoner_cls(tokenizer, **request.reasoning_parser_kwargs)
+
         if uses_fast_detokenizer(tokenizer):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            return FastIncrementalDetokenizer(tokenizer, request)
+            return FastIncrementalDetokenizer(tokenizer, request, reasoner)
 
         # Fall back to slow python-based incremental detokenization.
-        return SlowIncrementalDetokenizer(tokenizer, request)
+        return SlowIncrementalDetokenizer(tokenizer, request, reasoner)
 
 
 class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
-    def __init__(self, request: EngineCoreRequest):
+    def __init__(
+        self,
+        request: EngineCoreRequest,
+        reasoner: ParserEngineReasoningAdapter | None = None,
+    ):
         super().__init__()
 
         # Stop strings
@@ -93,6 +114,22 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         # Generation data
         self.output_text = ""
 
+        # Offset in output_text where the answer starts and stop strings may
+        # match, or None while the output is still reasoning.
+        self.stop_check_start: int | None = 0
+        self.reasoner: ParserEngineReasoningAdapter | None = None
+        prompt_token_ids = request.prompt_token_ids or []
+        if (
+            reasoner is not None
+            and reasoner.reasoning_end_token_ids
+            and not reasoner.is_reasoning_end(prompt_token_ids)
+        ):
+            # Start in the state the frontend's reasoning split starts in.
+            reasoner.adjust_initial_state_from_prompt(prompt_token_ids)
+            if reasoner.parser_state is ParserState.REASONING:
+                self.stop_check_start = None
+                self.reasoner = reasoner
+
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         """Update RequestState for the request_id by:
             1) Detokenize the new token ids incrementally.
@@ -103,6 +140,15 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         if not new_token_ids:
             # Skip detokenization if no new token ids.
             return None
+
+        # Index of the first answer token in new_token_ids if reasoning ends here.
+        answer_start = None
+        if self.reasoner is not None:
+            end = self.reasoner.find_reasoning_end(new_token_ids)
+            if end is not None and end.offset < len(new_token_ids):
+                # An implicit end token (e.g. a tool-call start) is content.
+                answer_start = end.offset if end.implicit else end.offset + 1
+                self.reasoner = None
 
         if stop_terminated and not self.include_stop_str_in_output:
             # If stop-terminated, exclude last token from detokenization
@@ -129,9 +175,17 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             if token_offsets is not None:
                 token_offsets.append(len(self.output_text))
 
+        if answer_start is not None:
+            assert token_offsets is not None
+            self.stop_check_start = token_offsets[answer_start]
+
         # 2) Evaluate stop strings.
         stop_string = None
-        if token_offsets is not None and self.num_output_tokens() > self.min_tokens:
+        if (
+            token_offsets is not None
+            and self.stop_check_start is not None
+            and self.num_output_tokens() > self.min_tokens
+        ):
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             stop_check_offset = token_offsets[max(self.min_tokens - num_prev_tokens, 0)]
             stop = check_stop_strings(
@@ -139,6 +193,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
                 new_char_count=len(self.output_text) - stop_check_offset,
                 stop=self.stop,
                 include_in_output=self.include_stop_str_in_output,
+                start=self.stop_check_start,
             )
             if stop is not None:
                 stop_string, truncate_to = stop
@@ -177,8 +232,13 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
 
 class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
-    def __init__(self, tokenizer: TokenizersBackend, request: EngineCoreRequest):
-        super().__init__(request)
+    def __init__(
+        self,
+        tokenizer: TokenizersBackend,
+        request: EngineCoreRequest,
+        reasoner: ParserEngineReasoningAdapter | None = None,
+    ):
+        super().__init__(request, reasoner)
 
         sampling_params = request.sampling_params
         assert sampling_params is not None
@@ -260,8 +320,13 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
 
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
-    def __init__(self, tokenizer: TokenizerLike, request: EngineCoreRequest):
-        super().__init__(request)
+    def __init__(
+        self,
+        tokenizer: TokenizerLike,
+        request: EngineCoreRequest,
+        reasoner: ParserEngineReasoningAdapter | None = None,
+    ):
+        super().__init__(request, reasoner)
 
         self.tokenizer = tokenizer
         params = request.sampling_params
@@ -323,9 +388,11 @@ def check_stop_strings(
     new_char_count: int,
     stop: list[str],
     include_in_output: bool,
+    start: int = 0,
 ) -> tuple[str, int] | None:
     """Check if any stop strings are matched and truncate sequence
-    output text accordingly.
+    output text accordingly. Only stop strings that begin at or after
+    `start` in output_text are matched.
 
     Returns tuple (stop_string, offset) if matched or else None.
 
@@ -348,7 +415,10 @@ def check_stop_strings(
     for stop_str in stop:
         stop_string_len = len(stop_str)
         # Avoid searching already-searched text.
-        stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)
+        stop_index = output_text.find(
+            stop_str,
+            max(start, len(output_text) + 1 - new_char_count - stop_string_len),
+        )
         if stop_index == -1:
             continue
 

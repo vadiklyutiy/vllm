@@ -31,7 +31,7 @@ from vllm.outputs import (
     WeightVersionSpan,
 )
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers import TokenizerLike, get_tokenizer
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -1100,6 +1100,148 @@ def test_stop_string(
 
     assert output_processor.get_num_unfinished_requests() == 0
     assert not output_processor.has_unfinished_requests()
+
+
+def _generate_until_stop_string(
+    tokenizer: TokenizerLike,
+    reasoning_parser: str,
+    prompt: str,
+    output: str,
+    reasoning_parser_kwargs: dict | None,
+    tokens_per_step: int = 1,
+    stop: str = "</block>",
+) -> CompletionOutput:
+    output_token_ids = tokenizer.encode(output, add_special_tokens=False)
+    output_processor = OutputProcessor(
+        tokenizer, log_stats=False, reasoning_parser=reasoning_parser
+    )
+    request = EngineCoreRequest(
+        request_id="request-0-int",
+        external_req_id="request-0",
+        prompt_token_ids=tokenizer.encode(prompt, add_special_tokens=False),
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(
+            skip_special_tokens=False,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+            stop=[stop],
+        ),
+        pooling_params=None,
+        reasoning_parser_kwargs=reasoning_parser_kwargs,
+    )
+    output_processor.add_request(request, None)
+
+    for start in range(0, len(output_token_ids), tokens_per_step):
+        engine_core_output = EngineCoreOutput(
+            request_id=request.request_id,
+            new_token_ids=output_token_ids[start : start + tokens_per_step],
+        )
+        request_outputs = output_processor.process_outputs(
+            [engine_core_output]
+        ).request_outputs
+        if request_outputs:
+            return request_outputs[0].outputs[0]
+    pytest.fail("No stop string matched.")
+
+
+@pytest.mark.parametrize("tokens_per_step", [1, 64])
+def test_stop_string_not_matched_in_reasoning(tokens_per_step: int):
+    """Stop strings apply to the answer, not to the reasoning before it.
+    See https://github.com/vllm-project/vllm/issues/62085."""
+    output = _generate_until_stop_string(
+        get_tokenizer("Qwen/Qwen3-0.6B"),
+        "qwen3",
+        prompt="<|im_start|>assistant\n<think>\n",
+        output="Output <block>no</block>.</think>\n\n<block>no</block> Done.",
+        reasoning_parser_kwargs={"chat_template_kwargs": {}},
+        tokens_per_step=tokens_per_step,
+    )
+    assert output.text == "Output <block>no</block>.</think>\n\n<block>no"
+    assert output.stop_reason == "</block>"
+
+
+def test_stop_string_matched_at_tool_call_ending_reasoning():
+    """A tool-call start that ends reasoning is part of the answer."""
+    output = _generate_until_stop_string(
+        get_tokenizer("Qwen/Qwen3-0.6B"),
+        "qwen3",
+        prompt="<|im_start|>assistant\n<think>\n",
+        output="Call f.<tool_call>\n<function=f>\n</function>\n</tool_call>",
+        reasoning_parser_kwargs={"chat_template_kwargs": {}},
+        stop="<tool_call>",
+    )
+    assert output.text == "Call f."
+    assert output.stop_reason == "<tool_call>"
+
+
+def test_stop_string_not_matched_in_reasoning_opened_by_prompt():
+    """Gemma 4 starts in content, but a prompt that ends inside an open
+    thought channel (after a tool response) starts the output in reasoning."""
+    output = _generate_until_stop_string(
+        get_tokenizer("google/gemma-4-E2B-it"),
+        "gemma4",
+        prompt="<|turn>model\n<|channel>thought\n",
+        output="Output <block>no</block>.<channel|><block>no</block> Done.",
+        reasoning_parser_kwargs={"chat_template_kwargs": {"enable_thinking": True}},
+    )
+    assert output.text == "Output <block>no</block>.<channel|><block>no"
+    assert output.stop_reason == "</block>"
+
+
+@pytest.mark.parametrize(
+    "tokenizer_name,tokenizer_kwargs,reasoning_parser,reasoning_parser_kwargs,output",
+    [
+        # No reasoning split (e.g. completions): the whole text is the answer.
+        pytest.param(
+            "Qwen/Qwen3-0.6B",
+            {},
+            "qwen3",
+            None,
+            "<block>no</block>.</think>",
+            id="no_reasoning_split",
+        ),
+        # The output starts in content: an answer without [THINK].
+        pytest.param(
+            "mistralai/Magistral-Small-2509",
+            {"tokenizer_mode": "mistral"},
+            "mistral",
+            {"chat_template_kwargs": {}},
+            "<block>no</block> Done.",
+            id="mistral_without_think",
+        ),
+        # A legacy parser that knows where reasoning ends only from its own
+        # streaming state.
+        pytest.param(
+            "tencent/Hunyuan-A13B-Instruct",
+            {"trust_remote_code": True},
+            "hunyuan_a13b",
+            {"chat_template_kwargs": {}},
+            "<think>\nok\n</think>\n<answer>\n<block>no</block>\n</answer>",
+            id="hunyuan_a13b",
+        ),
+    ],
+)
+def test_stop_string_matched_where_reasoning_is_not_tracked(
+    tokenizer_name: str,
+    tokenizer_kwargs: dict,
+    reasoning_parser: str,
+    reasoning_parser_kwargs: dict | None,
+    output: str,
+):
+    """Stop strings are only held back while the output is known to be
+    reasoning, so they never stay off for an answer."""
+    completion_output = _generate_until_stop_string(
+        get_tokenizer(tokenizer_name, **tokenizer_kwargs),
+        reasoning_parser,
+        prompt="hi",
+        output=output,
+        reasoning_parser_kwargs=reasoning_parser_kwargs,
+    )
+    assert completion_output.text == output[: output.index("</block>")]
+    assert completion_output.stop_reason == "</block>"
 
 
 def test_iteration_stats(dummy_test_vectors):

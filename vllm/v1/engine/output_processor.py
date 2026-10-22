@@ -281,6 +281,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        reasoning_parser: str = "",
     ) -> "RequestState":
         remote_prefill_cached_tokens = None
         if sampling_params := request.sampling_params:
@@ -307,6 +308,7 @@ class RequestState:
             detokenizer = IncrementalDetokenizer.from_new_request(
                 tokenizer=tokenizer,
                 request=request,
+                reasoning_parser=reasoning_parser,
             )
             max_tokens_param = sampling_params.max_tokens
             top_p = sampling_params.top_p
@@ -559,10 +561,12 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        reasoning_parser: str = "",
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
+        self.reasoning_parser = reasoning_parser
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
@@ -683,6 +687,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            reasoning_parser=self.reasoning_parser,
         )
         self.request_states[request_id] = req_state
         if parent_req:

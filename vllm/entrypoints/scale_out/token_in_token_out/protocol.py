@@ -150,8 +150,8 @@ class MultiModalFeatures(BaseModel):
 
 
 class ReasoningParserKwargs(BaseModel):
-    """Kwargs for the engine-side reasoning parser that gates structured
-    outputs. Typed so clients cannot pass arbitrary constructor kwargs."""
+    """Kwargs for the reasoning parser that gates structured outputs and
+    stop strings. Typed so clients cannot pass arbitrary constructor kwargs."""
 
     model_config = ConfigDict(extra="forbid")
 

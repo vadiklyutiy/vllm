@@ -74,3 +74,24 @@ def test_no_match_and_empty_inputs_return_none():
     assert check_stop_strings("hello", 5, ["zzz"], include_in_output=False) is None
     assert check_stop_strings("hello", 0, ["h"], include_in_output=False) is None
     assert check_stop_strings("hello", 5, [], include_in_output=False) is None
+
+
+def test_stop_beginning_before_start_not_matched():
+    # Text before `start` (e.g. reasoning) cannot hold any part of a match.
+    text = "think.\n\nanswer.\n\n"
+    assert check_stop_strings(
+        text, len(text), [".\n\n"], include_in_output=False, start=len("think.")
+    ) == (".\n\n", 14)
+
+    # Not even when the stop string spans from before `start` into the new text.
+    text = "think.\n" + "\nanswer"
+    assert (
+        check_stop_strings(
+            text,
+            len("\nanswer"),
+            ["\n\n"],
+            include_in_output=False,
+            start=len("think.\n"),
+        )
+        is None
+    )
