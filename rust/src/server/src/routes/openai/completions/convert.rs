@@ -5,8 +5,8 @@ use thiserror_ext::AsReport as _;
 use vllm_text::tokenizer::Tokenizer;
 use vllm_text::{Prompt, SamplingParams, TextDecodeOptions, TextRequest};
 
-use super::types::CompletionRequest;
-use crate::error::{ApiError, text_submit_error};
+use super::types::{CompletionPrompt, CompletionRequest};
+use crate::error::{ApiError, bail_invalid_request, text_submit_error};
 use crate::lora::LoraModelResolution;
 use crate::routes::openai::completions::validate;
 use crate::routes::openai::utils::resolve_generation_prompt_truncation;
@@ -20,7 +20,8 @@ use crate::utils::{
 /// every SSE chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PreparedRequest {
-    /// Stable OpenAI-style request ID, reused as the external text request ID.
+    /// Stable OpenAI-style response ID. A single prompt reuses it as the
+    /// external text request ID; a batch adds `-{index}` per prompt.
     pub request_id: String,
     /// Public model ID echoed back to the client.
     pub response_model: String,
@@ -50,8 +51,47 @@ pub(super) struct ResponseOptions {
     pub return_tokens_as_token_ids: bool,
 }
 
-/// Validate and lower one OpenAI completions request into the internal
-/// text-generation format.
+/// Validate and lower one OpenAI completions request into one prepared request
+/// per prompt, in prompt order. The result is never empty.
+///
+/// Like Python vLLM, the prompts of a batch share the response ID and get the
+/// text request IDs `{request_id}-{index}`.
+pub(super) fn prepare_completion_requests(
+    mut request: CompletionRequest,
+    lora_resolution: &LoraModelResolution,
+    ctx: ResolvedRequestContext,
+    tokenizer: &dyn Tokenizer,
+) -> Result<Vec<PreparedRequest>, ApiError> {
+    let prompts = match &mut request.prompt {
+        CompletionPrompt::Batch(prompts) if !prompts.is_empty() => std::mem::take(prompts),
+        _ => {
+            return Ok(vec![prepare_completion_request(
+                request,
+                lora_resolution,
+                ctx,
+                tokenizer,
+            )?]);
+        }
+    };
+
+    prompts
+        .into_iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let request = CompletionRequest {
+                prompt: CompletionPrompt::Single(prompt),
+                ..request.clone()
+            };
+            let mut prepared =
+                prepare_completion_request(request, lora_resolution, ctx.clone(), tokenizer)?;
+            prepared.text_request.request_id = format!("{}-{index}", prepared.request_id);
+            Ok(prepared)
+        })
+        .collect()
+}
+
+/// Validate and lower one OpenAI completions request with a single prompt into
+/// the internal text-generation format.
 ///
 /// `lora_resolution.model_names` must be non-empty; the first entry is used as
 /// the base `model` field in responses when no LoRA adapter is selected.
@@ -62,6 +102,9 @@ pub(super) fn prepare_completion_request(
     tokenizer: &dyn Tokenizer,
 ) -> Result<PreparedRequest, ApiError> {
     validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+    let CompletionPrompt::Single(prompt) = &request.prompt else {
+        bail_invalid_request!(param = "prompt", "expected a single prompt");
+    };
 
     let prompt_truncation = resolve_generation_prompt_truncation(
         request.truncate_prompt_tokens,
@@ -99,7 +142,7 @@ pub(super) fn prepare_completion_request(
     } else {
         request.max_tokens
     };
-    let echo = completion_echo_text(&request, tokenizer)?;
+    let echo = completion_echo_text(&request, prompt, tokenizer)?;
     let logprob_token_ids = request.logprob_token_ids.filter(|ids| !ids.is_empty());
     let logprobs = if logprob_token_ids.is_some() {
         None
@@ -117,7 +160,7 @@ pub(super) fn prepare_completion_request(
 
     let text_request = TextRequest {
         request_id: request_id.clone(),
-        prompt: request.prompt,
+        prompt: prompt.clone(),
         mm_features: None,
         sampling_params: SamplingParams {
             temperature: request.temperature,
@@ -191,13 +234,14 @@ pub(super) fn prepare_completion_request(
 
 fn completion_echo_text(
     request: &CompletionRequest,
+    prompt: &Prompt,
     tokenizer: &dyn Tokenizer,
 ) -> Result<Option<String>, ApiError> {
     if !request.echo {
         return Ok(None);
     }
 
-    match &request.prompt {
+    match prompt {
         Prompt::Text(prompt) => Ok(Some(prompt.clone())),
         Prompt::TokenIds(token_ids) if request.return_token_ids.unwrap_or(false) => {
             Ok(Some(String::new()))
@@ -226,9 +270,9 @@ mod tests {
     use vllm_text::{Prompt, PromptTruncation, PromptTruncationLimit, TruncationSide};
     use vllm_tokenizer::test_utils::TestTokenizer;
 
-    use super::prepare_completion_request;
+    use super::{prepare_completion_request, prepare_completion_requests};
     use crate::lora::LoraModelResolution;
-    use crate::routes::openai::completions::types::CompletionRequest;
+    use crate::routes::openai::completions::types::{CompletionPrompt, CompletionRequest};
     use crate::routes::openai::utils::types::Normalizable;
     use crate::utils::{ResolvedRequestContext, resolve_request_context};
 
@@ -306,6 +350,105 @@ mod tests {
         assert_eq!(request.prompt, Prompt::TokenIds(vec![11, 22, 33]));
         assert_eq!(request.max_tokens, Some(7));
         assert!(request.ignore_eos);
+    }
+
+    #[test]
+    fn completion_http_request_deserializes_every_prompt_form() {
+        for (prompt, expected) in [
+            (
+                json!("hello"),
+                CompletionPrompt::Single(Prompt::Text("hello".to_string())),
+            ),
+            (
+                json!([1, 2, 3]),
+                CompletionPrompt::Single(Prompt::TokenIds(vec![1, 2, 3])),
+            ),
+            (
+                json!(["hello", "world"]),
+                CompletionPrompt::Batch(vec![
+                    Prompt::Text("hello".to_string()),
+                    Prompt::Text("world".to_string()),
+                ]),
+            ),
+            (
+                json!([[1, 2, 3]]),
+                CompletionPrompt::Batch(vec![Prompt::TokenIds(vec![1, 2, 3])]),
+            ),
+            (
+                json!([[1, 2, 3], [4, 5, 6]]),
+                CompletionPrompt::Batch(vec![
+                    Prompt::TokenIds(vec![1, 2, 3]),
+                    Prompt::TokenIds(vec![4, 5, 6]),
+                ]),
+            ),
+        ] {
+            let request: CompletionRequest =
+                serde_json::from_value(json!({"model": "m", "prompt": prompt}))
+                    .expect("parse request");
+            assert_eq!(request.prompt, expected);
+        }
+    }
+
+    #[test]
+    fn prepare_completion_requests_prepares_one_request_per_prompt() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": ["hello", "world"],
+            "request_id": "batch",
+            "echo": true,
+            "max_tokens": 7
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_requests(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            request_context(&HeaderMap::new(), Some("batch")),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        let prepared: Vec<_> = prepared
+            .into_iter()
+            .map(|prepared| {
+                (
+                    prepared.request_id,
+                    prepared.text_request.request_id,
+                    prepared.text_request.prompt,
+                    prepared.text_request.sampling_params.max_tokens,
+                    prepared.options.echo,
+                )
+            })
+            .collect();
+        assert_eq!(
+            prepared,
+            [
+                (
+                    "cmpl-batch".to_string(),
+                    "cmpl-batch-0".to_string(),
+                    Prompt::Text("hello".to_string()),
+                    Some(7),
+                    Some("hello".to_string()),
+                ),
+                (
+                    "cmpl-batch".to_string(),
+                    "cmpl-batch-1".to_string(),
+                    Prompt::Text("world".to_string()),
+                    Some(7),
+                    Some("world".to_string()),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_http_request_bounds_prompt_list_length() {
+        for (prompts, valid) in [(1024, true), (1025, false)] {
+            let request: CompletionRequest =
+                serde_json::from_value(json!({"model": "m", "prompt": vec!["a"; prompts]}))
+                    .expect("parse request");
+            assert_eq!(request.validate().is_ok(), valid, "{prompts} prompts");
+        }
     }
 
     #[test]

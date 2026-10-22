@@ -153,17 +153,23 @@ async fn render_completion(
     let stream_options = body.stream_options.clone();
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let tokenizer = state.text.tokenizer();
-    let text_request = lower_completion_request(
+    let text_requests = lower_completion_request(
         body,
         &model_resolution(&state),
         request_context,
         tokenizer.as_ref(),
     )?;
-    Ok(Json(vec![lower_render_request(
-        &state,
-        text_request,
-        model,
-        stream,
-        stream_options,
-    )?]))
+    let generate_requests = text_requests
+        .into_iter()
+        .map(|text_request| {
+            lower_render_request(
+                &state,
+                text_request,
+                model.clone(),
+                stream,
+                stream_options.clone(),
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Json(generate_requests))
 }

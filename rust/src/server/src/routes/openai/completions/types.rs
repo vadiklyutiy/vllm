@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use validator::Validate;
+use validator::{Validate, ValidationError};
 use vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams;
 use vllm_text::{Prompt, TruncationSide};
 
@@ -21,6 +21,50 @@ use crate::routes::openai::utils::types::{
 /// / OpenAI default.
 fn default_completion_max_tokens() -> Option<u32> {
     Some(16)
+}
+
+/// The `prompt` of a completions request: one prompt or a batch of prompts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    /// One prompt. Tried first, so a flat token-ID array stays one prompt.
+    Single(Prompt),
+    /// Several prompts, each answered by its own choice.
+    Batch(Vec<Prompt>),
+}
+
+#[cfg(test)]
+impl PartialEq<Prompt> for CompletionPrompt {
+    fn eq(&self, other: &Prompt) -> bool {
+        matches!(self, Self::Single(prompt) if prompt == other)
+    }
+}
+
+fn max_completion_prompts() -> usize {
+    std::env::var("VLLM_MAX_COMPLETION_PROMPTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024)
+}
+
+/// Bound the number of prompts in one request, like Python's
+/// `VLLM_MAX_COMPLETION_PROMPTS`.
+fn validate_completion_prompt(prompt: &CompletionPrompt) -> Result<(), ValidationError> {
+    let max_prompts = max_completion_prompts();
+    if let CompletionPrompt::Batch(prompts) = prompt
+        && prompts.len() > max_prompts
+    {
+        return Err(ValidationError::new("too_many_prompts").with_message(
+            format!(
+                "prompt list length {} exceeds the maximum allowed count of {max_prompts}. \
+                 To increase this limit, set the VLLM_MAX_COMPLETION_PROMPTS environment \
+                 variable.",
+                prompts.len()
+            )
+            .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// vLLM-compatible request type for the Completions API.
@@ -39,7 +83,8 @@ pub struct CompletionRequest {
     /// The prompt(s) to generate completions for.
     ///
     /// We use [`vllm_text::Prompt`] here to support token-id input.
-    pub prompt: Prompt,
+    #[validate(custom(function = "validate_completion_prompt"))]
+    pub prompt: CompletionPrompt,
 
     /// Echo back the prompt in addition to the completion
     #[serde(default)]

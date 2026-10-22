@@ -15,7 +15,9 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
-use futures::{Stream, StreamExt as _, pin_mut};
+use futures::future::try_join_all;
+use futures::stream::select_all;
+use futures::{Stream, StreamExt as _, TryStreamExt as _, pin_mut};
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use tracing::{debug, error, info, trace};
@@ -27,7 +29,7 @@ use vllm_text::{
     TextOutputStreamExt as _, TextRequest,
 };
 
-use self::convert::{ResponseOptions, prepare_completion_request};
+use self::convert::{ResponseOptions, prepare_completion_requests};
 pub(crate) use self::types::CompletionRequest;
 use super::utils::logprobs::{
     collected_logprobs_to_openai, decoded_logprobs_to_openai, decoded_prompt_logprobs_to_openai,
@@ -48,14 +50,15 @@ use crate::routes::openai::utils::validated_json::ValidatedJson;
 use crate::state::AppState;
 use crate::utils::{ResolvedRequestContext, resolve_request_context, sse_response, unix_timestamp};
 
+/// Lower one completions request into one text request per prompt.
 pub(crate) fn lower_completion_request(
     request: CompletionRequest,
     lora_resolution: &LoraModelResolution,
     ctx: ResolvedRequestContext,
     tokenizer: &dyn Tokenizer,
-) -> Result<TextRequest, ApiError> {
-    prepare_completion_request(request, lora_resolution, ctx, tokenizer)
-        .map(|prepared| prepared.text_request)
+) -> Result<Vec<TextRequest>, ApiError> {
+    prepare_completion_requests(request, lora_resolution, ctx, tokenizer)
+        .map(|prepared| prepared.into_iter().map(|prepared| prepared.text_request).collect())
 }
 
 /// Validate one completions request and proxy it into the shared `vllm-text`
@@ -71,7 +74,7 @@ pub async fn completions(
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;
 
     let tokenizer = state.chat.text().tokenizer();
-    let prepared = match prepare_completion_request(
+    let prepared = match prepare_completion_requests(
         body,
         &lora_resolution,
         request_context,
@@ -80,57 +83,153 @@ pub async fn completions(
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
+    let request_id = prepared[0].request_id.clone();
+    let response_model = prepared[0].response_model.clone();
     let request_span = tracing::info_span!(
         "completions",
-        request_id = %prepared.request_id,
+        request_id = %request_id,
         engine_request_id = tracing::field::Empty,
     );
 
     let created = unix_timestamp();
     let api_server_options = state.api_server_options;
-    let text_stream = match state
-        .chat
-        .text()
-        .generate(prepared.text_request)
-        .instrument(request_span.clone())
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => {
-            return text_submit_error("failed to submit completion request", error).into_response();
+    let mut text_streams = Vec::with_capacity(prepared.len());
+    for prepared in prepared {
+        match state
+            .chat
+            .text()
+            .generate(prepared.text_request)
+            .instrument(request_span.clone())
+            .await
+        {
+            Ok(stream) => text_streams.push((stream, prepared.options)),
+            Err(error) => {
+                return text_submit_error("failed to submit completion request", error)
+                    .into_response();
+            }
         }
-    };
+    }
 
     if stream {
-        let chunk_stream = completion_chunk_stream(
-            text_stream,
-            prepared.request_id,
-            prepared.response_model,
-            created,
-            api_server_options,
-            prepared.options,
-        );
-        let sse_stream = completion_sse_stream(chunk_stream).instrument(request_span);
+        let chunk_streams = text_streams
+            .into_iter()
+            .map(|(text_stream, options)| {
+                completion_chunk_stream(
+                    text_stream,
+                    request_id.clone(),
+                    response_model.clone(),
+                    created,
+                    api_server_options,
+                    options,
+                )
+            })
+            .collect();
+        let sse_stream = completion_sse_stream(merge_completion_chunk_streams(chunk_streams))
+            .instrument(request_span);
 
         sse_response(sse_stream, api_server_options.sse_keep_alive_interval)
     } else {
-        let response = match collect_completion(
-            text_stream,
-            prepared.request_id,
-            prepared.response_model,
-            created,
-            api_server_options,
-            prepared.options,
-        )
-        .instrument(request_span.clone())
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => return error.into_response(),
-        };
+        let responses =
+            match try_join_all(text_streams.into_iter().map(|(text_stream, options)| {
+                collect_completion(
+                    text_stream,
+                    request_id.clone(),
+                    response_model.clone(),
+                    created,
+                    api_server_options,
+                    options,
+                )
+            }))
+            .instrument(request_span.clone())
+            .await
+            {
+                Ok(responses) => responses,
+                Err(error) => return error.into_response(),
+            };
 
-        Json(response).into_response()
+        Json(merge_completion_responses(responses)).into_response()
     }
+}
+
+/// Merge the responses of every prompt in one request, in prompt order.
+///
+/// Like Python vLLM, each choice is indexed by its prompt, usage is summed,
+/// and per-request metrics are only kept for a single prompt.
+fn merge_completion_responses(responses: Vec<CompletionResponse>) -> CompletionResponse {
+    let mut responses = responses.into_iter();
+    let mut merged = responses.next().expect("one response per prompt");
+    for response in responses {
+        merged.choices.extend(response.choices);
+        merged.usage =
+            merged.usage.zip(response.usage).map(|(total, usage)| add_usage(total, usage));
+        merged.metrics = None;
+    }
+    for (index, choice) in merged.choices.iter_mut().enumerate() {
+        choice.index = index as u32;
+    }
+    merged
+}
+
+/// Interleave the chunk streams of every prompt in one request.
+///
+/// Like Python vLLM, each choice is indexed by its prompt, and the final usage
+/// chunks of all prompts are summed into one chunk sent after every prompt has
+/// finished. Per-request metrics are only kept for a single prompt.
+#[try_stream]
+async fn merge_completion_chunk_streams(
+    streams: Vec<impl Stream<Item = Result<CompletionSseChunk, ApiError>>>,
+    mut y: TryYielder<CompletionSseChunk, ApiError>,
+) -> Result<(), ApiError> {
+    let mut chunks = select_all(
+        streams
+            .into_iter()
+            .enumerate()
+            .map(|(index, stream)| Box::pin(stream.map_ok(move |chunk| (index as u32, chunk)))),
+    );
+    let mut usage_chunk: Option<CompletionStreamResponse> = None;
+
+    while let Some((index, chunk)) = chunks.try_next().await? {
+        match chunk {
+            CompletionSseChunk::Chunk(mut chunk) => {
+                for choice in &mut chunk.choices {
+                    choice.index = index;
+                }
+                y.yield_ok(CompletionSseChunk::Chunk(chunk)).await;
+            }
+            CompletionSseChunk::Usage(chunk) => {
+                usage_chunk = Some(match usage_chunk {
+                    None => chunk,
+                    Some(mut total) => {
+                        total.usage = total
+                            .usage
+                            .zip(chunk.usage)
+                            .map(|(total, usage)| add_usage(total, usage));
+                        total.metrics = None;
+                        total
+                    }
+                });
+            }
+        }
+    }
+
+    if let Some(chunk) = usage_chunk {
+        y.yield_ok(CompletionSseChunk::Usage(chunk)).await;
+    }
+    Ok(())
+}
+
+/// Sum the usage of two prompts in one request.
+fn add_usage(total: Usage, usage: Usage) -> Usage {
+    let cached_tokens = |usage: &Usage| {
+        (usage.prompt_tokens_details.as_ref()).map_or(0, |details| details.cached_tokens)
+    };
+    Usage::from_counts(
+        total.prompt_tokens + usage.prompt_tokens,
+        total.completion_tokens.unwrap_or(0) + usage.completion_tokens.unwrap_or(0),
+        Some(cached_tokens(&total) + cached_tokens(&usage)),
+        total.completion_tokens_details.reasoning_tokens
+            + usage.completion_tokens_details.reasoning_tokens,
+    )
 }
 
 async fn collect_completion(
