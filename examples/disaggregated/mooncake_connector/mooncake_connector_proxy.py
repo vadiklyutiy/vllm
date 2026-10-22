@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 
 def maybe_wrap_ipv6_address(address: str) -> str:
@@ -303,7 +303,11 @@ async def stream_service_response(
     async with decode_client_info["client"].stream(
         "POST", endpoint, json=req_data, headers=headers
     ) as response:
+        if not response.is_success:
+            await response.aread()
         response.raise_for_status()
+        # Let the caller send its headers as soon as decode's headers arrive
+        yield b""
         async for chunk in response.aiter_bytes():
             yield chunk
 
@@ -329,15 +333,37 @@ async def _handle_completions(api: str, request: Request):
         decode_client_info = get_next_client(request.app, "decode")
 
         # Stream response from decode service
+        decode_stream = stream_service_response(
+            prefill_client_info,
+            prefill_dp_rank,
+            decode_client_info,
+            api,
+            req_data,
+            request_id=request_id,
+        )
+        # Get the decode service's status before sending ours,
+        # unless the client disconnects first
+        first_chunk_task = asyncio.ensure_future(anext(decode_stream))
+        disconnect_task = asyncio.ensure_future(request.receive())
+        done, pending = await asyncio.wait(
+            [first_chunk_task, disconnect_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        if first_chunk_task not in done:
+            return Response()
+        try:
+            first_chunk = first_chunk_task.result()
+        except httpx.HTTPStatusError as e:
+            return Response(
+                content=e.response.content,
+                status_code=e.response.status_code,
+                media_type=e.response.headers.get("content-type"),
+            )
+
         async def generate_stream():
-            async for chunk in stream_service_response(
-                prefill_client_info,
-                prefill_dp_rank,
-                decode_client_info,
-                api,
-                req_data,
-                request_id=request_id,
-            ):
+            yield first_chunk
+            async for chunk in decode_stream:
                 yield chunk
 
         media_type = (
