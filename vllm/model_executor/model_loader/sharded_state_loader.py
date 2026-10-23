@@ -13,16 +13,21 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     runai_safetensors_weights_iterator,
 )
+from vllm.model_executor.utils import weights_already_processed
+from vllm.tracing import instrument
 from vllm.transformers_utils.s3_utils import glob as s3_glob
 from vllm.transformers_utils.utils import is_s3
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
 
@@ -187,7 +192,57 @@ class ShardedStateLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model, model_config.revision)
 
+    @instrument(span_name="Load model")
+    def load_model(
+        self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
+    ) -> nn.Module:
+        device_config = vllm_config.device_config
+        load_device = (
+            device_config.device
+            if self.load_config.device is None
+            else self.load_config.device
+        )
+        target_device = torch.device(load_device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = self.create_model(
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                    prefix=prefix,
+                )
+            not_loaded = self._load_shards(model, model_config)
+            # Quant methods that cannot take pre-processed weights keep the
+            # base loader flow: strict key check, then normal processing.
+            pre_processed = all(
+                quant_method.supports_pre_processed_weights
+                for quant_method in (
+                    getattr(module, "quant_method", None) for module in model.modules()
+                )
+                if isinstance(quant_method, QuantizeMethodBase)
+            )
+            if pre_processed:
+                # The shards hold the state of a model that already went through
+                # process_weights_after_loading (see save_model). Re-run it in
+                # pre-processed mode so quant methods only rebuild the state kept
+                # outside the state dict and drop the placeholders they consumed.
+                with weights_already_processed():
+                    process_weights_after_loading(model, model_config, target_device)
+                processed_keys = model.state_dict().keys()
+                not_loaded = [key for key in not_loaded if key in processed_keys]
+            if not_loaded:
+                raise ValueError(f"Missing keys {tuple(not_loaded)} in loaded state!")
+            if not pre_processed:
+                process_weights_after_loading(model, model_config, target_device)
+        return model.eval()
+
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        missing = self._load_shards(model, model_config)
+        if missing:
+            raise ValueError(f"Missing keys {tuple(missing)} in loaded state!")
+
+    def _load_shards(self, model: nn.Module, model_config: ModelConfig) -> list[str]:
+        """Copy this rank's shards into `model` and return the keys of its
+        state dict that the shards did not provide."""
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
@@ -248,8 +303,7 @@ class ShardedStateLoader(BaseModelLoader):
             "Loading weights took %.2f seconds",
             counter_after_loading_weights - counter_before_loading_weights,
         )
-        if state_dict:
-            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+        return list(state_dict)
 
     def iterate_over_files(
         self, paths

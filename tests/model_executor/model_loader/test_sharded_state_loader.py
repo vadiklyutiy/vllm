@@ -12,7 +12,12 @@ import pytest
 import torch
 
 from vllm import LLM, SamplingParams
+from vllm.config.load import LoadConfig
+from vllm.model_executor.layers.attention.attention import set_default_quant_scales
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader import ShardedStateLoader
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.transformers_utils.repo_utils import hf_api
 
 prompts = [
@@ -360,6 +365,95 @@ def test_save_model_rejects_bad_pattern_before_overwrite(monkeypatch, tmp_path):
     # The pre-existing shard is untouched and nothing new was written.
     assert colliding.read_bytes() == b"existing shard"
     assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+def _make_kv_scale_model() -> torch.nn.Module:
+    attn = torch.nn.Module()
+    attn.kv_cache_dtype = "fp8"
+    set_default_quant_scales(attn, register_buffer=True)
+    attn.quant_method = BaseKVCacheMethod(quant_config=None)
+    attn.quant_method.create_weights(attn)
+    model = torch.nn.Module()
+    model.attn = attn
+    return model
+
+
+def test_load_model_restores_processed_kv_scales(monkeypatch, tmp_path):
+    """Shards are saved after process_weights_after_loading has consumed the
+    KV-cache scale placeholders, so loading must not require them and must
+    take the scales from the saved buffers."""
+    _mock_pp_group(monkeypatch, 1)
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        model_weights="",
+        dtype=torch.float32,
+        quantization=None,
+        word_embeddings_untied_by_checkpoint=False,
+    )
+
+    saved = _make_kv_scale_model()
+    saved.attn.k_scale.fill_(0.25)
+    saved.attn.v_scale.fill_(0.125)
+    process_weights_after_loading(saved, model_config, torch.device("cpu"))
+    ShardedStateLoader.save_model(saved, str(tmp_path))
+
+    loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    monkeypatch.setattr(loader, "create_model", lambda **_: _make_kv_scale_model())
+    vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cpu"), load_config=loader.load_config
+    )
+    loaded = loader.load_model(vllm_config, model_config)
+
+    assert not hasattr(loaded.attn, "k_scale")
+    assert torch.equal(loaded.attn._k_scale, saved.attn._k_scale)
+    assert loaded.attn._k_scale_float == saved.attn._k_scale_float
+    assert loaded.attn._v_scale_float == saved.attn._v_scale_float
+
+
+class _NoPreProcessedSupportMethod(QuantizeMethodBase):
+    def create_weights(self, layer):
+        layer.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+    def apply(self, layer, x):
+        raise NotImplementedError
+
+
+def _make_no_pre_processed_model() -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.linear = torch.nn.Module()
+    model.linear.quant_method = _NoPreProcessedSupportMethod()
+    model.linear.quant_method.create_weights(model.linear)
+    return model
+
+
+def test_load_model_without_pre_processed_support(monkeypatch, tmp_path):
+    """Quant methods that do not declare supports_pre_processed_weights (e.g.
+    AWQ on Triton, out-of-tree plugins) keep loading as before."""
+    _mock_pp_group(monkeypatch, 1)
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        model_weights="",
+        dtype=torch.float32,
+        quantization=None,
+        word_embeddings_untied_by_checkpoint=False,
+    )
+
+    saved = _make_no_pre_processed_model()
+    saved.linear.weight.fill_(3.0)
+    ShardedStateLoader.save_model(saved, str(tmp_path))
+
+    loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    monkeypatch.setattr(
+        loader, "create_model", lambda **_: _make_no_pre_processed_model()
+    )
+    vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cpu"),
+        load_config=loader.load_config,
+        quant_config=None,
+    )
+    loaded = loader.load_model(vllm_config, model_config)
+
+    assert torch.equal(loaded.linear.weight, torch.full((4,), 3.0))
 
 
 @pytest.fixture(scope="module")
