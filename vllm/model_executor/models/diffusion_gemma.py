@@ -61,7 +61,10 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
-from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+from vllm.v1.worker.gpu.attn_utils import (
+    build_attn_metadata,
+    compute_mm_prefix_ranges,
+)
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -269,6 +272,15 @@ class DiffusionGemmaForConditionalGeneration(
             eps=getattr(text_config, "rms_norm_eps", 1e-6),
         )
 
+        # As in Gemma4, image tokens are bidirectional only on sliding layers.
+        self._full_attn_layer_idxs: frozenset[int] = frozenset()
+        if vllm_config.model_config.is_mm_prefix_lm:
+            self._full_attn_layer_idxs = frozenset(
+                i
+                for i, layer_type in enumerate(text_config.layer_types)
+                if layer_type != "sliding_attention"
+            )
+
     # ------------------------------------------------------------------ #
     # Multimodal: reuse Gemma4's image parsing, processing & embedding
     # ------------------------------------------------------------------ #
@@ -289,6 +301,9 @@ class DiffusionGemmaForConditionalGeneration(
     _process_image_input = Gemma4ForConditionalGeneration._process_image_input
     _process_video_input = Gemma4ForConditionalGeneration._process_video_input
     embed_multimodal = Gemma4ForConditionalGeneration.embed_multimodal
+    _clear_mm_prefix_for_full_attn_layers = (
+        Gemma4ForConditionalGeneration._clear_mm_prefix_for_full_attn_layers
+    )
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix mapping for multimodal models."""
@@ -312,6 +327,7 @@ class DiffusionGemmaForConditionalGeneration(
     ) -> torch.Tensor:
         if intermediate_tensors is not None:
             inputs_embeds = None
+        self._clear_mm_prefix_for_full_attn_layers()
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1103,6 +1119,18 @@ class DiffusionGemmaModelState(ModelState):
             self._causal_buf[actual_num_reqs:num_reqs] = 0
         causal: bool | torch.Tensor = self._causal_buf[:num_reqs]
 
+        req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
+        if (
+            self.supports_mm_inputs
+            and self.encoder_cache is not None
+            and self.model_config.is_mm_prefix_lm
+        ):
+            req_doc_ranges = compute_mm_prefix_ranges(
+                req_ids=input_batch.req_ids,
+                mm_features=self.encoder_cache.mm_features,
+                sliding_window=self.model_config.get_sliding_window(),
+            )
+
         return build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -1115,6 +1143,8 @@ class DiffusionGemmaModelState(ModelState):
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            mm_req_doc_ranges=req_doc_ranges,
             causal=causal,
         )
 
