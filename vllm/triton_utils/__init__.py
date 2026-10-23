@@ -23,6 +23,7 @@ else:
     gl = TritonLanguagePlaceholder()
     aggregate = TritonLanguagePlaceholder()
 
+from vllm.triton_utils.dot_precision import fp32_dot_allow_tf32
 from vllm.triton_utils.tensor_descriptor import use_tensor_descriptor
 
 LOG2E = 1.4426950408889634
@@ -38,5 +39,6 @@ __all__ = [
     "gluon",
     "gl",
     "aggregate",
+    "fp32_dot_allow_tf32",
     "use_tensor_descriptor",
 ]

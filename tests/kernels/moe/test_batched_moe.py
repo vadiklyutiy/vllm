@@ -254,6 +254,38 @@ def test_batched_mm(
     torch.testing.assert_close(test_output, q_ref_output, atol=atol, rtol=rtol)
 
 
+def test_batched_mm_fp32_matches_fp64_reference():
+    """At the default "highest" fp32 matmul precision, fp32 inputs must not be
+    computed in TF32 (~4e-3 error here) but in IEEE fp32 (~1e-5)."""
+    set_random_seed(7)
+    num_experts, max_tokens, K, N = 8, 64, 1024, 1024
+    A = torch.randn(num_experts, max_tokens, K, device=DEVICE)
+    B = torch.randn(num_experts, N, K, device=DEVICE) * K**-0.5
+    C = torch.zeros(num_experts, max_tokens, N, device=DEVICE)
+    num_expert_tokens = torch.full(
+        (num_experts,), max_tokens, dtype=torch.int32, device=DEVICE
+    )
+
+    invoke_moe_batched_triton_kernel(
+        A,
+        B,
+        C,
+        num_expert_tokens,
+        tl.float32,
+        None,
+        None,
+        None,
+        False,
+        False,
+        False,
+        config={"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 16},
+        per_act_token_quant=False,
+    )
+
+    ref = torch.bmm(A.double(), B.double().transpose(1, 2))
+    torch.testing.assert_close(C.double(), ref, atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize(("m", "n", "k"), MNK_FACTORS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)

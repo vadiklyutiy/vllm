@@ -6,6 +6,10 @@ import sys
 import types
 from unittest import mock
 
+import pytest
+import torch
+
+from vllm.triton_utils import fp32_dot_allow_tf32
 from vllm.triton_utils import importing as triton_importing
 from vllm.triton_utils.importing import TritonLanguagePlaceholder, TritonPlaceholder
 
@@ -139,6 +143,30 @@ def test_cpu_build_with_cpu_backend_keeps_triton():
 
 def test_cpu_build_without_cpu_backend_disables_triton():
     assert _has_triton_for_backends(vllm_version="0.0.0+cpu", amd=True) is False
+
+
+@pytest.mark.parametrize(
+    ("matmul_precision", "expected"),
+    [("highest", False), ("high", True), ("medium", True)],
+)
+def test_fp32_dot_allow_tf32_follows_torch(matmul_precision, expected):
+    """fp32 ``tl.dot`` is IEEE unless torch allows TF32 for fp32 matmuls."""
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(matmul_precision)
+    try:
+        assert fp32_dot_allow_tf32() == expected
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+def test_fp32_dot_allow_tf32_traces_with_fullgraph():
+    """Kernel launchers run inside compiled model code (e.g. K2Horizon's
+    direct ``dispatch_fused_moe_kernel`` call)."""
+
+    def f(x):
+        return x + (1 if fp32_dot_allow_tf32() else 2)
+
+    torch.compile(f, fullgraph=True, backend="eager")(torch.zeros(1))
 
 
 def test_no_triton_fallback():

@@ -233,6 +233,28 @@ def test_context_attention_sliding_window(
     torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
 
 
+def test_context_attention_fp32_matches_fp64_reference():
+    """At the default "highest" fp32 matmul precision, fp32 inputs must not be
+    computed in TF32 (~1e-2 error here) but in IEEE fp32 (~1e-5)."""
+    torch.manual_seed(0)
+    seq_len = 512
+    q, k, v = torch.randn(3, seq_len, 8, 128, device=DEVICE_TYPE).unbind(0)
+    o = torch.empty_like(q)
+
+    context_attention_fwd(
+        q,
+        k,
+        v,
+        o,
+        torch.zeros(1, dtype=torch.int32, device=DEVICE_TYPE),
+        torch.tensor([seq_len], dtype=torch.int32, device=DEVICE_TYPE),
+        seq_len,
+    )
+
+    o_ref = ref_masked_attention(q.double(), k.double(), v.double())
+    torch.testing.assert_close(o.double(), o_ref, rtol=1e-4, atol=1e-4)
+
+
 class _LaunchCapture:
     """Records the launch configuration in place of ``_fwd_kernel``."""
 

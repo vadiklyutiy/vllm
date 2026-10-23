@@ -621,7 +621,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MAIN_CUDA_VERSION": lambda: (
         os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
     ),
-    # Controls PyTorch float32 matmul precision mode within vLLM workers.
+    # Controls float32 matmul precision within vLLM workers: PyTorch matmuls,
+    # and the float32 tl.dot calls in the Triton attention (TRITON_ATTN,
+    # TRITON_ATTN_DIFFKV) and unquantized Triton MoE (triton, batched_triton)
+    # kernels.
     # Valid options mirror torch.set_float32_matmul_precision
     "VLLM_FLOAT32_MATMUL_PRECISION": env_with_choices(
         "VLLM_FLOAT32_MATMUL_PRECISION",

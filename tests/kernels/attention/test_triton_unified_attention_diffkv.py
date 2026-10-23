@@ -263,6 +263,52 @@ def test_triton_unified_attn_diffkv_fp8_query(seq_lens, seq_threshold_3D):
     )
 
 
+@torch.inference_mode()
+def test_triton_unified_attn_diffkv_fp32_matches_fp64_reference() -> None:
+    """At the default "highest" fp32 matmul precision, fp32 inputs must not be
+    computed in TF32 (~1e-2 error here) but in IEEE fp32 (~1e-5)."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    seq_len, num_heads, block_size = 512, 8, 16
+    head_size_qk, head_size_v = 192, 128
+    num_blocks = seq_len // block_size
+    scale = head_size_qk**-0.5
+    query = torch.randn(seq_len, num_heads, head_size_qk)
+    kv_cache = torch.randn(
+        num_blocks, block_size, num_heads, head_size_qk + head_size_v
+    )
+    key_cache = kv_cache[..., :head_size_qk]
+    value_cache = kv_cache[..., head_size_qk:]
+    output = torch.empty(seq_len, num_heads, head_size_v)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32)[None]
+
+    unified_attention_diffkv(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32),
+        seqused_k=torch.tensor([seq_len], dtype=torch.int32),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        max_seqlen_q=seq_len,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query.double(),
+        key_cache=key_cache.double(),
+        value_cache=value_cache.double(),
+        query_lens=[seq_len],
+        kv_lens=[seq_len],
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(output.double(), ref_output, atol=1e-4, rtol=1e-4)
+
+
 def _capture_diffkv_launch(
     query_lens: list[int], max_seqlen_q: int, segm_first_dim: int
 ):

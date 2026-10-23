@@ -509,6 +509,54 @@ def test_fused_shared_expert_alignment(workspace_init):
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
 
 
+def test_fused_experts_fp32_matches_torch_fp32():
+    """At the default "highest" fp32 matmul precision, fp32 inputs must not be
+    computed in TF32 (~1e-2 error here) but in IEEE fp32, like torch."""
+    set_random_seed(0)
+    m, n, k, e, topk = 64, 1024, 1024, 8, 2
+    a = torch.randn((m, k), device=DEVICE_TYPE)
+    w1 = torch.randn((e, 2 * n, k), device=DEVICE_TYPE) * k**-0.5
+    w2 = torch.randn((e, k, n), device=DEVICE_TYPE) * n**-0.5
+    score = torch.randn((m, e), device=DEVICE_TYPE)
+    topk_weights, topk_ids = score.softmax(dim=-1).topk(topk)
+
+    with set_current_vllm_config(vllm_config):
+        expected = torch_experts(a, w1, w2, topk_weights, topk_ids)
+        actual = fused_moe_module.fused_experts(
+            a, w1, w2, topk_weights, topk_ids.to(torch.int32)
+        )
+
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_fused_experts_int8_w8a16_fp32_matches_torch_fp32():
+    """Same as above for the int8_w8a16 dot (int8 weights, fp32 activations)."""
+    set_random_seed(0)
+    m, n, k, e, topk = 64, 1024, 1024, 8, 2
+    a = torch.randn((m, k), device=DEVICE_TYPE)
+    w1 = torch.randint(-127, 128, (e, 2 * n, k), device=DEVICE_TYPE, dtype=torch.int8)
+    w2 = torch.randint(-127, 128, (e, k, n), device=DEVICE_TYPE, dtype=torch.int8)
+    w1_scale = torch.full((e, 2 * n), (3 / k) ** 0.5 / 127, device=DEVICE_TYPE)
+    w2_scale = torch.full((e, k), (3 / n) ** 0.5 / 127, device=DEVICE_TYPE)
+    score = torch.randn((m, e), device=DEVICE_TYPE)
+    topk_weights, topk_ids = score.softmax(dim=-1).topk(topk)
+    quant_config = int8_w8a16_moe_quant_config(w1_scale=w1_scale, w2_scale=w2_scale)
+
+    with set_current_vllm_config(vllm_config):
+        expected = torch_experts(
+            a,
+            w1 * w1_scale[..., None],
+            w2 * w2_scale[..., None],
+            topk_weights,
+            topk_ids,
+        )
+        actual = fused_moe_module.fused_experts(
+            a, w1, w2, topk_weights, topk_ids.to(torch.int32), quant_config=quant_config
+        )
+
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
 def test_fused_moe_int64_overflow(workspace_init):
     """Regression test for int32 overflow in stride*offset products.
 

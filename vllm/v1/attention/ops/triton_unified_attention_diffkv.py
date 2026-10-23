@@ -28,7 +28,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import fp32_dot_allow_tf32, tl, triton
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -115,6 +115,7 @@ def kernel_unified_attention_diffkv(
     # sequence) and 3D layout (split-KV / FlashDecoding-style: per-segm
     # programs write partials, finalized by ``kernel_reduce_segments_diffkv``).
     IS_3D: tl.constexpr,
+    ALLOW_TF32: tl.constexpr = True,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -253,7 +254,7 @@ def kernel_unified_attention_diffkv(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        S += scale * tl.dot(Q, K)
+        S += scale * tl.dot(Q, K, allow_tf32=ALLOW_TF32)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -277,7 +278,7 @@ def kernel_unified_attention_diffkv(
                 V,
                 0.0,
             )
-        acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P.to(V.dtype), V, allow_tf32=ALLOW_TF32)
 
     # ---- Epilogue --------------------------------------------------------
     if USE_KV_SCALES:
@@ -566,6 +567,7 @@ def unified_attention_diffkv(
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         IS_3D=use_3d,
+        ALLOW_TF32=fp32_dot_allow_tf32(),
         **launch_kw,
     )
 

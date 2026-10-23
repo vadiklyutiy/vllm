@@ -34,7 +34,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils import (
+    fp32_dot_allow_tf32,
+    tl,
+    triton,
+    use_tensor_descriptor,
+)
 from vllm.triton_utils.allocation import set_triton_allocator
 
 
@@ -90,6 +95,7 @@ def moe_mmk(
     stride_am: tl.int64 = 0,
     stride_bn: tl.int64 = 0,
     USE_TD: tl.constexpr = False,
+    ALLOW_TF32: tl.constexpr = True,
 ):
     offs_k = tl.arange(0, BLOCK_K)
 
@@ -172,7 +178,7 @@ def moe_mmk(
                 # acc used to enable fp8_fast_accum
                 accumulator = tl.dot(a, b, acc=accumulator)
         else:
-            accumulator += tl.dot(a, b)
+            accumulator += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_K * stride_ak
@@ -233,6 +239,7 @@ def expert_triton_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_TD: tl.constexpr = False,
+    ALLOW_TF32: tl.constexpr = True,
 ):
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N) % N
@@ -285,6 +292,7 @@ def expert_triton_kernel(
         stride_am,
         stride_bn,
         USE_TD,
+        ALLOW_TF32,
     )
 
     # store in C
@@ -340,6 +348,7 @@ def batched_triton_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_TD: tl.constexpr = False,
+    ALLOW_TF32: tl.constexpr = True,
 ):
     expert_id = tl.program_id(axis=0)
     e_num_tokens = tl.load(expert_num_tokens + expert_id)
@@ -421,6 +430,7 @@ def batched_triton_kernel(
         BLOCK_N,
         BLOCK_K,
         USE_TD,
+        ALLOW_TF32,
     )
 
 
@@ -549,6 +559,7 @@ def invoke_moe_batched_triton_kernel(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         USE_TD=use_td,
+        ALLOW_TF32=fp32_dot_allow_tf32(),
     )
 
 
