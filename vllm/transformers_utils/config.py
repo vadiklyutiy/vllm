@@ -194,11 +194,56 @@ _AUTO_CONFIG_KWARGS_OVERRIDES: dict[str, dict[str, Any]] = {
 }
 
 
+_MODEL_TYPE_CONFIG_CLASSES: dict[
+    tuple[str, type[PreTrainedConfig]], type[PreTrainedConfig]
+] = {}
+
+
+def _config_class_for_model_type(
+    model_type: str, config_class: type[PreTrainedConfig]
+) -> type[PreTrainedConfig]:
+    """Return `config_class`, or a subclass of it, whose `model_type` is
+    `model_type`.
+
+    `PreTrainedConfig.to_dict()` serializes the class `model_type`, so model
+    types that share a config class each need their own subclass.
+    """
+    if config_class.model_type == model_type:
+        return config_class
+    key = (model_type, config_class)
+    if key not in _MODEL_TYPE_CONFIG_CLASSES:
+        _MODEL_TYPE_CONFIG_CLASSES[key] = type(
+            config_class.__name__,
+            (config_class,),
+            {
+                "__module__": config_class.__module__,
+                "model_type": model_type,
+                # Transformers regenerates `__init__` for subclasses without one
+                "__init__": config_class.__init__,
+                # The subclass is not importable, so pickle instances by
+                # rebuilding it
+                "__reduce__": lambda self: (
+                    _new_config_for_model_type,
+                    (model_type, config_class),
+                    self.__dict__,
+                ),
+            },
+        )
+    return _MODEL_TYPE_CONFIG_CLASSES[key]
+
+
+def _new_config_for_model_type(
+    model_type: str, config_class: type[PreTrainedConfig]
+) -> PreTrainedConfig:
+    return object.__new__(_config_class_for_model_type(model_type, config_class))
+
+
 def _register_config_class(
     model_type: str, config_class: type[PreTrainedConfig]
-) -> None:
-    config_class.model_type = model_type
+) -> type[PreTrainedConfig]:
+    config_class = _config_class_for_model_type(model_type, config_class)
     AutoConfig.register(model_type, config_class, exist_ok=True)
+    return config_class
 
 
 def _maybe_register_hf_config(config: PreTrainedConfig | None) -> None:
@@ -418,8 +463,9 @@ class HFConfigParser(ConfigParserBase):
                 # Register the config class to AutoConfig to ensure it's used
                 # in future calls to `from_pretrained` (e.g. from
                 # AutoTokenizer or AutoProcessor).
-                config_class = _CONFIG_REGISTRY[model_type]
-                _register_config_class(model_type, config_class)
+                config_class = _register_config_class(
+                    model_type, _CONFIG_REGISTRY[model_type]
+                )
                 # If the on-disk model_type differs from the overridden
                 # one, register under both so AutoConfig.from_pretrained
                 # returns the correct class regardless of what the
@@ -427,8 +473,11 @@ class HFConfigParser(ConfigParserBase):
                 if (
                     config_model_type := config_dict.get("model_type")
                 ) and config_model_type != model_type:
-                    _register_config_class(config_model_type, config_class)
-                    config_class.model_type = model_type
+                    from transformers import CONFIG_MAPPING
+
+                    CONFIG_MAPPING.register(
+                        config_model_type, config_class, exist_ok=True
+                    )
                 # Now that it is registered, it is not considered remote code anymore
                 trust_remote_code = False
             try:

@@ -7,12 +7,14 @@ only get the `eos_token_id` from the tokenizer as defined by
 
 import json
 import math
+from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 from transformers import PreTrainedConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from vllm.config.model import ModelConfig
 from vllm.tokenizers import get_tokenizer
@@ -323,3 +325,69 @@ def test_mrope_num_dims_from_nested_rope_parameters():
 
 def test_mrope_num_dims_without_mrope():
     assert mrope_num_dims(PreTrainedConfig()) == 0
+
+
+@pytest.fixture
+def restore_config_mapping():
+    extra_content = dict(CONFIG_MAPPING._extra_content)
+    yield
+    # Keep keys that config modules register when the test first imports them
+    for key in config_module._CONFIG_REGISTRY:
+        if key in extra_content:
+            CONFIG_MAPPING._extra_content[key] = extra_content[key]
+        else:
+            CONFIG_MAPPING._extra_content.pop(key, None)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("kimi_k2", "deepseek_v32"),
+        # `kimi_k2` is registered from the upstream `deepseek_v3` config class
+        ("deepseek_v3", "kimi_k2"),
+    ],
+)
+def test_config_keeps_model_type_after_loading_alias(
+    tmp_path, first, second, restore_config_mapping
+):
+    """Model types that share a config class must not overwrite each other's
+    serialized `model_type`."""
+
+    def load(model_type):
+        (tmp_path / model_type).mkdir()
+        (tmp_path / model_type / "config.json").write_text(
+            json.dumps({"model_type": model_type})
+        )
+        return config_module.get_config(tmp_path / model_type, trust_remote_code=False)
+
+    config = load(first)
+    load(second)
+
+    assert config.to_dict()["model_type"] == first
+    # Engine processes started with `spawn` receive the config pickled
+    pickled = ForkingPickler.loads(ForkingPickler.dumps(config))
+    assert pickled.to_dict()["model_type"] == first
+
+
+def test_register_config_class_keeps_registry_classes(restore_config_mapping):
+    """Every `_CONFIG_REGISTRY` key is registered with a class of its own
+    `model_type` that builds the same config as the registry class, and the
+    registry class itself is left unchanged."""
+    registry = config_module._CONFIG_REGISTRY
+    model_types = {key: registry[key].model_type for key in registry}
+
+    for key in registry:
+        config_module._register_config_class(key, registry[key])
+
+    for key in registry:
+        config_class = CONFIG_MAPPING[key]
+        assert config_class.model_type == key
+        assert registry[key].model_type == model_types[key]
+        assert issubclass(config_class, registry[key])
+        if config_class is not registry[key]:
+            assert config_class.__module__ == registry[key].__module__
+            assert config_class.__name__ == registry[key].__name__
+            assert config_class().to_dict() == {
+                **registry[key]().to_dict(),
+                "model_type": key,
+            }
