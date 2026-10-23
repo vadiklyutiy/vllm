@@ -5,7 +5,9 @@
 import argparse
 import logging
 import threading
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 
 try:
@@ -27,6 +29,11 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Clients do not report when they are done with the pages they were handed, so
+# a key whose pages were handed out is kept from eviction for this long. The
+# lease set by the scheduler's lookup must outlast the worker's queued loads.
+KEY_LEASE_TTL_S = 120.0
 
 
 @dataclass
@@ -64,6 +71,7 @@ class KeyMetadata:
     key: str
     rank_to_page: dict[int, int]  # rank -> allocated page index
     tp_world_size: int
+    lease_expiry: float = 0.0  # time.monotonic() until which it is not evicted
 
     def add_rank_page(self, rank: int, page_index: int) -> None:
         """Add page allocation for a specific rank."""
@@ -85,10 +93,12 @@ class KeyMetadata:
 class GlobalMetadataState:
     """Manages global metadata state across all ranks and keys."""
 
-    def __init__(self):
+    def __init__(self, lease_ttl_s: float = KEY_LEASE_TTL_S):
         self.global_lock = threading.RLock()
         self.rank_metadata: dict[int, RankFileMetadata] = {}
-        self.key_metadata: dict[str, KeyMetadata] = {}
+        # Ordered from least to most recently used.
+        self.key_metadata: OrderedDict[str, KeyMetadata] = OrderedDict()
+        self.lease_ttl_s = lease_ttl_s
 
     def clear(self) -> None:
         """Clear all metadata state."""
@@ -105,6 +115,55 @@ class GlobalMetadataState:
                     rank, num_pages, list(range(num_pages))
                 )
                 logger.info("Initialized rank %s with %s pages", rank, num_pages)
+
+    def _evict_lru_keys(
+        self, rank: int, num_pages: int, batch_keys: list[tuple[str, str]]
+    ) -> None:
+        """Evict least recently used keys so `rank` has `num_pages` free, or
+        none if that many cannot be freed.
+
+        An evicted key releases its pages on every rank. Leased keys and keys
+        of the batch being allocated are kept, as their pages may be in use.
+        """
+        shortfall = num_pages - self.rank_metadata[rank].get_free_page_count()
+        if shortfall <= 0:
+            return
+
+        batch = {key for key, _ in batch_keys}
+        now = time.monotonic()
+        victims: list[str] = []
+        for key, key_meta in self.key_metadata.items():
+            if len(victims) == shortfall:
+                break
+            if (
+                key not in batch
+                and rank in key_meta.rank_to_page
+                and key_meta.lease_expiry <= now
+            ):
+                victims.append(key)
+        if len(victims) < shortfall:
+            return
+
+        for key in victims:
+            for key_rank, page_index in self.key_metadata.pop(key).get_all_pages():
+                self.rank_metadata[key_rank].release_pages([page_index])
+        logger.debug("Evicted %s keys for rank %s", len(victims), rank)
+
+    def _touch(self, keys: list[str], lease: bool = False) -> None:
+        """Mark keys as most recently used; the first key is evicted last.
+
+        With `lease`, the keys are also leased (see `_lease`).
+        """
+        for key in reversed(keys):
+            self.key_metadata.move_to_end(key)
+        if lease:
+            self._lease(keys)
+
+    def _lease(self, keys: list[str]) -> None:
+        """Keep keys whose pages were handed out from eviction for `lease_ttl_s`."""
+        lease_expiry = time.monotonic() + self.lease_ttl_s
+        for key in keys:
+            self.key_metadata[key].lease_expiry = lease_expiry
 
     def allocate_pages_for_keys(
         self, rank: int, keys: list[tuple[str, str]]
@@ -125,6 +184,7 @@ class GlobalMetadataState:
 
             # Batch allocate pages for all keys
             num_pages_needed = len(keys)
+            self._evict_lru_keys(rank, num_pages_needed, keys)
             allocated_pages = self.rank_metadata[rank].allocate_pages(num_pages_needed)
 
             if len(allocated_pages) < num_pages_needed:
@@ -136,6 +196,7 @@ class GlobalMetadataState:
                 )
 
             allocation_results = {}
+            hits = []
             for i, (key, prefix_key) in enumerate(keys):
                 if key in self.key_metadata:
                     key_meta = self.key_metadata[key]
@@ -144,6 +205,7 @@ class GlobalMetadataState:
                         # and release the allocated pages back to the free pool.
                         if i < len(allocated_pages):
                             self.rank_metadata[rank].release_pages([allocated_pages[i]])
+                        hits.append(key)
                         allocation_results[key] = key_meta.rank_to_page[rank]
                         continue
 
@@ -152,6 +214,7 @@ class GlobalMetadataState:
                 else:
                     allocation_results[key] = -1  # No pages available
 
+            self._touch(hits, lease=True)
             return allocation_results
 
     def confirm_write_for_keys(
@@ -169,6 +232,7 @@ class GlobalMetadataState:
 
         """
         with self.global_lock:
+            released = pages_to_release or []
             # Confirm successful writes
             for key, page_index in key_confirmations:
                 if key not in self.key_metadata:
@@ -176,8 +240,14 @@ class GlobalMetadataState:
                     tp_world_size = len(self.rank_metadata)
                     self.key_metadata[key] = KeyMetadata(key, {}, tp_world_size)
 
-                # Add confirmed page to key metadata
-                self.key_metadata[key].add_rank_page(rank, page_index)
+                key_meta = self.key_metadata[key]
+                held_page = key_meta.get_rank_page(rank)
+                if held_page not in (None, page_index) and held_page not in released:
+                    # The rank already holds this key; free the duplicate page.
+                    self.rank_metadata[rank].release_pages([page_index])
+                    continue
+                key_meta.add_rank_page(rank, page_index)
+            self._touch([key for key, _ in key_confirmations])
 
             # Release specified pages back to free pool
             if pages_to_release:
@@ -208,6 +278,9 @@ class GlobalMetadataState:
                     # Check if all ranks in the TP world have confirmed writes
                     key_meta = self.key_metadata[key]
                     results.append(key_meta.is_complete())
+            self._touch(
+                [key for key, exists in zip(keys, results) if exists], lease=True
+            )
             return results
 
     def get_key_locations(self, rank: int, keys: list[str]) -> list[int | None]:
@@ -238,6 +311,9 @@ class GlobalMetadataState:
                 else:
                     results.append(None)
 
+            # A load is split into several calls; recency was already set for
+            # the whole prompt by the scheduler's batch_key_exists.
+            self._lease([key for key, page in zip(keys, results) if page is not None])
             return results
 
 

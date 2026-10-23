@@ -190,3 +190,180 @@ class TestGlobalMetadataStateAllocation:
         free_after_release = state.rank_metadata[0].get_free_page_count()
 
         assert free_after_release == free_after_alloc + 1
+
+    def test_confirm_of_held_incomplete_key_keeps_one_page(self):
+        """A rank that saves a key again before the other ranks confirm it
+        keeps one page for the key and frees the other.
+        """
+        state = GlobalMetadataState()
+        for rank in range(2):
+            state.initialize_rank(rank, 2)
+        [held_page] = _save_key(state, "K", range(1))  # rank 1 has not confirmed K
+        _save_key(state, "K", range(1))  # a later request saves K again
+        _save_key(state, "K", range(1, 2))
+
+        assert state.get_key_locations(0, ["K"]) == [held_page]
+        assert state.rank_metadata[0].get_free_page_count() == 1
+
+    def test_confirm_that_releases_held_page_moves_key(self):
+        """A rank that confirms a key at a new page and releases the page it
+        held for the key moves the key to the new page.
+        """
+        state = GlobalMetadataState()
+        for rank in range(2):
+            state.initialize_rank(rank, 2)
+        [old_page] = _save_key(state, "K", range(1))
+        new_page = state.allocate_pages_for_keys(0, [("K", "")])["K"]
+        state.confirm_write_for_keys(0, [("K", new_page)], pages_to_release=[old_page])
+        _save_key(state, "K", range(1, 2))
+
+        assert state.get_key_locations(0, ["K"]) == [new_page]
+        assert state.rank_metadata[0].free_pages == [old_page]
+
+
+# ===========================================================================
+# TestGlobalMetadataStateEviction
+# ===========================================================================
+
+
+def _save_key(state: GlobalMetadataState, key: str, ranks: range) -> list[int]:
+    """Allocate and confirm `key` on every rank, as the connector's save does."""
+    pages = []
+    for rank in ranks:
+        page = state.allocate_pages_for_keys(rank, [(key, "")])[key]
+        assert page >= 0
+        state.confirm_write_for_keys(rank, [(key, page)])
+        pages.append(page)
+    return pages
+
+
+class TestGlobalMetadataStateEviction:
+    """Tests that a full page pool evicts least recently used, unleased keys."""
+
+    def test_full_pool_evicts_lru_key_on_every_rank(self):
+        """A new key takes the pages of the least recently used key on every
+        rank, so saves keep succeeding after the pool has been filled.
+        """
+        state = GlobalMetadataState()
+        ranks = range(2)
+        for rank in ranks:
+            state.initialize_rank(rank, 2)
+        k1_pages = _save_key(state, "K1", ranks)
+        _save_key(state, "K2", ranks)
+
+        assert _save_key(state, "K3", ranks) == k1_pages
+        assert state.batch_key_exists(["K1", "K2", "K3"]) == [False, True, True]
+
+    @pytest.mark.parametrize(
+        "use_k1",
+        [
+            lambda state: state.batch_key_exists(["K1"]),
+            lambda state: state.batch_key_exists(["K1", "K2"]),
+            lambda state: state.allocate_pages_for_keys(0, [("K1", ""), ("K2", "")]),
+        ],
+        ids=[
+            "batch_key_exists",
+            "prefix_batch_key_exists",
+            "prefix_allocate_cache_hit",
+        ],
+    )
+    def test_used_key_is_evicted_last(self, use_k1):
+        """A key that is looked up or hit again outlives keys used before it,
+        and the first block of a prefix is evicted last.
+        """
+        state = GlobalMetadataState(lease_ttl_s=0)
+        state.initialize_rank(0, 2)
+        _save_key(state, "K1", range(1))
+        _save_key(state, "K2", range(1))
+
+        use_k1(state)
+        _save_key(state, "K3", range(1))
+
+        assert state.batch_key_exists(["K1", "K2", "K3"]) == [True, False, True]
+
+    def test_batched_load_keeps_first_block_last(self):
+        """A prefix looked up at once and then read in several calls, as the
+        connector does, still has its first block evicted last.
+        """
+        state = GlobalMetadataState(lease_ttl_s=0)
+        state.initialize_rank(0, 2)
+        _save_key(state, "K1", range(1))
+        _save_key(state, "K2", range(1))
+        state.batch_key_exists(["K1", "K2"])
+        state.get_key_locations(0, ["K1"])
+        state.get_key_locations(0, ["K2"])
+
+        _save_key(state, "K3", range(1))
+
+        assert state.batch_key_exists(["K1", "K2", "K3"]) == [True, False, True]
+
+    def test_keys_of_current_batch_are_not_evicted(self):
+        """A cache-hit key of the batch keeps its page while others are evicted."""
+        state = GlobalMetadataState()
+        state.initialize_rank(0, 3)
+        [k1_page] = _save_key(state, "K1", range(1))
+        _save_key(state, "K2", range(1))
+
+        results = state.allocate_pages_for_keys(0, [("K1", ""), ("K3", "")])
+
+        assert results["K1"] == k1_page
+        assert results["K3"] >= 0
+        assert state.batch_key_exists(["K1", "K2"]) == [True, False]
+
+    def test_unsatisfiable_allocation_evicts_nothing(self):
+        """An allocation that eviction cannot satisfy keeps every stored key."""
+        state = GlobalMetadataState()
+        state.initialize_rank(0, 3)
+        _save_key(state, "K1", range(1))
+        _save_key(state, "K2", range(1))
+        state.allocate_pages_for_keys(0, [("X", "")])  # write still in flight
+
+        results = state.allocate_pages_for_keys(0, [("Y1", ""), ("Y2", ""), ("Y3", "")])
+
+        assert all(page == -1 for page in results.values())
+        assert state.batch_key_exists(["K1", "K2"]) == [True, True]
+
+    def test_lagging_rank_keeps_its_pages(self):
+        """A rank that confirms a key evicted by a faster rank, and then saves
+        it again, does not lose a page.
+        """
+        state = GlobalMetadataState()
+        for rank in range(2):
+            state.initialize_rank(rank, 2)
+        for key in ("A", "B", "C"):  # rank 0 runs ahead; saving C evicts A
+            _save_key(state, key, range(1))
+        _save_key(state, "A", range(1, 2))
+        _save_key(state, "A", range(1, 2))  # a later request saves A again
+
+        assert state.rank_metadata[1].get_free_page_count() == 1
+
+    @pytest.mark.parametrize(
+        "hand_out_k1",
+        [
+            lambda state: state.batch_key_exists(["K1"]),
+            lambda state: state.get_key_locations(0, ["K1"]),
+            lambda state: state.allocate_pages_for_keys(0, [("K1", "")]),
+        ],
+        ids=["batch_key_exists", "get_key_locations", "allocate_cache_hit"],
+    )
+    @pytest.mark.parametrize(
+        "state_kwargs, k1_kept",
+        [({}, True), ({"lease_ttl_s": 0}, False)],
+        ids=["leased", "lease_expired"],
+    )
+    def test_handed_out_key_is_kept_while_leased(
+        self, hand_out_k1, state_kwargs, k1_kept
+    ):
+        """Pages handed out to a reader or rewriter are not given to new keys
+        until the lease runs out.
+        """
+        state = GlobalMetadataState(**state_kwargs)
+        state.initialize_rank(0, 2)
+        [k1_page] = _save_key(state, "K1", range(1))
+        _save_key(state, "K2", range(1))
+        hand_out_k1(state)
+
+        results = state.allocate_pages_for_keys(0, [("N1", ""), ("N2", "")])
+
+        assert (k1_page not in results.values()) == k1_kept
+        assert state.batch_key_exists(["K1"]) == [k1_kept]
