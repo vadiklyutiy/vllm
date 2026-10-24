@@ -3,21 +3,31 @@
 """Tests for HF3FS KV Connector high-level components:
 - TestHf3fsMockClient      : file-backed mock client I/O correctness
 - TestHF3FSKVConnectorStats: metric collection, aggregation, serialisation
+- test_llm_uses_configured_metadata_server_url: hf3fs_metadata_server_url is honoured
 """
 
 import os
+import threading
+import time
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
+import uvicorn
 
+from vllm import LLM
+from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector import (
     HF3FSKVConnectorStats,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_metadata_server import (
+    Hf3fsMetadataServer,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.utils.hf3fs_mock_client import (
     Hf3fsClient as MockHf3fsClient,
 )
+from vllm.utils.network_utils import get_open_port
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,6 +45,25 @@ def _make_cuda_event():
     if torch.cuda.is_available():
         return torch.cuda.Event()
     return MagicMock()
+
+
+@pytest.fixture
+def hf3fs_metadata_server():
+    """Real metadata server on a free port, away from the default 18000."""
+    server = Hf3fsMetadataServer()
+    port = get_open_port()
+    uvicorn_server = uvicorn.Server(
+        uvicorn.Config(server.app, host="127.0.0.1", port=port, log_level="warning")
+    )
+    thread = threading.Thread(target=uvicorn_server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 30
+    while not uvicorn_server.started:
+        assert thread.is_alive() and time.monotonic() < deadline
+        time.sleep(0.01)
+    yield server, f"http://127.0.0.1:{port}"
+    uvicorn_server.should_exit = True
+    thread.join()
 
 
 # ===========================================================================
@@ -231,3 +260,25 @@ class TestHF3FSKVConnectorStats:
         clone = hf3fs_stats.clone_and_reset()
         assert clone.data["num_transfer_task"] == 2
         assert hf3fs_stats.is_empty()
+
+
+def test_llm_uses_configured_metadata_server_url(hf3fs_metadata_server, tmp_path):
+    """Both the worker and the scheduler connector must reach the configured
+    metadata server, not the client's default http://localhost:18000."""
+    server, url = hf3fs_metadata_server
+    llm = LLM(
+        model="facebook/opt-125m",
+        max_model_len=512,
+        gpu_memory_utilization=0.3,
+        enforce_eager=True,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="HF3FSKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "hf3fs_storage_path": str(tmp_path),
+                "hf3fs_metadata_server_url": url,
+            },
+        ),
+    )
+    assert server.state.rank_metadata[0].num_pages > 0
+    del llm
