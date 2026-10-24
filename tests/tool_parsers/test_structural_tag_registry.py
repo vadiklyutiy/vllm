@@ -14,6 +14,7 @@ from xgrammar import get_model_structural_tag as get_xgrammar_builtin_structural
 from xgrammar.testing import _is_grammar_accept_string
 
 import vllm.envs as envs
+from tests.tool_parsers.utils import structural_tag_accepts_tokens
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedFunction,
     ChatCompletionNamedToolChoiceParam,
@@ -44,6 +45,7 @@ from vllm.tool_parsers.deepseekv32_engine_tool_parser import (
     DeepSeekV32EngineToolParser,
 )
 from vllm.tool_parsers.deepseekv41_engine_tool_parser import DeepSeekV41EngineToolParser
+from vllm.tool_parsers.gemma4_engine_tool_parser import Gemma4EngineToolParser
 from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
 from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 from vllm.tool_parsers.kimi_k2_tool_parser import KimiK2ToolParser
@@ -632,6 +634,75 @@ def test_plamo3_forced_stops_after_the_named_tool_call():
     )
 
 
+_GEMMA4_MARKER_IDS = {"<|tool_call>": 1, "<tool_call|>": 2}
+
+
+def _gemma4_call(name: str, spelled: str | None = None) -> list[str]:
+    """Tokens of a Gemma 4 call; the ``spelled`` marker is split into characters."""
+    tokens = [
+        "<|tool_call>",
+        f"call:{name}{{city:",
+        '<|"|>',
+        "Paris",
+        '<|"|>',
+        ",days:[1,{n:2}]}",
+        "<tool_call|>",
+    ]
+    return [piece for t in tokens for piece in (list(t) if t == spelled else [t])]
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "accepted"),
+    [
+        (
+            "auto",
+            {"text", "get_weather", "get_time", "get_time_twice", "spelled_start"},
+        ),
+        ("required", {"get_weather", "get_time", "get_time_twice"}),
+        (
+            ChatCompletionNamedToolChoiceParam(
+                function=ChatCompletionNamedFunction(name="get_time")
+            ),
+            {"get_time"},
+        ),
+    ],
+)
+def test_gemma4_pins_tool_call_envelope(tool_choice, accepted: set[str]):
+    """The markers (as tokens) and the function name are pinned, not arguments.
+
+    A marker spelled with plain-text tokens is not a call: the streaming parser
+    would return it as content. Under ``auto`` it is only allowed as text.
+    """
+    outputs = {
+        "text": ["It is sunny."],
+        "get_weather": _gemma4_call("get_weather"),
+        "get_time": _gemma4_call("get_time"),
+        "get_time_twice": _gemma4_call("get_time") * 2,
+        "get_timezone": _gemma4_call("get_timezone"),
+        "spelled_start": _gemma4_call("get_time", spelled="<|tool_call>"),
+        "spelled_end": _gemma4_call("get_time", spelled="<tool_call|>"),
+    }
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={"name": name, "strict": True, "parameters": {"type": "object"}},
+        )
+        for name in ("get_weather", "get_time")
+    ]
+    tag = get_model_structural_tag(
+        model="gemma4",
+        tools=tools,
+        tool_choice=tool_choice,
+        reasoning=False,
+    )
+    assert isinstance(tag, StructuralTag)
+
+    for name, output in outputs.items():
+        assert structural_tag_accepts_tokens(
+            tag.model_dump_json(), output, vocab=_GEMMA4_MARKER_IDS
+        ) == (name in accepted), name
+
+
 # ---------------------------------------------------------------------------
 # Kimi K3 (XTML channel format) structural tag
 # ---------------------------------------------------------------------------
@@ -904,6 +975,7 @@ def test_glm_4_7_forced_custom_tool_uses_function_shim():
         (Qwen3EngineToolParser, "qwen_3_coder"),
         (Step3p5ToolParser, "qwen_3_coder"),
         (MiMoToolParser, "mimo"),
+        (Gemma4EngineToolParser, "gemma4"),
     ],
 )
 def test_tool_parsers_declare_matching_xgrammar_builtin_model(parser_cls, model):

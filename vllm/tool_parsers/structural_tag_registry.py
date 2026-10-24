@@ -3,7 +3,7 @@
 
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
 from openai.types.responses import CustomTool, FunctionTool, ToolChoiceCustom
@@ -30,6 +30,7 @@ from xgrammar.structural_tag import (
     StarFormat,
     TagFormat,
     TagsWithSeparatorFormat,
+    TokenFormat,
     TokenTriggeredTagsFormat,
     TriggeredTagsFormat,
 )
@@ -83,7 +84,7 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
     }
 )
 VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
-    {"glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3"}
+    {"gemma4", "glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3"}
 )
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
@@ -282,6 +283,35 @@ def limit_to_single_tool_call(tag: StructuralTag) -> StructuralTag:
         if isinstance(node, BaseModel):
             if isinstance(node, _TOOL_CALL_LIST_FORMATS):
                 node.stop_after_first = True
+            for name in type(node).model_fields:
+                visit(getattr(node, name))
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+
+    visit(tag.format)
+    return tag
+
+
+def resolve_token_strings(
+    tag: StructuralTag, vocab: Mapping[str, int]
+) -> StructuralTag:
+    """Replace token strings in ``tag`` with their IDs in ``vocab``, in place.
+
+    Requests' structural tags are validated without a tokenizer, so a tag may
+    name tokens only by ID there.
+    """
+
+    def token_id(token: int | str) -> int:
+        return vocab[token] if isinstance(token, str) else token
+
+    def visit(node: Any) -> None:
+        if isinstance(node, BaseModel):
+            if isinstance(node, TokenFormat):
+                node.token = token_id(node.token)
+            for name in ("trigger_tokens", "exclude_tokens"):
+                if name in type(node).model_fields:
+                    setattr(node, name, [token_id(t) for t in getattr(node, name)])
             for name in type(node).model_fields:
                 visit(getattr(node, name))
         elif isinstance(node, (list, tuple)):
@@ -1179,3 +1209,60 @@ def get_glm_4_7_structural_tag(
         )
         return StructuralTag(format=SequenceFormat(elements=[prefix_tag, suffix_tag]))
     return StructuralTag(format=suffix_tag)
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 tool calls (<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>)
+# ---------------------------------------------------------------------------
+# Keys are bare and strings are wrapped in <|"|>, which no JSONSchemaFormat
+# style describes, so only the envelope (markers and function name) is pinned.
+# The markers are pinned as tokens: the streaming parser finds a call only by
+# the marker token, and a string match also admits the marker's plain spelling.
+# Gemma4EngineToolParser resolves them to token IDs.
+
+_GEMMA4_TOOL_CALL_START = "<|tool_call>"
+_GEMMA4_TOOL_CALL_END = "<tool_call|>"
+
+
+@register_vllm_structural_tag("gemma4")
+def get_gemma4_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+    token_suffix: str = "",
+) -> StructuralTag:
+    del builtin_tools, reasoning, token_suffix
+    if not tools:
+        return StructuralTag(format=AnyTextFormat())
+    arguments = AnyTextFormat(excludes=[_GEMMA4_TOOL_CALL_START, _GEMMA4_TOOL_CALL_END])
+    tag = TagFormat(
+        begin=TokenFormat(token=_GEMMA4_TOOL_CALL_START),
+        content=OrFormat(
+            elements=[
+                SequenceFormat(
+                    elements=[
+                        ConstStringFormat(value=f"call:{tool.function.name}{{"),
+                        arguments,
+                        ConstStringFormat(value="}"),
+                    ]
+                )
+                for tool in tools
+            ]
+        ),
+        end=TokenFormat(token=_GEMMA4_TOOL_CALL_END),
+    )
+    if tool_choice == "auto":
+        return StructuralTag(
+            format=TokenTriggeredTagsFormat(
+                trigger_tokens=[_GEMMA4_TOOL_CALL_START], tags=[tag]
+            )
+        )
+    return StructuralTag(
+        format=TagsWithSeparatorFormat(
+            tags=[tag],
+            separator="",
+            at_least_one=True,
+            stop_after_first=tool_choice == "forced",
+        )
+    )

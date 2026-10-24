@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TypedDict
+
+import xgrammar as xgr
 
 from vllm.entrypoints.generate.base.protocol import (
     DeltaFunctionCall,
@@ -197,3 +199,28 @@ def run_tool_extraction_streaming(
         previous_text = current_text
         previous_tokens = current_tokens
     return reconstructor
+
+
+def structural_tag_accepts_tokens(
+    structural_tag: str, tokens: Sequence[str], vocab: Mapping[str, int]
+) -> bool:
+    """Whether the grammar of ``structural_tag`` accepts ``tokens``, then stops.
+
+    Unlike ``_is_grammar_accept_string``, this checks ``TokenFormat`` parts,
+    which accept their token but not its text spelled by other tokens. Tokens
+    in ``vocab`` keep their IDs, which a tag may refer to; the rest get new IDs.
+    """
+    token_ids = {"<eos>": 0, **vocab}
+    for token in tokens:
+        token_ids.setdefault(token, max(token_ids.values()) + 1)
+    encoded_vocab = [f"<unused{i}>" for i in range(max(token_ids.values()) + 1)]
+    for token, token_id in token_ids.items():
+        encoded_vocab[token_id] = token
+    tokenizer_info = xgr.TokenizerInfo(
+        encoded_vocab, xgr.VocabType.RAW, stop_token_ids=[0]
+    )
+    compiler = xgr.GrammarCompiler(tokenizer_info, cache_enabled=False)
+    matcher = xgr.GrammarMatcher(compiler.compile_structural_tag(structural_tag))
+    return all(matcher.accept_token(token_ids[t]) for t in tokens) and (
+        matcher.accept_token(0)
+    )

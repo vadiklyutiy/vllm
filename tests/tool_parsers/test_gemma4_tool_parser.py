@@ -7,15 +7,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.tool_parsers.utils import structural_tag_accepts_tokens
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.parser.gemma4 import (
     TOOL_CALL_END,
     TOOL_CALL_START,
     _parse_gemma4_args,
     _parse_gemma4_array,
 )
+from vllm.sampling_params import SamplingParams
 from vllm.tool_parsers.gemma4_engine_tool_parser import Gemma4EngineToolParser
+from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -131,6 +135,55 @@ def test_named_custom_tool_choice_skips_structured_outputs(mock_tokenizer):
 
     assert request.skip_special_tokens is False
     assert request.structured_outputs is None
+
+
+class _Gemma4DelegatingParser(DelegatingParser):
+    tool_parser_cls = Gemma4EngineToolParser
+
+
+def test_allowed_tools_required_constrains_and_parses_native_call(mock_tokenizer):
+    request = ResponsesRequest.model_validate(
+        {
+            "input": "What is the temperature in Berlin?",
+            "tools": [
+                {"type": "function", "name": "get_temperature", "strict": True},
+                {"type": "function", "name": "get_time", "strict": True},
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "get_time"}],
+            },
+        }
+    )
+    parser = _Gemma4DelegatingParser(mock_tokenizer, tools=request.tools)
+    request = parser.adjust_request(request)
+
+    assert request.structured_outputs is not None
+    # Requests are validated without a tokenizer, so markers must be token IDs.
+    validate_xgrammar_grammar(
+        SamplingParams(structured_outputs=request.structured_outputs)
+    )
+    structural_tag = request.structured_outputs.structural_tag
+    body = 'call:get_time{timezone:<|"|>Europe/Berlin<|"|>}'
+    wrong_body = body.replace("get_time{timezone", "get_temperature{city")
+    for tokens_body, accepted in ((body, True), (wrong_body, False)):
+        tokens = [TOOL_CALL_START, tokens_body, TOOL_CALL_END]
+        assert (
+            structural_tag_accepts_tokens(
+                structural_tag, tokens, vocab=mock_tokenizer.get_vocab()
+            )
+            == accepted
+        )
+
+    call = TOOL_CALL_START + body + TOOL_CALL_END
+    _, content, tool_calls = parser.parse(call, request, enable_auto_tools=True)
+
+    assert not content
+    assert tool_calls is not None
+    assert [(c.name, json.loads(c.arguments)) for c in tool_calls] == [
+        ("get_time", {"timezone": "Europe/Berlin"})
+    ]
 
 
 # ---------------------------------------------------------------------------

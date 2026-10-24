@@ -9,10 +9,12 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.parser.engine.registered_adapters import Gemma4ParserToolAdapter
+from vllm.tool_parsers.tool_strict_level import ToolStrictLevel
 
 
 class Gemma4EngineToolParser(Gemma4ParserToolAdapter):  # type: ignore[valid-type, misc]
     supports_required_and_named = False
+    structural_tag_model = "gemma4"
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -39,3 +41,20 @@ class Gemma4EngineToolParser(Gemma4ParserToolAdapter):  # type: ignore[valid-typ
                 request.skip_special_tokens = False
                 return request
         return super().adjust_request(request)
+
+    def get_structural_tag(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        *,
+        reasoning: bool = False,
+        strict_level: ToolStrictLevel = ToolStrictLevel.AUTO,
+    ):
+        """Build the ``gemma4`` tag with its call-marker tokens given by ID."""
+        tag = super().get_structural_tag(
+            request, reasoning=reasoning, strict_level=strict_level
+        )
+        if tag is None:
+            return None
+        from vllm.tool_parsers.structural_tag_registry import resolve_token_strings
+
+        return resolve_token_strings(tag, self.vocab)
