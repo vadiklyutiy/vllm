@@ -83,7 +83,7 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
     }
 )
 VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
-    {"glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3"}
+    {"gemma4", "glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3"}
 )
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
@@ -1179,3 +1179,46 @@ def get_glm_4_7_structural_tag(
         )
         return StructuralTag(format=SequenceFormat(elements=[prefix_tag, suffix_tag]))
     return StructuralTag(format=suffix_tag)
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 tool calls (<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>)
+# ---------------------------------------------------------------------------
+# Keys are bare and strings are wrapped in <|"|>, which no JSONSchemaFormat
+# style describes, so only the envelope (markers and function name) is pinned.
+
+_GEMMA4_TOOL_CALL_START = "<|tool_call>"
+_GEMMA4_TOOL_CALL_END = "<tool_call|>"
+
+
+@register_vllm_structural_tag("gemma4")
+def get_gemma4_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+    token_suffix: str = "",
+) -> StructuralTag:
+    del builtin_tools, reasoning, token_suffix
+    tags = [
+        TagFormat(
+            begin=f"{_GEMMA4_TOOL_CALL_START}call:{tool.function.name}{{",
+            content=AnyTextFormat(),
+            end=f"}}{_GEMMA4_TOOL_CALL_END}",
+        )
+        for tool in tools
+    ]
+    if tool_choice == "auto":
+        return StructuralTag(
+            format=TriggeredTagsFormat(triggers=[_GEMMA4_TOOL_CALL_START], tags=tags)
+            if tags
+            else AnyTextFormat()
+        )
+    return StructuralTag(
+        format=TagsWithSeparatorFormat(
+            tags=tags,
+            separator="",
+            at_least_one=True,
+            stop_after_first=tool_choice == "forced",
+        )
+    )

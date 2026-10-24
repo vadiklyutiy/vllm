@@ -126,7 +126,7 @@ Structural-tag parsers resolve call obligation, grammar activation, and argument
 | `"auto"` | Tool calls are optional | When at least one tool sets `strict: true`, or `--tool-strict-level` is `function` or `parameter` |
 | `"none"` | Tool calling is disabled | Disabled |
 
-When a structural tag applies, each tool's declared parameter schema is enforced only when that tool sets `strict: true` or the server uses `--tool-strict-level parameter`. Tools with omitted or false `strict` receive broad argument-syntax constraints at levels `auto` and `function`, including for required and named calls.
+When a structural tag applies, each tool's declared parameter schema is enforced only when that tool sets `strict: true` or the server uses `--tool-strict-level parameter`. Tools with omitted or false `strict` receive broad argument-syntax constraints at levels `auto` and `function`, including for required and named calls. The `gemma4` parser constrains only the envelope, because Gemma 4 arguments are not JSON, so its argument schemas are never enforced.
 
 For parsers using schema-derived JSON constraints, required and named calls continue to enforce the declared parameter schemas.
 

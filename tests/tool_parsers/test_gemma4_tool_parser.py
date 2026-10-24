@@ -6,9 +6,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from xgrammar import Grammar
+from xgrammar.testing import _is_grammar_accept_string
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.parser.gemma4 import (
     TOOL_CALL_END,
     TOOL_CALL_START,
@@ -131,6 +134,46 @@ def test_named_custom_tool_choice_skips_structured_outputs(mock_tokenizer):
 
     assert request.skip_special_tokens is False
     assert request.structured_outputs is None
+
+
+class _Gemma4DelegatingParser(DelegatingParser):
+    tool_parser_cls = Gemma4EngineToolParser
+
+
+def test_allowed_tools_required_constrains_and_parses_native_call(mock_tokenizer):
+    request = ResponsesRequest.model_validate(
+        {
+            "input": "What is the temperature in Berlin?",
+            "tools": [
+                {"type": "function", "name": "get_temperature", "strict": True},
+                {"type": "function", "name": "get_time", "strict": True},
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "get_time"}],
+            },
+        }
+    )
+    parser = _Gemma4DelegatingParser(mock_tokenizer, tools=request.tools)
+    request = parser.adjust_request(request)
+
+    assert request.structured_outputs is not None
+    grammar = Grammar.from_structural_tag(request.structured_outputs.structural_tag)
+    call = f'{TOOL_CALL_START}call:get_time{{timezone:<|"|>Europe/Berlin<|"|>}}'
+    call += TOOL_CALL_END
+    assert _is_grammar_accept_string(grammar, call)
+    assert not _is_grammar_accept_string(
+        grammar, call.replace("get_time{timezone", "get_temperature{city")
+    )
+
+    _, content, tool_calls = parser.parse(call, request, enable_auto_tools=True)
+
+    assert not content
+    assert tool_calls is not None
+    assert [(c.name, json.loads(c.arguments)) for c in tool_calls] == [
+        ("get_time", {"timezone": "Europe/Berlin"})
+    ]
 
 
 # ---------------------------------------------------------------------------
