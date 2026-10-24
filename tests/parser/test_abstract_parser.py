@@ -17,8 +17,10 @@ from vllm.exceptions import VLLMValidationError
 from vllm.parser.abstract_parser import DelegatingParser, structured_outputs_to_format
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
+from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
 from vllm.tool_parsers.qwen3_engine_tool_parser import Qwen3EngineToolParser
 from vllm.tool_parsers.structural_tag_registry import ToolChoice
+from vllm.tool_parsers.tool_strict_level import ToolStrictLevel
 
 
 class TestToolChoice_Plus_ResponseFormat:
@@ -186,6 +188,80 @@ class TestToolChoice_Plus_ResponseFormat:
         assert out.response_format is not None
         assert out.structured_outputs is None
         mock_warn.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("level", "composes"),
+        [(None, False), (ToolStrictLevel.FUNCTION, True)],
+        ids=["parser_default", "server_floor"],
+    )
+    def test_auto_without_strict_tools_parser_default_level(
+        self, level: ToolStrictLevel | None, composes: bool
+    ):
+        """glm47 defaults to FUNCTION to constrain the calls auto allows. Unlike
+        a server floor, that default must not add tool calls next to the
+        response_format (#62483)."""
+        tools = self._tools(strict=False)
+        request = self._setup_request(
+            tools=tools,
+            tool_choice="auto",
+            response_format=self._json_schema_response_format(),
+        )
+
+        class TestParser(DelegatingParser):
+            tool_parser_cls = Glm47MoeModelToolParser
+            tool_strict_level = level
+
+        out = TestParser(MagicMock(), tools=tools).adjust_request(request)
+
+        assert isinstance(out, ChatCompletionRequest)
+        assert (out.response_format is None) == composes
+        if composes:
+            assert out.structured_outputs is not None
+            tag = json.loads(out.structured_outputs.structural_tag)
+            assert tag["format"]["type"] == "or"
+        else:
+            assert out.structured_outputs is None
+
+    def test_auto_with_strict_tools_keeps_parser_default_level(self):
+        """A strict tool composes tool calls with the response_format; the
+        parser default still constrains them."""
+        tools = [
+            *self._tools(strict=True),
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"n": {"type": "integer", "minimum": 5}},
+                        "required": ["n"],
+                    },
+                },
+            ),
+        ]
+        request = self._setup_request(
+            tools=tools,
+            tool_choice="auto",
+            response_format=self._json_schema_response_format(),
+        )
+
+        class ParameterDefaultToolParser(Glm47MoeModelToolParser):
+            default_tool_strict_level = ToolStrictLevel.PARAMETER
+
+        class TestParser(DelegatingParser):
+            tool_parser_cls = ParameterDefaultToolParser
+
+        out = TestParser(MagicMock(), tools=tools).adjust_request(request)
+
+        assert isinstance(out, ChatCompletionRequest)
+        assert out.structured_outputs is not None
+        grammar = Grammar.from_structural_tag(out.structured_outputs.structural_tag)
+        assert _is_grammar_accept_string(grammar, '{"text": "hi"}')
+        call = (
+            "<tool_call>lookup<arg_key>n</arg_key><arg_value>{}</arg_value></tool_call>"
+        )
+        assert _is_grammar_accept_string(grammar, call.format(7))
+        assert not _is_grammar_accept_string(grammar, call.format(2))
 
     def test_when_model_does_not_have_structural_tag(self):
         """Note(arpera):
