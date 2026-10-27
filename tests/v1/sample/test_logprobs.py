@@ -1329,6 +1329,42 @@ def test_spec_decode_logprobs(
         assert ref_logprob.decoded_token == spec_logprob.decoded_token
 
 
+def test_spec_decode_logprob_token_ids(monkeypatch: pytest.MonkeyPatch):
+    """Tokens from the V2 rejection sampler carry the `logprob_token_ids`
+    scores even when `logprobs` is unset, as the chat endpoint sends them."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    requested_ids = [100, 1000, 5000]
+    sampling_params = SamplingParams(
+        temperature=0, max_tokens=10, logprob_token_ids=requested_ids
+    )
+
+    with VllmRunner(
+        "Qwen/Qwen3-0.6B",
+        speculative_config={
+            "method": "ngram",
+            "prompt_lookup_max": 5,
+            "prompt_lookup_min": 3,
+            "num_speculative_tokens": 3,
+        },
+        max_model_len=256,
+        disable_log_stats=False,
+        enforce_eager=True,
+        gpu_memory_utilization=0.25,
+    ) as vllm_model:
+        outputs = vllm_model.llm.generate("Hello world " * 50, sampling_params)
+        metrics = vllm_model.llm.get_metrics()
+
+    num_draft_tokens = next(
+        m.value for m in metrics if m.name == "vllm:spec_decode_num_draft_tokens"
+    )
+    assert num_draft_tokens > 0, "No draft tokens reached the rejection sampler"
+    output = outputs[0].outputs[0]
+    assert output.logprobs is not None
+    assert len(output.logprobs) == len(output.token_ids)
+    for token_id, logprobs in zip(output.token_ids, output.logprobs):
+        assert set(logprobs) == {token_id, *requested_ids}
+
+
 def test_prompt_logprobs_with_chunking_and_preemption():
     """Test that prompt logprobs are correctly returned when using
     both chunked prefill and preemption.

@@ -469,10 +469,8 @@ def _pack_logprobs_kernel(
         src = start + pos
         dst = req_idx * max_num_logits_per_req + pos
         cols = tl.arange(0, BLOCK_SIZE)
-        # A rank whose sub-batch has no draft tokens runs the regular sampler
-        # while others run the rejection sampler, and their column counts can
-        # differ (e.g. logprob_token_ids widening); the two masks pad or
-        # truncate to the agreed width.
+        # Each rank sizes its logprobs from its own requests, so its column
+        # count can be below the agreed width; the masks pad it.
         src_mask = cols < num_src_cols
         dst_mask = cols < num_logprob_cols
         ids = tl.load(src_ids_ptr + src * src_ids_stride + cols, mask=src_mask, other=0)

@@ -16,7 +16,12 @@ from tests.utils import wait_for_memory_to_settle
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 
-from .utils import _skip_if_insufficient_gpus_for_tp, get_test_prompts, greedy_sampling
+from .utils import (
+    _skip_if_insufficient_gpus_for_tp,
+    get_spec_decode_metric_value,
+    get_test_prompts,
+    greedy_sampling,
+)
 
 # Even with in-process scheduling, near-tie tokens still flip on up to 3 of 20
 # prompts in CI, greedy and seeded. A sharding bug diverges wholesale instead.
@@ -101,3 +106,56 @@ def test_mtp_sharded_sampling_equivalence(monkeypatch: pytest.MonkeyPatch):
                 f"{name}: {len(divergent)}/{len(ref_outputs)} prompts diverged "
                 f"at {divergent}, beyond near-tie noise"
             )
+
+
+def test_ngram_sharded_sampling_logprob_token_ids(monkeypatch: pytest.MonkeyPatch):
+    """The batch-sharded gather keeps the `logprob_token_ids` scores of
+    rejection-sampled tokens when `logprobs` is unset."""
+    tp_size = 2
+    _skip_if_insufficient_gpus_for_tp(tp_size)
+    requested_ids = [100, 1000, 5000]
+    # More requests than ranks, so every rank samples some of them.
+    prompts = ["Hello world " * 50, "The cat sat on the mat. " * 20] * 2
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        # Required for the collective_rpc mode check below.
+        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+        llm = LLM(
+            model="meta-llama/Llama-3.2-1B-Instruct",
+            tensor_parallel_size=tp_size,
+            enable_batch_sharded_sampling=True,
+            speculative_config={
+                "method": "ngram",
+                "prompt_lookup_max": 5,
+                "prompt_lookup_min": 3,
+                "num_speculative_tokens": 3,
+            },
+            max_model_len=1024,
+            max_num_seqs=len(prompts),
+            disable_log_stats=False,
+        )
+        try:
+            assert all(llm.llm_engine.collective_rpc(_is_sharded_sampling_active))
+            outputs = llm.generate(
+                prompts,
+                SamplingParams(
+                    temperature=0, max_tokens=10, logprob_token_ids=requested_ids
+                ),
+            )
+            num_draft_tokens = get_spec_decode_metric_value(
+                llm.get_metrics(), "vllm:spec_decode_num_draft_tokens"
+            )
+        finally:
+            del llm
+            torch.accelerator.empty_cache()
+            cleanup_dist_env_and_memory()
+            wait_for_memory_to_settle()
+
+    assert num_draft_tokens > 0, "No draft tokens reached the rejection sampler"
+    for output in outputs:
+        completion = output.outputs[0]
+        assert completion.logprobs is not None
+        assert len(completion.logprobs) == len(completion.token_ids)
+        for token_id, logprobs in zip(completion.token_ids, completion.logprobs):
+            assert set(logprobs) == {token_id, *requested_ids}

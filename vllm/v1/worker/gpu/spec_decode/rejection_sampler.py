@@ -188,6 +188,8 @@ class RejectionSampler:
         cu_num_logits: torch.Tensor,
         cu_num_logits_np: np.ndarray,
         max_num_logprobs: int,
+        expanded_idx_mapping: torch.Tensor | None = None,
+        max_per_req_token_ids: int = 0,
     ) -> LogprobsTensors | None:
         if max_num_logprobs == NO_LOGPROBS:
             return None
@@ -219,6 +221,11 @@ class RejectionSampler:
             max_num_logprobs,
             flat_sampled,
             cu_num_generated_tokens,
+            logprob_token_ids_state=(
+                self.sampler.logprob_token_ids_state if max_per_req_token_ids else None
+            ),
+            expanded_idx_mapping=expanded_idx_mapping,
+            max_per_req_token_ids=max_per_req_token_ids,
             logits_mode=self.sampler.logprobs_mode
             in ("raw_logits", "processed_logits"),
         )
@@ -305,6 +312,7 @@ class RejectionSampler:
         max_chunk_logits: int,
         max_num_logprobs: int,
         verify_draft_sampled: torch.Tensor | None = None,
+        max_per_req_token_ids: int = 0,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -365,6 +373,8 @@ class RejectionSampler:
                 chunk_cu_num_logits,
                 chunk_cu_num_logits_np,
                 max_num_logprobs,
+                input_batch.expanded_idx_mapping[lo:hi],
+                max_per_req_token_ids,
             )
             if chunk_logprobs is not None:
                 logprobs_chunks.append(chunk_logprobs)
@@ -441,9 +451,8 @@ class RejectionSampler:
         if invalid_drafts is not None:
             verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)
 
-        max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
-            input_batch.idx_mapping_np
-        )
+        logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
+        max_num_logprobs, max_per_req_token_ids = logprobs_dims or (NO_LOGPROBS, 0)
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
         (
             sampled,
@@ -459,6 +468,7 @@ class RejectionSampler:
             chunk_logit_limit,
             max_num_logprobs,
             verify_draft_sampled,
+            max_per_req_token_ids,
         )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(

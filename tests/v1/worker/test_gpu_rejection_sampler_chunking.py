@@ -8,8 +8,10 @@ import numpy as np
 import pytest
 import torch
 
+from vllm import SamplingParams
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.platforms import current_platform
+from vllm.v1.worker.gpu.sample.logprob import LogprobTokenIdsState
 from vllm.v1.worker.gpu.sample.output import SamplingMaskTensors
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
@@ -148,6 +150,70 @@ def test_chunked_scores_match_full_batch(
         == full_logprobs.cu_num_generated_tokens
     )
     assert sampling_mask_tensors is None
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="Requires CUDA or XPU",
+)
+def test_chunked_logprob_token_ids_match_full_batch(monkeypatch: pytest.MonkeyPatch):
+    """Each verification chunk scores the `logprob_token_ids` of its own requests."""
+    device = torch.device(current_platform.device_type)
+    cu_num_logits_np = np.array([0, 3, 4, 8, 10], dtype=np.int32)
+    idx_mapping_np = np.array([7, 2, 9, 1], dtype=np.int32)
+    input_batch = _make_input_batch(cu_num_logits_np, idx_mapping_np, device)
+    token_ids_state = LogprobTokenIdsState(max_num_reqs=10, device=device)
+    for req_idx, token_ids in ((7, [3]), (2, None), (9, [5, 6, 11]), (1, [16, 0])):
+        token_ids_state.add_request(
+            req_idx, SamplingParams(logprob_token_ids=token_ids)
+        )
+    token_ids_state.apply_staged_writes()
+    rejection_sampler = _make_rejection_sampler(
+        SimpleNamespace(
+            logprobs_mode="raw_logprobs",
+            return_sampling_mask=False,
+            logprob_token_ids_state=token_ids_state,
+        ),
+        num_speculative_steps=3,
+    )
+
+    def fake_verify(self, logits, _dl, _ds, _pos, cu_num_logits, *_):
+        num_sampled = torch.diff(cu_num_logits).to(torch.int32)
+        sampled = torch.zeros(len(num_sampled), 4, dtype=torch.int64, device=device)
+        return logits, sampled, num_sampled
+
+    monkeypatch.setattr(
+        rejection_sampler, "_verify", MethodType(fake_verify, rejection_sampler)
+    )
+    logits = torch.randn(10, 17, device=device)
+
+    sampled, num_sampled, chunked_logprobs, _ = rejection_sampler._verify_in_chunks(
+        logits,
+        input_batch,
+        draft_logits=None,
+        draft_sampled=torch.arange(10, device=device),
+        pos=torch.arange(10, device=device),
+        max_chunk_logits=5,
+        max_num_logprobs=1,
+        max_per_req_token_ids=3,
+    )
+    full_logprobs = rejection_sampler._get_logprobs_tensors(
+        sampled,
+        num_sampled,
+        logits,
+        input_batch.cu_num_logits,
+        input_batch.cu_num_logits_np,
+        max_num_logprobs=1,
+        expanded_idx_mapping=input_batch.expanded_idx_mapping,
+        max_per_req_token_ids=3,
+    )
+
+    assert chunked_logprobs is not None and full_logprobs is not None
+    assert chunked_logprobs.logprob_token_ids[4:8, 1:].tolist() == [[5, 6, 11]] * 4
+    assert torch.equal(
+        chunked_logprobs.logprob_token_ids, full_logprobs.logprob_token_ids
+    )
+    assert torch.equal(chunked_logprobs.logprobs, full_logprobs.logprobs)
 
 
 @pytest.mark.skipif(
