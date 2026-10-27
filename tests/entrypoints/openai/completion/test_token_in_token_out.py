@@ -70,3 +70,26 @@ async def test_token_in_token_out_and_logprobs(server):
             prompt_text = tokenizer.decode(completion.choices[0].prompt_token_ids)
             # The decoded prompt should match or close to original prompt
             assert prompt_text == text
+
+
+@pytest.mark.asyncio
+async def test_logprobs_keep_stop_token(server):
+    """Without a tokenizer there is no text, so the logprobs keep the stop
+    token. allowed_token_ids makes the stop token the first sampled token."""
+    async with server.get_async_client() as client:
+        completion = await client.completions.create(
+            model=MODEL_PATH,
+            prompt=[9707, 11, 1879],
+            max_tokens=5,
+            temperature=0,
+            logprobs=0,
+            extra_body={
+                "allowed_token_ids": [13],
+                "stop_token_ids": [13],
+                "return_tokens_as_token_ids": True,
+            },
+        )
+
+    choice = completion.choices[0]
+    assert choice.finish_reason == "stop"
+    assert choice.logprobs.tokens == ["token_id:13"]

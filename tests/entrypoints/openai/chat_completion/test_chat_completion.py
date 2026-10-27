@@ -304,3 +304,35 @@ async def test_per_request_metrics_on_final_usage_chunk(client: openai.AsyncOpen
     assert metrics["queue_time_ms"] >= 0
     assert metrics["tokens_per_second"] >= 0
     assert "mean_itl_ms" not in metrics
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_logprobs_leave_out_eos(client: openai.AsyncOpenAI, stream: bool):
+    """The EOS token that ends generation is not in the content, so it has no
+    logprobs entry either. The choice grammar forces EOS right after the
+    answer."""
+    kwargs = dict(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Is the sky blue?"}],
+        max_completion_tokens=16,
+        temperature=0,
+        logprobs=True,
+        extra_body={"structured_outputs": {"choice": ["yes", "no"]}},
+    )
+    if stream:
+        content, tokens = "", []
+        async for chunk in await client.chat.completions.create(stream=True, **kwargs):
+            choice = chunk.choices[0]
+            content += choice.delta.content or ""
+            if choice.logprobs is not None:
+                tokens += [entry.token for entry in choice.logprobs.content]
+            finish_reason = choice.finish_reason
+    else:
+        choice = (await client.chat.completions.create(**kwargs)).choices[0]
+        content = choice.message.content
+        tokens = [entry.token for entry in choice.logprobs.content]
+        finish_reason = choice.finish_reason
+
+    assert finish_reason == "stop"
+    assert "".join(tokens) == content

@@ -694,6 +694,66 @@ async def test_echo_logprob_completion(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("echo", [False, True])
+async def test_logprobs_leave_out_eos(
+    client: openai.AsyncOpenAI, stream: bool, echo: bool
+):
+    """The EOS token that ends generation is not in the text, so it has no
+    logprobs entry either. The choice grammar forces EOS right after the
+    answer."""
+    kwargs = dict(
+        model=MODEL_NAME,
+        prompt="Is the sky blue? Answer:",
+        max_tokens=16,
+        temperature=0.0,
+        echo=echo,
+        logprobs=0,
+        extra_body={"structured_outputs": {"choice": [" yes", " no"]}},
+    )
+    if stream:
+        text, tokens = "", []
+        async for chunk in await client.completions.create(stream=True, **kwargs):
+            choice = chunk.choices[0]
+            text += choice.text
+            if choice.logprobs is not None:
+                tokens += choice.logprobs.tokens
+            finish_reason = choice.finish_reason
+    else:
+        choice = (await client.completions.create(**kwargs)).choices[0]
+        text = choice.text
+        tokens = choice.logprobs.tokens
+        finish_reason = choice.finish_reason
+
+    assert finish_reason == "stop"
+    assert "".join(tokens) == text
+
+
+@pytest.mark.asyncio
+async def test_logprobs_leave_out_first_token_stop(client: openai.AsyncOpenAI):
+    """The first streamed chunk echoes the prompt and, here, also carries the
+    stop token, because allowed_token_ids makes it the first sampled token."""
+    text, tokens = "", []
+    async for chunk in await client.completions.create(
+        model=MODEL_NAME,
+        prompt="Is the sky blue? Answer:",
+        max_tokens=16,
+        temperature=0.0,
+        echo=True,
+        logprobs=0,
+        stream=True,
+        extra_body={"allowed_token_ids": [9834], "stop_token_ids": [9834]},
+    ):
+        choice = chunk.choices[0]
+        text += choice.text
+        if choice.logprobs is not None:
+            tokens += choice.logprobs.tokens
+
+    assert choice.finish_reason == "stop"
+    assert "".join(tokens) == text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model_name",
     [MODEL_NAME],

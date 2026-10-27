@@ -370,7 +370,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             delta_text = prompt_text + output.text
                             delta_token_ids = [
                                 *prompt_token_ids,
-                                *output.token_ids,
+                                *self._get_logprob_token_ids(
+                                    output, request, tokenizer
+                                ),
                             ]
                             out_logprobs = [
                                 *(prompt_logprobs or []),
@@ -381,7 +383,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     else:
                         # return just the delta
                         delta_text = output.text
-                        delta_token_ids = output.token_ids
+                        delta_token_ids = self._get_logprob_token_ids(
+                            output, request, tokenizer
+                        )
                         out_logprobs = output.logprobs
 
                         # has_echoed[i] is reused here to indicate whether
@@ -596,7 +600,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         out_logprobs = prompt_logprobs
                         output_text = prompt_text
                     else:
-                        token_ids = [*prompt_token_ids, *output.token_ids]
+                        token_ids = [
+                            *prompt_token_ids,
+                            *self._get_logprob_token_ids(output, request, tokenizer),
+                        ]
 
                         if request.logprobs is None:
                             out_logprobs = None
@@ -610,7 +617,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
                         output_text = prompt_text + output.text
                 else:
-                    token_ids = output.token_ids
+                    token_ids = self._get_logprob_token_ids(output, request, tokenizer)
                     out_logprobs = output.logprobs
                     output_text = output.text
 

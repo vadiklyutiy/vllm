@@ -251,6 +251,36 @@ async def test_batched_chat_completions_logprob_token_ids(
     }
 
 
+@pytest.mark.asyncio
+async def test_batched_chat_completions_logprobs_leave_out_eos(
+    server: RemoteOpenAIServer,
+) -> None:
+    """The EOS token that ends generation is not in the content, so it has no
+    logprobs entry either. The choice grammar forces EOS right after the
+    answer."""
+    conversations = [[{"role": "user", "content": "Is the sky blue?"}]]
+
+    async with httpx.AsyncClient() as http_client:
+        response = await http_client.post(
+            f"{server.url_for('v1/chat/completions/batch')}",
+            json={
+                "model": MODEL_NAME,
+                "messages": conversations,
+                "max_tokens": 16,
+                "temperature": 0,
+                "logprobs": True,
+                "structured_outputs": {"choice": ["yes", "no"]},
+            },
+            timeout=60,
+        )
+
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    tokens = [entry["token"] for entry in choice["logprobs"]["content"]]
+    assert "".join(tokens) == choice["message"]["content"]
+
+
 def _make_request_output(
     prompt_idx: int,
     text: str,

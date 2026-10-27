@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import ClassVar, Generic, TypeVar
@@ -17,7 +17,10 @@ from vllm.entrypoints.generate.base.protocol import (
     SpeculativeDecodingMetrics,
 )
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
+    ChatCompletionRequest,
+)
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
@@ -30,6 +33,7 @@ from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.outputs import CompletionOutput
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import convert_ids_list_to_tokens
 from vllm.v1.metrics.stats import RequestStateStats
@@ -317,6 +321,38 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             )
 
         return tokenizer.decode([token_id])
+
+    @staticmethod
+    def _get_logprob_token_ids(
+        output: CompletionOutput,
+        request: ChatCompletionRequest | CompletionRequest | BatchChatCompletionRequest,
+        tokenizer: TokenizerLike | None,
+    ) -> Sequence[int]:
+        """The generated token ids to report logprobs for.
+
+        The engine's detokenizer leaves the token that stopped generation (the
+        `stop_token_ids` entry reported as `stop_reason`, or else EOS) out of
+        the text, so it is left out here too. It is kept when the text keeps
+        it (`include_stop_str_in_output`) or when the response returns it in
+        `token_ids`, which the logprobs pair with. Without a tokenizer there is
+        no text, so nothing is left out. Beam search already leaves it out of
+        `token_ids`.
+        """
+        token_ids = output.token_ids
+        if (
+            tokenizer is None
+            or request.include_stop_str_in_output
+            or request.return_token_ids
+            or output.finish_reason != "stop"
+            or not token_ids
+        ):
+            return token_ids
+        stop_token_id = output.stop_reason
+        if stop_token_id is None:
+            stop_token_id = tokenizer.eos_token_id
+        if token_ids[-1] != stop_token_id:
+            return token_ids
+        return token_ids[:-1]
 
 
 def format_token_id_placeholder(token_id: int) -> str:

@@ -688,7 +688,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     if request.logprobs:
                         assert output.logprobs is not None, "Did not output logprobs"
                         logprobs = self._create_chat_logprobs(
-                            token_ids=output.token_ids,
+                            token_ids=self._get_logprob_token_ids(
+                                output, request, tokenizer
+                            ),
                             top_logprobs=output.logprobs,
                             tokenizer=tokenizer,
                             num_output_top_logprobs=request.top_logprobs,
@@ -1001,7 +1003,7 @@ class OpenAIServingChat(GenerateBaseServing):
             if request.logprobs:
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
-                    token_ids=token_ids,
+                    token_ids=self._get_logprob_token_ids(output, request, tokenizer),
                     top_logprobs=out_logprobs,
                     num_output_top_logprobs=request.top_logprobs,
                     logprob_token_ids=request.logprob_token_ids,

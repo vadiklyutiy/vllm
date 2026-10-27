@@ -286,6 +286,43 @@ async def test_comparison_with_prompt_logprobs_and_logprobs(server):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_token_ids_align_with_logprobs_on_eos(server, stream: bool):
+    """token_ids keep the EOS that ended generation, so the logprobs keep it
+    too. The choice grammar forces EOS right after the answer."""
+    kwargs = dict(
+        model=MODEL_NAME,
+        prompt="Is the sky blue? Answer:",
+        max_tokens=16,
+        temperature=0,
+        logprobs=1,
+        extra_body={
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "structured_outputs": {"choice": [" yes", " no"]},
+        },
+    )
+    async with server.get_async_client() as client:
+        if stream:
+            token_ids: list[int] = []
+            logprob_tokens: list[str] = []
+            async for chunk in await client.completions.create(stream=True, **kwargs):
+                choice = chunk.choices[0]
+                token_ids += choice.token_ids or []
+                if choice.logprobs is not None:
+                    logprob_tokens += choice.logprobs.tokens
+                finish_reason = choice.finish_reason
+        else:
+            choice = (await client.completions.create(**kwargs)).choices[0]
+            token_ids = choice.token_ids
+            logprob_tokens = choice.logprobs.tokens
+            finish_reason = choice.finish_reason
+
+    assert finish_reason == "stop"
+    assert logprob_tokens == [f"token_id:{t}" for t in token_ids]
+
+
+@pytest.mark.asyncio
 async def test_chat_completion_with_emoji_and_token_ids(server):
     """Test chat completion with emojis to verify token_ids handling."""
     chat_messages = [
