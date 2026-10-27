@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 VLLM_ATTN_IMPL = "vllm"
 VLLM_MLA_ATTN_IMPL = "vllm_mla"
+# Transformers only hands `cu_seqlens` to implementations with "flash" in the name
+VLLM_ENCODER_ATTN_IMPL = "vllm_flash_encoder"
 
 
 def _is_interface_lookup(node: ast.expr | None) -> bool:

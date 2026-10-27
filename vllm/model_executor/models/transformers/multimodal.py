@@ -16,17 +16,22 @@
 # limitations under the License.
 """Transformers modeling backend mixin for multi-modal models."""
 
+import inspect
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from types import UnionType
+from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
 
 import torch
 import transformers
 
-from vllm.compilation.decorators import should_torch_compile_mm_encoder
+from vllm.compilation.decorators import (
+    DynamicArgDims,
+    should_torch_compile_mm_encoder,
+)
 from vllm.config.utils import getattr_iter
 from vllm.inputs import MultiModalDataBuiltins, MultiModalDataDict
 from vllm.logger import init_logger
@@ -36,6 +41,9 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.transformers.fusers.attention import (
+    VLLM_ENCODER_ATTN_IMPL,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargsItems
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalFieldConfig
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems, MultiModalDataParser
@@ -77,6 +85,63 @@ _MAX_FRAMES_PER_VIDEO = 16
 _MAX_DUMMY_SIDE = 10_000
 # Tiny inputs trip processors' channel-axis inference
 _MIN_DUMMY_SIDE = 224
+
+
+def _may_be_tensor(annotation: Any) -> bool:
+    """Whether a parameter annotated with `annotation` may receive a tensor.
+
+    Unannotated parameters may, and legacy types such as `torch.BoolTensor` are not
+    subclasses of `torch.Tensor`."""
+    if annotation is inspect.Parameter.empty:
+        return True
+    members = [annotation]
+    if get_origin(annotation) in {Union, UnionType}:
+        members = [m for m in get_args(annotation) if m is not type(None)]
+    return all(
+        m in torch._tensor_classes
+        or (isinstance(m, type) and issubclass(m, torch.Tensor))
+        for m in members
+    )
+
+
+def _infer_encoder_dynamic_arg_dims(cls: type["PreTrainedModel"]) -> DynamicArgDims:
+    """Dim 0 of every tensor `cls.forward` may receive, including through `**kwargs`."""
+    params = list(inspect.signature(cls.forward).parameters.values())[1:]
+    return {
+        p.name: 0
+        for p in params
+        if p.kind is p.VAR_KEYWORD
+        or (p.kind is not p.VAR_POSITIONAL and _may_be_tensor(p.annotation))
+    }
+
+
+def _precompute_metadata_before_call(cls: type["PreTrainedModel"]) -> None:
+    """Make calls to `cls` precompute the metadata Transformers derives from the size
+    of each item (e.g. `cu_seqlens` and `position_ids` from `grid_thw`), which its
+    forward then takes from `**kwargs` instead.
+
+    Transformers derives it in Python loops over the items, which would fix the
+    compiled forward to the number of items it was traced with."""
+    if getattr(cls.__call__, "precomputes_metadata", False):
+        return
+    # Not part of the public `transformers.exporters` API, so only import it when
+    # an encoder is compiled
+    from transformers.exporters.utils import precompute_export_inputs
+
+    call = cls.__call__
+    signature = inspect.signature(cls.forward)
+
+    def __call__(self, *args, **kwargs):
+        if self.do_not_compile:
+            return call(self, *args, **kwargs)
+        inputs = signature.bind(self, *args, **kwargs).arguments
+        given = set(inputs)
+        precompute_export_inputs(self, inputs)
+        kwargs.update((k, v) for k, v in inputs.items() if k not in given)
+        return call(self, *args, **kwargs)
+
+    __call__.precomputes_metadata = True  # type: ignore[attr-defined]
+    cls.__call__ = __call__
 
 
 def _get_embed_token_id(replacement_ids: torch.Tensor) -> int:
@@ -853,6 +918,22 @@ class MultiModalMixin(SupportsMultiModal, SupportsMRoPE, Base):
     def __init__(self, *, vllm_config: "VllmConfig", prefix: str = ""):
         # Skip SupportsMRoPE.__init__ and call the next class in MRO
         super(SupportsMRoPE, self).__init__(vllm_config=vllm_config, prefix=prefix)
+        if self.compilation_config.compile_mm_encoder:
+            self._use_encoder_attention_for_packed_encoders()
+
+    def _use_encoder_attention_for_packed_encoders(self):
+        """Point the encoders which pack all items into one sequence at vLLM's
+        encoder attention, which takes the item boundaries as a tensor.
+
+        Set after `self.model` is built, because Transformers refuses "flash"
+        implementations it cannot load a kernel for."""
+        encoder_classes = tuple(self._pre_trained_model_classes.encoders.values())
+        for module in self.model.modules():
+            if isinstance(module, encoder_classes) and any(
+                "cu_seqlens" in inspect.signature(m.forward).parameters
+                for m in module.modules()
+            ):
+                module.config._attn_implementation = VLLM_ENCODER_ATTN_IMPL
 
     def _find_encoder_classes(
         self, model: "PreTrainedModel"
@@ -939,8 +1020,7 @@ class MultiModalMixin(SupportsMultiModal, SupportsMRoPE, Base):
                 "Multimodal encoder compilation with the Transformers modeling backend "
                 "is an experimental feature. It relies on:\n"
                 "- The encoder being torch compilable.\n"
-                "- All encoder tensor inputs must be type hinted as either "
-                "`torch.Tensor` or `torch.FloatTensor`.\n"
+                "- All unannotated encoder inputs being tensors.\n"
                 "- The 0-th dimension of all tensor inputs to the encoder being the "
                 "dynamic dimension (e.g. sequence length, number of patches).\n"
                 "Please report any issues you encounter to help us improve it."
@@ -949,12 +1029,11 @@ class MultiModalMixin(SupportsMultiModal, SupportsMRoPE, Base):
             for encoder_cls in dict.fromkeys(encoder_classes.values()):
                 self._decorate_cls_for_torch_compile(
                     cls=encoder_cls,
-                    # TODO: properly infer dynamic_arg_dims based on the encoder's
-                    # forward method signature. We assume dim 0 for all tensor inputs.
-                    dynamic_arg_dims=None,
+                    dynamic_arg_dims=_infer_encoder_dynamic_arg_dims(encoder_cls),
                     enable_if=should_torch_compile_mm_encoder,
                     is_encoder=True,
                 )
+                _precompute_metadata_before_call(encoder_cls)
 
     def forward(
         self,

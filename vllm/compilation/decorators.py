@@ -171,6 +171,8 @@ def support_torch_compile(
     - if it is `None`, ignored.
     - if it is `IntermediateTensors`, all the tensors in the intermediate
         tensors will be marked as dynamic.
+    - if it is a `dict` (e.g. `**kwargs`), all the tensors in it will be
+        marked as dynamic.
     - otherwise, it will raise an error.
 
     NOTE: if an argument is `None`, it should always be passed as `None` during
@@ -504,6 +506,15 @@ def _support_torch_compile(
                     mark_dynamic(arg, dim_shape_pairs)
                 elif isinstance(arg, IntermediateTensors):
                     for tensor in arg.tensors.values():
+                        dim_shape_pairs = [
+                            (tensor.ndim + d if d < 0 else d, dim_to_shape_id.get(d))
+                            for d in dims
+                        ]
+                        mark_dynamic(tensor, dim_shape_pairs)
+                elif isinstance(arg, dict):
+                    for tensor in arg.values():
+                        if not isinstance(tensor, torch.Tensor):
+                            continue
                         dim_shape_pairs = [
                             (tensor.ndim + d if d < 0 else d, dim_to_shape_id.get(d))
                             for d in dims

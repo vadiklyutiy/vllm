@@ -3,8 +3,15 @@
 from functools import partial
 
 import pytest
+import torch
+from transformers import AutoProcessor
 
-from tests.models.utils import dummy_hf_overrides
+from tests.models.utils import (
+    check_embeddings_close,
+    check_logprobs_close,
+    dummy_hf_overrides,
+)
+from vllm import SamplingParams
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
@@ -181,6 +188,90 @@ def test_paddleocr_vl_compilation(
         ) as _,
     ):
         pass
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+@pytest.mark.parametrize(
+    ("model", "max_num_batched_tokens"),
+    [
+        # Encoder `pixel_values` is unannotated, `patch_attention_mask` a BoolTensor
+        pytest.param("HuggingFaceTB/SmolVLM-256M-Instruct", None, id="smolvlm"),
+        # Encoder packs all images into one sequence and derives where each starts
+        # from `grid_thw`, while traced with one or with two dummy images
+        pytest.param("Qwen/Qwen3-VL-2B-Instruct", None, id="qwen3_vl"),
+        pytest.param("Qwen/Qwen3-VL-2B-Instruct", 32768, id="qwen3_vl-2-dummies"),
+    ],
+)
+def test_transformers_backend_encoder_compilation(
+    vllm_runner,
+    image_assets,
+    monkeypatch,
+    model: str,
+    max_num_batched_tokens: int | None,
+):
+    """Test that the Transformers modeling backend compiles the encoder, and that
+    the compiled encoder matches the eager one on a batch of two images."""
+    # Disable multiprocessing so that the counter is in the same process
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    # Different sizes, so the items packed into one sequence differ in length
+    sizes = [(448, 448), (336, 448)]
+    images = [asset.pil_image.resize(size) for asset, size in zip(image_assets, sizes)]
+    content = [{"type": "image_pil", "image_pil": image} for image in images]
+    content.append({"type": "text", "text": "Describe the two images."})
+    messages = [{"role": "user", "content": content}]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=16, logprobs=5)
+    image_inputs = AutoProcessor.from_pretrained(model).image_processor(
+        images, return_tensors="pt"
+    )
+
+    def embed_images(vllm_model) -> list[list[float]]:
+        hf_model = vllm_model.model
+        inputs = {k: v.to(hf_model.device) for k, v in image_inputs.items()}
+        with torch.inference_mode():
+            output = hf_model.get_image_features(**inputs, return_dict=True)
+        return [embeds.flatten().tolist() for embeds in output.pooler_output]
+
+    def chat(compile_mm_encoder: bool):
+        with vllm_runner(
+            model,
+            model_impl="transformers",
+            max_model_len=4096,
+            max_num_batched_tokens=max_num_batched_tokens,
+            limit_mm_per_prompt={"image": 2},
+            gpu_memory_utilization=0.5,
+            compilation_config={
+                "mode": CompilationMode.VLLM_COMPILE,
+                "compile_mm_encoder": compile_mm_encoder,
+            },
+        ) as vllm_model:
+            (output,) = vllm_model.llm.chat(messages, sampling_params)
+            (image_embeds,) = vllm_model.llm.apply_model(embed_images)
+        completion = output.outputs[0]
+        outputs = [(list(completion.token_ids), completion.text, completion.logprobs)]
+        return outputs, image_embeds
+
+    # Compiled first: decorating the classes is global, so later runs count more
+    with compilation_counter.expect(num_models_seen=2):
+        compiled, compiled_embeds = chat(compile_mm_encoder=True)
+    eager, eager_embeds = chat(compile_mm_encoder=False)
+
+    check_logprobs_close(
+        outputs_0_lst=eager,
+        outputs_1_lst=compiled,
+        name_0="eager_encoder",
+        name_1="compiled_encoder",
+    )
+    check_embeddings_close(
+        embeddings_0_lst=eager_embeds,
+        embeddings_1_lst=compiled_embeds,
+        name_0="eager_encoder",
+        name_1="compiled_encoder",
+        # Inductor's bf16 kernels round differently from eager
+        tol=1e-2,
+    )
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073

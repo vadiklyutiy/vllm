@@ -23,6 +23,9 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from vllm.model_executor.models.transformers.base import VLLM_ATTN_ATTR
 from vllm.model_executor.models.transformers.causal import CausalMixin
+from vllm.model_executor.models.transformers.fusers.attention import (
+    VLLM_ENCODER_ATTN_IMPL,
+)
 from vllm.model_executor.models.transformers.legacy import LegacyMixin
 from vllm.model_executor.models.transformers.moe import MoEMixin
 from vllm.model_executor.models.transformers.multimodal import (
@@ -36,6 +39,7 @@ from vllm.model_executor.models.transformers.pooling import (
     SequenceClassificationMixin,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.v1.attention.ops.vit_attn_wrappers import vit_torch_sdpa_wrapper
 
 if TYPE_CHECKING:
     import torch
@@ -121,8 +125,30 @@ def vllm_mla_attention_forward(
     return attn_output, None
 
 
+def vllm_encoder_attention_forward(
+    # Transformers args
+    module: "torch.nn.Module",
+    query: "torch.Tensor",
+    key: "torch.Tensor",
+    value: "torch.Tensor",
+    attention_mask: "torch.Tensor | None",
+    scaling: float | None = None,
+    cu_seq_lens_q: "torch.Tensor | None" = None,
+    **kwargs,
+):
+    enable_gqa = key.shape[1] != query.shape[1]
+    # [batch, heads, seq_len, head_dim] -> [batch, seq_len, heads, head_dim]
+    query, key, value = (x.transpose(1, 2) for x in (query, key, value))
+    # A custom op, so the split at `cu_seq_lens_q` is hidden from torch.compile
+    attn_output = vit_torch_sdpa_wrapper(
+        query, key, value, scaling, cu_seq_lens_q, enable_gqa=enable_gqa
+    )
+    return attn_output, None
+
+
 ALL_ATTENTION_FUNCTIONS.register("vllm", vllm_attention_forward)
 ALL_ATTENTION_FUNCTIONS.register("vllm_mla", vllm_mla_attention_forward)
+ALL_ATTENTION_FUNCTIONS.register(VLLM_ENCODER_ATTN_IMPL, vllm_encoder_attention_forward)
 
 
 # Text only models
