@@ -616,11 +616,9 @@ class RadioWithNeck(nn.Module):
             torch.cat(positioned_pages, dim=1), imgs_sizes=image_sizes
         )
         hidden = patch_generator.patch_normalizer(hidden)
-        mask_meta = None
-        if len(image_sizes) > 1:
-            mask_meta = backbone.inter_image_mask_metadata(
-                image_sizes, device=hidden.device
-            )
+        mask_meta = backbone.inter_image_mask_metadata(
+            image_sizes, device=hidden.device
+        )
         hidden = backbone.encoder(inputs_embeds=hidden, mask_meta=mask_meta)
 
         cursor = 0

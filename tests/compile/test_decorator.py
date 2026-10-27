@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
+import weakref
+
 import pytest
 import torch
 from torch import nn
@@ -159,6 +162,36 @@ def test_ignore_torch_compile_decorator(use_inductor_graph_partition, monkeypatc
         num_cudagraph_captured=expected_num_cudagraph_captured,
     ):
         run_model(vllm_config, mod_C, cudagraph_runtime_mode)
+
+
+def test_redecorated_subclass_cleanup_frees_module(monkeypatch):
+    """Engine cleanup must drop every bytecode hook of a decorated subclass of
+    a decorated class, or the hooks keep the module and its weights alive."""
+    monkeypatch.setenv("VLLM_USE_BYTECODE_HOOK", "1")
+    vllm_config = VllmConfig(
+        compilation_config=CompilationConfig(mode=CompilationMode.VLLM_COMPILE)
+    )
+
+    @support_torch_compile
+    class A(nn.Module):
+        def __init__(
+            self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs
+        ) -> None:
+            super().__init__()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x * 2
+
+    @support_torch_compile
+    class B(A): ...
+
+    with set_current_vllm_config(vllm_config):
+        mod = B(vllm_config=vllm_config, prefix="")
+    ref = weakref.ref(mod)
+    mod.cleanup()
+    del mod
+    gc.collect()
+    assert ref() is None
 
 
 # Only enable torch.compile if

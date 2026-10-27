@@ -3,12 +3,17 @@
 from functools import partial
 
 import pytest
+import torch
 
-from tests.models.utils import dummy_hf_overrides
+from tests.models.utils import check_logprobs_close, dummy_hf_overrides
+from vllm.assets.image import ImageAsset
 from vllm.compilation.counter import compilation_counter
-from vllm.config import VllmConfig
+from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.model_executor.models.radio import RadioModel, calc_seq_lens
 from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.radio import RadioConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 
 def test_compile():
@@ -181,6 +186,112 @@ def test_paddleocr_vl_compilation(
         ) as _,
     ):
         pass
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+@torch.inference_mode()
+def test_radio_dynamic_resolution_compilation(dist_init):
+    """The compiled RADIO encoder layer is traced once, on a packed batch of
+    two images. Packed batches with other image counts or sizes, and conv3d
+    video clips with other tubelet counts, must reuse that graph and match
+    the eager encoder."""
+    radio_config = RadioConfig(
+        model_name="vit_small_patch16_224",
+        register_multiple=8,
+        video_temporal_patch_size=2,
+    )
+    patch_size = radio_config.patch_size
+
+    def build_model(compile_mm_encoder: bool) -> tuple[VllmConfig, RadioModel]:
+        vllm_config = VllmConfig(
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                compile_mm_encoder=compile_mm_encoder,
+                cudagraph_mode=CUDAGraphMode.NONE,
+            )
+        )
+        with (
+            set_current_vllm_config(vllm_config),
+            set_default_torch_dtype(torch.bfloat16),
+        ):
+            model = RadioModel(radio_config, num_hidden_layers_override=2)
+        return vllm_config, model.to("cuda")
+
+    torch.manual_seed(0)
+    compiled_config, compiled_model = build_model(compile_mm_encoder=True)
+    eager_config, eager_model = build_model(compile_mm_encoder=False)
+    for param in compiled_model.parameters():
+        param.normal_(std=0.02)
+    # Unit scales, so that a wrong attention mask shows in the output.
+    for layer in compiled_model.model.encoder.layers:
+        for param in (layer.ls1, layer.ls2, layer.norm1.weight, layer.norm2.weight):
+            param.fill_(1.0)
+    eager_model.load_state_dict(compiled_model.state_dict())
+
+    for imgs_sizes in (
+        [(320, 256), (224, 448)],
+        [(256, 384)],
+        [(160, 160), (192, 320), (128, 256)],
+        [(448, 160), (128, 384)],
+    ):
+        num_patches = sum(calc_seq_lens(imgs_sizes, patch_size))
+        pixel_values = torch.randn(
+            1, num_patches, 3 * patch_size**2, dtype=torch.bfloat16, device="cuda"
+        )
+        with set_current_vllm_config(eager_config):
+            expected = eager_model(pixel_values, imgs_sizes=imgs_sizes)
+        with set_current_vllm_config(compiled_config):
+            actual = compiled_model(pixel_values, imgs_sizes=imgs_sizes)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    for num_frames in (6, 2):
+        pixel_values = torch.randn(
+            num_frames, 3, 224, 224, dtype=torch.bfloat16, device="cuda"
+        )
+        with set_current_vllm_config(eager_config):
+            expected = eager_model(pixel_values, num_frames=num_frames)
+        with set_current_vllm_config(compiled_config):
+            actual = compiled_model(pixel_values, num_frames=num_frames)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_nemotron_parse_35_compilation(vllm_runner):
+    """Parse 3.5 profiles its encoder with several images, so the compiled
+    RADIO layers are traced on a packed batch. A one-image request must match
+    the eager encoder."""
+    prompts = [
+        "<pad></s><s><predict_bbox><predict_classes><output_markdown>"
+        "<predict_no_text_in_pic>"
+    ]
+    images = [ImageAsset("paper-11").pil_image_ext(ext="png").convert("RGB")]
+    outputs = []
+    for compile_mm_encoder in (False, True):
+        with vllm_runner(
+            "nvidia/Nemotron-3.5-Parse",
+            trust_remote_code=True,
+            max_model_len=16384,
+            limit_mm_per_prompt={"image": 1},
+            compilation_config={
+                "mode": CompilationMode.VLLM_COMPILE,
+                "compile_mm_encoder": compile_mm_encoder,
+            },
+        ) as vllm_model:
+            outputs.append(
+                vllm_model.generate_greedy_logprobs(
+                    prompts, max_tokens=32, num_logprobs=5, images=images
+                )
+            )
+    check_logprobs_close(
+        outputs_0_lst=outputs[0],
+        outputs_1_lst=outputs[1],
+        name_0="eager_encoder",
+        name_1="compiled_encoder",
+    )
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073

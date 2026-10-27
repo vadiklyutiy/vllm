@@ -175,6 +175,8 @@ class TorchCompileWithNoGuardsWrapper:
             )
 
         if envs.VLLM_USE_BYTECODE_HOOK and mode != CompilationMode.STOCK_TORCH_COMPILE:
+            # A decorated subclass of a decorated class runs this init twice.
+            self.cleanup()
             self._bytecode_hook_handle = (
                 torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
             )

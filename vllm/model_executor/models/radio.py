@@ -19,6 +19,10 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PreTrainedConfig
 
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.intern_vit import (
@@ -26,6 +30,7 @@ from vllm.model_executor.models.intern_vit import (
     InternVisionEncoder,
     InternVisionEncoderLayer,
 )
+from vllm.utils.torch_utils import async_tensor_h2d
 
 input_dim_t: TypeAlias = int | tuple[int, int]
 
@@ -459,7 +464,11 @@ class MaskMetadata:
 
 class RadioParallelAttention(InternParallelAttention):
     def forward(
-        self, x: torch.Tensor, mask_meta: MaskMetadata | None = None
+        self,
+        x: torch.Tensor,
+        mask_meta: MaskMetadata | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -467,7 +476,6 @@ class RadioParallelAttention(InternParallelAttention):
         if self.qk_normalization:
             q, k = self._apply_qk_norm(q, k)
 
-        cu_seqlens, max_seqlen = None, None
         if mask_meta is not None:
             cu_seqlens = mask_meta.cu_seqlens
             max_seqlen = mask_meta.max_seqlen
@@ -476,18 +484,33 @@ class RadioParallelAttention(InternParallelAttention):
         return out
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": [0, 1], "cu_seqlens": 0},
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class RadioVisionEncoderLayer(InternVisionEncoderLayer):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
+    def __init__(self, *args, prefix: str = "", **kwargs) -> None:
+        super().__init__(
+            *args, attn_cls=RadioParallelAttention, prefix=prefix, **kwargs
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         mask_meta: MaskMetadata | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ):
         hidden_states = (
             hidden_states
-            + self.attn(self.norm1(hidden_states), mask_meta=mask_meta) * self.ls1
+            + self.attn(
+                self.norm1(hidden_states),
+                mask_meta=mask_meta,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+            * self.ls1
         )
 
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)) * self.ls2
@@ -504,9 +527,15 @@ class RadioVisionEncoder(InternVisionEncoder):
         inputs_embeds: torch.Tensor,
         mask_meta: MaskMetadata | None = None,
     ):
+        cu_seqlens, max_seqlen = None, None
+        if mask_meta is not None:
+            cu_seqlens = mask_meta.cu_seqlens
+            max_seqlen = mask_meta.max_seqlen
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            hidden_states = encoder_layer(hidden_states, mask_meta=mask_meta)
+            hidden_states = encoder_layer(
+                hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+            )
         return hidden_states
 
 
@@ -596,8 +625,8 @@ class RadioInternVisionModel(nn.Module):
         cls/register tokens, i.e. patch_count + num_skip per item).
         Use inter_image_mask_metadata() when you only have imgs_sizes."""
         assert len(seq_lens) > 0
-        cu_seqlens = torch.tensor(
-            list(accumulate(seq_lens, initial=0)), dtype=torch.int32, device=device
+        cu_seqlens = async_tensor_h2d(
+            list(accumulate(seq_lens, initial=0)), device=device, dtype=torch.int32
         )
         # Keep max_seqlen on CPU to avoid .item() sync
         # See: https://github.com/vllm-project/vllm/blob/20b6b01/vllm/v1/attention/ops/vit_attn_wrappers.py#L48
@@ -628,8 +657,8 @@ class RadioInternVisionModel(nn.Module):
         else:
             # Images for any model, or video for non-conv3d model
             hidden_states = self.patch_generator(x, imgs_sizes=imgs_sizes)
-            if imgs_sizes is not None and len(imgs_sizes) > 1:
-                # Dynamic resolution w/ > 1 image, create attn mask
+            if imgs_sizes is not None:
+                # Dynamic resolution, create attn mask
                 mask_meta = self.inter_image_mask_metadata(
                     imgs_sizes, device=hidden_states.device
                 )
