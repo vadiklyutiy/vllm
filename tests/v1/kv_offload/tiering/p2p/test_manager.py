@@ -47,6 +47,8 @@ from vllm.v1.kv_offload.tiering.p2p.session import (
 from vllm.v1.kv_offload.tiering.p2p.session.client import _LOOKUP_TIMEOUT_S
 from vllm.v1.kv_offload.tiering.p2p.session.protocol import TYPE_KEY, DisconnectMsg
 
+from .test_sessions import FakeConnection, _activate, _fetch, _make_session
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -127,6 +129,7 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr._finished_jobs = []
     mgr._failed_req_ids = set()
     mgr._sessions = {}
+    mgr._closing = {}
     mgr._reconnect_backoff = {}
     mgr._data_plane_faults = {}
     mgr._kv_to_session = {}
@@ -2426,3 +2429,50 @@ class TestReconnectBackoff:
         assert conn.sent == [{TYPE_KEY: DisconnectMsg.TYPE}]
         assert conn.close_calls == 1
         assert self.PEER not in mgr._sessions
+
+
+# ---------------------------------------------------------------------------
+# Reap of a session whose WRITE is not confirmed stopped
+# ---------------------------------------------------------------------------
+
+
+class TestReapHoldsUnconfirmedWrite:
+    """Reaping a session must not release a WRITE the transport has not
+    confirmed stopped: its store job stays pinned and the peer registered,
+    and the peer is refused, until the transport reports it terminal."""
+
+    PEER = "peer:8000"
+
+    def test_held_until_terminal(self):
+        class NoControl:
+            def poll(self):
+                return []
+
+        mgr = _make_manager()
+        mgr._control = NoControl()  # type: ignore[assignment]
+        session, conn, data = _make_session(peer_id=self.PEER)
+        mgr._data = data  # type: ignore[assignment]
+        mgr._sessions[self.PEER] = session
+        _activate(session, conn)
+        session.add_stored_blocks("req-1", [OffloadKey(b"k1")], [0], job_id=1)
+        _fetch(conn, "req-1", [b"k1"], [5])
+        list(mgr.get_finished_jobs())
+        (tid,) = data._transfers
+        data._cancel_still_inflight.add(tid)
+
+        conn.mark_dead()
+        results = list(mgr.get_finished_jobs())
+        assert self.PEER not in mgr._sessions
+        assert all(r.job_id != 1 for r in results)
+        assert self.PEER in data._remote_peers
+        assert mgr._get_or_create_session(self.PEER) is None
+        inbound = FakeConnection(self.PEER)
+        mgr._accept_new_peers([inbound])  # type: ignore[list-item]
+        assert inbound._sent == [{TYPE_KEY: DisconnectMsg.TYPE}]
+        assert not inbound.alive
+        assert all(mode == "wait" for _, mode in data._cancel_calls)
+
+        data._poll_done.append(tid)
+        assert list(mgr.get_finished_jobs()) == [JobResult(job_id=1, success=False)]
+        assert self.PEER not in mgr._closing
+        assert self.PEER not in data._remote_peers

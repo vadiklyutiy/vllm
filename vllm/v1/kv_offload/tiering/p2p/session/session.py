@@ -211,7 +211,7 @@ class P2PSession:
 
     @property
     def data_plane_fault(self) -> str | None:
-        """The transport's peer fault, if one was reported (see server role)."""
+        """The data-plane peer fault, if one was detected (see server role)."""
         return self._server.peer_fault
 
     @property
@@ -380,7 +380,10 @@ class P2PSession:
             now-dead peer. The manager fails these so the consumer's lookup()
             falls back to local prefill instead of deferring forever on an
             answer that can never arrive.
-        failed_stores: server store job_ids to fail.
+        failed_stores: server store job_ids to fail. Jobs read by a WRITE
+            the transport does not report stopped are not among them: they
+            keep their pins, and ``has_pending_work`` stays True, until
+            ``poll_closed`` settles them.
         failed_serves: synthetic lookup ctxs still owing
             ``parent.on_request_finished`` (the manager flushes these on
             its next ``serve_external_requests``).
@@ -408,6 +411,10 @@ class P2PSession:
             failed_stores=failed_stores,
             failed_serves=failed_serves,
         )
+
+    def poll_closed(self) -> list[StoreResult]:
+        """Settle the WRITEs ``close()`` left inflight, once they stop."""
+        return self._server.collect_results()
 
     # ------------------------------------------------------------------
     # Message dispatch
@@ -630,8 +637,9 @@ class P2PSession:
 
         Called from poll() after message dispatch. A successful
         registration releases ConnectAckMsg — the peer treats that as
-        permission to send, so it must not go out earlier. A failed one
-        marks the connection dead so the manager reaps the session.
+        permission to send, so it must not go out earlier. A failed one, or
+        a failed ack send, marks the connection dead so the manager reaps
+        the session.
         """
         registration = self._pending_registration
         if registration is None or not registration.done():
@@ -648,7 +656,7 @@ class P2PSession:
             self._mark_dead(f"peer registration failed: {exc}")
             return
         if self._conn is not None and self._conn.alive:
-            self._conn.send(
+            self._do_send(
                 {
                     TYPE_KEY: ConnectAckMsg.TYPE,
                     ConnectAckMsg.PEER_ID: self._local_id,

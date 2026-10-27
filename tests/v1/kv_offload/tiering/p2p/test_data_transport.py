@@ -538,6 +538,25 @@ class TestNixlTransportWithMockedAgent:
         transport._agent.remove_remote_agent.assert_called_once_with("nixl-peer-name")
         assert "peer:1" not in transport._remote_dlists
 
+    @pytest.mark.parametrize("failing", ["get_xfer_descs", "prep_xfer_dlist"])
+    def test_failed_registration_removes_agent(self, failing):
+        """A registration whose descriptors cannot be built rolls back.
+
+        add_remote_agent() succeeded, but the name was never published, so
+        remove_remote_peer() cannot find it later: the failed registration
+        must remove the agent itself, or it stays registered forever.
+        """
+        transport = self._make_transport()
+        getattr(transport._agent, failing).side_effect = RuntimeError("prep failed")
+
+        future = transport.add_remote_peer_async("peer:1", b"meta", 0x1000, 8, 1024)
+        with pytest.raises(RuntimeError, match="prep failed"):
+            future.result(timeout=5)
+
+        transport._agent.remove_remote_agent.assert_called_once_with("nixl-peer-name")
+        assert "peer:1" not in transport._peer_nixl_names
+        assert transport.write_blocks("peer:1", [0], [1]) is None
+
     def test_close_releases_everything(self):
         """Close releases all handles and clears state."""
         transport = self._make_transport()

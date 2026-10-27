@@ -39,6 +39,10 @@ logger = init_logger(__name__)
 
 _STORE_TIMEOUT_S = 30.0
 _CANCEL_DRAIN_TIMEOUT_S = 10.0
+# A WRITE still inflight this long has outlived its store job's timeout by a
+# full cancel drain, so its peer is faulted (see "Failure model" in
+# data/base.py). Its pins are still held until it is terminal.
+_TRANSFER_STALL_TIMEOUT_S = _STORE_TIMEOUT_S + _CANCEL_DRAIN_TIMEOUT_S
 # Minimum spacing between wait-mode cancel attempts for one round. Each
 # attempt calls into NIXL on the scheduler thread, so an unconfirmed
 # cancellation is retried at this rate instead of on every poll tick.
@@ -166,6 +170,7 @@ class _InflightXfer:
     # Dummy default for test-seeded entries.
     round: _OutboundRequestState = field(default_factory=_OutboundRequestState)
     round_key: int = 0
+    submitted_at: float = field(default_factory=lambda: time.monotonic())
 
 
 @dataclass
@@ -286,7 +291,8 @@ class ServerRole:
         # Parked aborts already warned about for exceeding
         # _CANCEL_DRAIN_TIMEOUT_S.
         self._slow_aborts: set[tuple[str, int]] = set()
-        # PollResult.peer_fault, once reported; no new WRITE after that.
+        # PollResult.peer_fault once reported, or a WRITE inflight past
+        # _TRANSFER_STALL_TIMEOUT_S; no new WRITE after that.
         self.peer_fault: str | None = None
 
     # ------------------------------------------------------------------
@@ -757,6 +763,8 @@ class ServerRole:
     def collect_results(self) -> list[StoreResult]:
         """Drain timeouts, deferred results, and transport completions.
 
+        Also settles, after ``close``, the transfers it left inflight.
+
         Inbound LookupMsg resolution (including re-polling HIT_PENDING /
         RETRY keys) is NOT done here — it runs in
         ``serve_external_requests`` where the ParentManager is available.
@@ -839,6 +847,13 @@ class ServerRole:
                 self._finalize_cancelled(xfer.kv_request_id, xfer.round_key)
             self._maybe_prune(xfer.kv_request_id)
 
+        if self.peer_fault is None and self._inflight:
+            # _inflight is in submission order, so its head is the oldest.
+            oldest = next(iter(self._inflight.values()))
+            age = time.monotonic() - oldest.submitted_at
+            if age >= _TRANSFER_STALL_TIMEOUT_S:
+                self.peer_fault = f"WRITE still inflight after {age:.0f}s"
+
         # Finalizing transfers can queue results for supplied but unfetched blocks.
         if self._pending_store_results:
             results.extend(self._pending_store_results)
@@ -861,7 +876,14 @@ class ServerRole:
             self._drain_abort(kv_request_id, round_seq)
 
     def close(self) -> tuple[list[int], list[ReqContext]]:
-        """Tear down. Cancels inflight.
+        """Tear down. Cancels inflight in ``mode="wait"``.
+
+        A transfer the transport does not report terminal stays inflight,
+        its round cancelled, and its jobs keep their pins, as in
+        ``_drain_abort``: neither releasing its handle nor removing the
+        remote agent stops a WRITE already in flight. The owner keeps
+        calling ``collect_results`` until ``has_inflight_transfers`` is
+        False; those jobs are settled there.
 
         Returns ``(failed_store_job_ids, failed_serves)`` where
         ``failed_serves`` are synthetic lookup ctxs still owing a
@@ -869,11 +891,16 @@ class ServerRole:
         parent handle in hand, so the manager flushes these in its next
         ``serve_external_requests``.
         """
-        failed_stores = list(self._store_jobs.keys())
-        self._store_jobs.clear()
         if self._inflight:
-            self._transport.cancel(list(self._inflight.keys()))
-        self._inflight.clear()
+            still = set(self._transport.cancel(list(self._inflight), mode="wait"))
+            for tid in [tid for tid in self._inflight if tid not in still]:
+                self._inflight_pop(tid)
+            for xfer in self._inflight.values():
+                xfer.round.cancelled = True
+        still_pinned = self._read_job_ids()
+        failed_stores = [jid for jid in self._store_jobs if jid not in still_pinned]
+        for jid in failed_stores:
+            del self._store_jobs[jid]
         self._pending_store_results.clear()
         # Surface every synthetic ctx still owing on_request_finished so
         # the manager can release the TieringManager's per-request

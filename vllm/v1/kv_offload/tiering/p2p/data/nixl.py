@@ -93,7 +93,7 @@ def _is_terminal_state_error(exc: Exception) -> bool:
     ``remove_remote_agent`` while its handle raised ``nixlNotFoundError``.
     Such a transfer stays inflight, so its pins and the peer's destination
     blocks are not reused under it. The raise still faults its peer (see
-    ``_record_state_check_failure``), which bounds how long it stays.
+    ``_record_state_check_failure``), which ends the peer's session.
     """
     return _peer_fault_status(exc) == "NIXL_ERR_REMOTE_DISCONNECT"
 
@@ -223,7 +223,7 @@ class NixlTransport(DataTransport):
     ) -> None:
         gen = self._begin_registration(peer_id)
         nixl_name, remote_dlist = self._build_peer_handles(
-            agent_metadata, base_addr, num_blocks, block_len
+            peer_id, agent_metadata, base_addr, num_blocks, block_len
         )
         self._publish_peer(peer_id, gen, nixl_name, remote_dlist)
 
@@ -239,7 +239,7 @@ class NixlTransport(DataTransport):
 
         def register() -> None:
             nixl_name, remote_dlist = self._build_peer_handles(
-                agent_metadata, base_addr, num_blocks, block_len
+                peer_id, agent_metadata, base_addr, num_blocks, block_len
             )
             if not self._publish_peer(peer_id, gen, nixl_name, remote_dlist):
                 raise RuntimeError(
@@ -270,6 +270,7 @@ class NixlTransport(DataTransport):
 
     def _build_peer_handles(
         self,
+        peer_id: str,
         agent_metadata: bytes,
         base_addr: int,
         num_blocks: int,
@@ -280,13 +281,19 @@ class NixlTransport(DataTransport):
         Touches no shared state, so it runs unlocked — holding the peer
         lock across it would stall the scheduler thread for exactly as
         long as the registration it is meant to move off that thread.
+        If the descriptors cannot be built, the remote agent added here is
+        removed again: it was never published, so nothing else can.
         """
         nixl_name = self._agent.add_remote_agent(agent_metadata)
-        block_descs = [
-            (base_addr + i * block_len, block_len, 0) for i in range(num_blocks)
-        ]
-        xfer_dlist = self._agent.get_xfer_descs(block_descs, mem_type="DRAM")
-        remote_dlist = self._agent.prep_xfer_dlist(nixl_name, xfer_dlist)
+        try:
+            block_descs = [
+                (base_addr + i * block_len, block_len, 0) for i in range(num_blocks)
+            ]
+            xfer_dlist = self._agent.get_xfer_descs(block_descs, mem_type="DRAM")
+            remote_dlist = self._agent.prep_xfer_dlist(nixl_name, xfer_dlist)
+        except Exception:
+            self._release_remote_handles(peer_id, None, nixl_name)
+            raise
         return nixl_name, remote_dlist
 
     def _publish_peer(
@@ -449,7 +456,8 @@ class NixlTransport(DataTransport):
                 if not _is_terminal_state_error(exc):
                     # Kept: the WRITE may still be landing. Its peer is now
                     # faulted, so the session disconnects once this drains
-                    # or at its drain cap, and the teardown reclaims it.
+                    # or at its drain cap; the teardown keeps it until it
+                    # is terminal.
                     continue
                 state = "ERR"
             if state == "DONE":

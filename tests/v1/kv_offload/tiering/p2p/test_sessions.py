@@ -492,6 +492,25 @@ class TestConnectHandshake:
         assert not conn.alive
         assert not any(m[TYPE_KEY] == ConnectAckMsg.TYPE for m in conn._sent)
 
+    def test_failed_ack_send_rejects_peer(self):
+        """A ConnectAck that cannot be sent kills the connection.
+
+        The landed registration is consumed, so nothing sends the ack again;
+        a live session would leave the peer waiting for its handshake
+        deadline instead of being rejected now.
+        """
+        transport = FakeDataTransport(defer_registration=True)
+        session, conn, _ = _make_session(transport=transport)
+        conn.enqueue(_peer_connect_msg())
+        session.poll()
+
+        assert transport.complete_registrations() == 1
+        conn.fail_send = True
+        session.poll()
+
+        assert not session.alive
+        assert session.death_reason == f"send of {ConnectAckMsg.TYPE} failed"
+
     def test_duplicate_connect_during_registration_is_rejected(self):
         """A second ConnectMsg mid-registration is a protocol violation."""
         transport = FakeDataTransport(defer_registration=True)
@@ -2944,6 +2963,31 @@ class TestDisconnect:
         assert set(result.failed_stores) == {10}
         assert result.failed_serves == []
 
+    def test_close_holds_write_not_confirmed_stopped(self):
+        """close() keeps a WRITE the transport cannot confirm stopped, and
+        its store job's pin: releasing the handle does not stop the WRITE.
+        poll_closed() fails the job once the WRITE is terminal."""
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-1", [OffloadKey(b"k1")], [0], job_id=1)
+        session.add_stored_blocks("req-2", [OffloadKey(b"k2")], [1], job_id=2)
+        _fetch(conn, "req-1", [b"k1"], [5])
+        session.poll()
+        (tid,) = transport._transfers
+        transport._cancel_still_inflight.add(tid)
+
+        result = session.close()
+        assert result.failed_stores == [2]
+        assert transport._cancel_calls == [([tid], "wait")]
+        assert tid in transport._transfers
+        assert session.has_pending_work
+        assert session.poll_closed() == []
+
+        transport._poll_done.append(tid)
+        assert session.poll_closed() == [StoreResult(job_id=1, success=False)]
+        assert not session.has_pending_work
+        assert all(mode == "wait" for _, mode in transport._cancel_calls)
+
     def test_send_failure_marks_connection_dead(self):
         """A raising send must mark the connection dead, not silently drop
         the message — otherwise the session lingers alive, is never reaped,
@@ -3616,6 +3660,32 @@ class TestPeerFaultEscalation:
         session._peer_fault_at = time.monotonic() - _PEER_FAULT_DRAIN_S - 1.0
         session.poll()
         assert not session.alive
+
+    def test_stalled_write_faults_the_peer(self, lookup_clock):
+        """A WRITE the transport keeps reporting in progress faults its peer
+        once it is older than _TRANSFER_STALL_TIMEOUT_S, so the session ends
+        at the drain cap. Its store job stays pinned."""
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-1", [OffloadKey(b"k1")], [0], job_id=1)
+        _fetch(conn, "req-1", [b"k1"], [5])
+        session.poll()
+        (tid,) = transport._transfers
+        transport._cancel_still_inflight.add(tid)
+        lookup_clock.now += server_mod._TRANSFER_STALL_TIMEOUT_S - 1.0
+        assert session.poll().stores == []
+        assert session.data_plane_fault is None
+
+        lookup_clock.now += 1.0
+        assert session.poll().stores == []
+        fault = session.data_plane_fault
+        assert fault is not None and fault.startswith("WRITE still inflight after")
+        assert session.alive
+        lookup_clock.now += _PEER_FAULT_DRAIN_S
+        assert session.poll().stores == []
+        assert not session.alive
+        assert tid in session._server._inflight
+        assert 1 in session._server._store_jobs
 
     def test_death_reasons(self):
         session, conn, _ = _make_session()

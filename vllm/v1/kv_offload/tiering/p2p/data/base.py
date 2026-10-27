@@ -63,12 +63,15 @@ The transport decides each failure's scope:
   failures with no success between). poll(peer_id) reports the cause in
   ``PollResult.peer_fault`` until remove_remote_peer(). A transfer whose
   state check failed stays inflight unless the failure proves it can no
-  longer write, so the peer's teardown is what bounds it.
+  longer write. The session also faults a peer whose WRITE stays inflight
+  past its deadline.
 
 The transport never recovers a peer itself. The session turns a peer
 fault into the same connection death as a missed heartbeat, so the
 manager's reap is the only teardown: DisconnectMsg makes the peer tear
-down too, and the next connection re-registers both sides.
+down too, and the next connection re-registers both sides. The reap keeps
+a WRITE that is not terminal, with its pins and the peer's registration,
+until poll() or cancel() reports it terminal.
 
 write_blocks() and poll() report failures through their return values
 and must not raise for them.

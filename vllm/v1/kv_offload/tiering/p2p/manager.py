@@ -364,6 +364,11 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         self._control: ControlTransport = ZmqTransport(self._local_id, host, port)
 
         self._sessions: dict[str, P2PSession] = {}
+        # peer_id → reaped session holding WRITEs the transport has not yet
+        # reported stopped, with their pins (see P2PSession.close). The
+        # transport tracks transfers by peer_id, so the peer stays registered
+        # and is refused until they stop; see _poll_closing.
+        self._closing: dict[str, P2PSession] = {}
         # peer_id → (backoff, retry_at); see _schedule_reconnect_backoff.
         self._reconnect_backoff: dict[str, tuple[float, float]] = {}
         # peer_id → data-plane faults over this process's lifetime. Unlike
@@ -667,7 +672,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         warned = False
         while True:
             self._poll_once()
-            pending = any(s.has_pending_work for s in self._sessions.values())
+            pending = bool(self._closing) or any(
+                s.has_pending_work for s in self._sessions.values()
+            )
             if not pending:
                 return
             if not warned and time.monotonic() - start > 5.0:
@@ -730,7 +737,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         session = self._sessions.get(peer_id)
         if session is not None:
             return session
-        if self._reconnect_wait(peer_id) > 0:
+        if peer_id in self._closing or self._reconnect_wait(peer_id) > 0:
             return None
 
         max_peers = envs.VLLM_P2P_MAX_PEERS
@@ -803,6 +810,17 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                     conn.send({TYPE_KEY: DisconnectMsg.TYPE})
                 conn.close()
                 continue
+            if conn.peer_id in self._closing:
+                logger.info(
+                    "P2P %s: rejecting inbound peer %s — WRITEs of its previous "
+                    "session are not yet confirmed stopped",
+                    self._local_id,
+                    conn.peer_id,
+                )
+                with contextlib.suppress(Exception):
+                    conn.send({TYPE_KEY: DisconnectMsg.TYPE})
+                conn.close()
+                continue
             try:
                 existing = self._sessions.get(conn.peer_id)
                 if existing is not None:
@@ -860,12 +878,16 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             # Release the TieringManager's per-request bookkeeping for the
             # dead session's synthetic lookups on the next serve_external_requests.
             self._failed_serve_ctxs.extend(close_result.failed_serves)
-            self._data.remove_remote_peer(pid)
             fault_info = ""
+            if session.has_pending_work:
+                self._closing[pid] = session
+                fault_info = "; holding WRITEs not yet confirmed stopped"
+            else:
+                self._data.remove_remote_peer(pid)
             if session.data_plane_fault is not None:
                 faults = self._data_plane_faults.get(pid, 0) + 1
                 self._data_plane_faults[pid] = faults
-                fault_info = f"; data-plane fault #{faults}"
+                fault_info += f"; data-plane fault #{faults}"
                 backoff = self._schedule_reconnect_backoff(pid)
                 if backoff:
                     fault_info += f"; reconnect backoff {backoff:.0f}s"
@@ -876,6 +898,22 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 session.death_reason,
                 fault_info,
             )
+
+    def _poll_closing(self) -> None:
+        """Settle reaped sessions' held WRITEs; retire a peer once none is left."""
+        for pid, session in list(self._closing.items()):
+            for sr in session.poll_closed():
+                self._finished_jobs.append(
+                    JobResult(job_id=sr.job_id, success=sr.success)
+                )
+            if not session.has_pending_work:
+                del self._closing[pid]
+                self._data.remove_remote_peer(pid)
+                logger.info(
+                    "P2P %s: held WRITEs to peer %s stopped; peer released",
+                    self._local_id,
+                    pid,
+                )
 
     def _schedule_reconnect_backoff(self, peer_id: str) -> float:
         """Record a data-plane fault for *peer_id*; return its reconnect wait.
@@ -1063,6 +1101,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                         kv_request_id, batch.keys, batch.block_ids, batch.job_id
                     )
 
+        self._poll_closing()
         self._reap_dead_sessions()
         self._reap_unbound_stores()
         self._reap_idle_sessions()
@@ -1103,7 +1142,11 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         _SHUTDOWN_DRAIN_TIMEOUT_S elapses: the engine is exiting, and a
         wedged peer must not hang shutdown.
         """
-        ids = [tid for s in self._sessions.values() for tid in s._server._inflight]
+        ids = [
+            tid
+            for s in (*self._sessions.values(), *self._closing.values())
+            for tid in s._server._inflight
+        ]
         if not ids:
             return
         deadline = time.monotonic() + _SHUTDOWN_DRAIN_TIMEOUT_S
