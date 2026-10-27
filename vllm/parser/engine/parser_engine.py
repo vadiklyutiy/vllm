@@ -881,6 +881,10 @@ class ParserEngine(Parser):
 
         if len(tool_call_deltas) > 1:
             tool_call_deltas = self._coalesce_tool_call_deltas(tool_call_deltas)
+        for tc in tool_call_deltas:
+            # Unsent slots (rejected or unnamed) take no index, as in the
+            # non-streaming tool_calls list.
+            tc.index = sum(slot.name_sent for slot in self._tool_slots[: tc.index])
 
         if self._deferred_content and (not seen_tool_event or not tool_call_deltas):
             # Deferred content carried in from a previous delta precedes this

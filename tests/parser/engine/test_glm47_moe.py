@@ -231,3 +231,30 @@ class TestStreamedToolArguments:
     )
     def test_no_value_extender_unless_open_value_is_last(self, raw_args):
         assert _glm47_arg_value_extender(raw_args) is None
+
+
+def test_rejected_call_takes_no_streamed_index(mock_request):
+    """A call to an undeclared tool is dropped, so the next call streams
+    at index 0, its position in the non-streaming result."""
+    mock_request.tools = [WRITE_TOOL]
+    text = (
+        f"{THINK_END}{TOOL_CALL_START}Read\n"
+        "<arg_key>file_path</arg_key><arg_value>/repo/a.py</arg_value>\n"
+        f"{TOOL_CALL_END}{TOOL_CALL_START}Write\n"
+        "<arg_key>file_path</arg_key><arg_value>/repo/b.py</arg_value>\n"
+        f"{TOOL_CALL_END}"
+    )
+    parser = Glm47MoeParser(make_mock_tokenizer(VOCAB))
+    chunks = _pieces(text, 7)
+    indices = []
+    for i, chunk in enumerate(chunks):
+        delta = parser.parse_delta(
+            chunk, [], mock_request, finished=i == len(chunks) - 1
+        )
+        indices += [tc.index for tc in (delta and delta.tool_calls) or []]
+    result = Glm47MoeParser(make_mock_tokenizer(VOCAB)).extract_tool_calls(
+        text, mock_request
+    )
+
+    assert [tc.function.name for tc in result.tool_calls] == ["Write"]
+    assert set(indices) == {0}
