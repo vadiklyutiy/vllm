@@ -255,6 +255,14 @@ def test_labels_start_the_reply(qwen):
         reply_label_ids(tokenizer, tokenizer.encode("team:"))
 
 
+def test_labels_without_tokens_are_not_one_token():
+    from transformers import Qwen2Tokenizer
+
+    # Without its vocabulary files, a tokenizer encodes every label to no token.
+    with pytest.raises(ValueError, match="not one distinct token"):
+        reply_label_ids(Qwen2Tokenizer(), [])
+
+
 @pytest.mark.parametrize(
     "model_name,reply_start",
     [
