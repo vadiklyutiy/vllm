@@ -1241,7 +1241,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     block_id_offset = next_block_id_offset
 
         current_batch_keys: list[str] = key_list_c
-        current_batch_block_ids: list[int] = block_id_list_c
+        num_loaded_keys = 0
         batch_bytes = 0
         try:
             for (
@@ -1251,7 +1251,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 batch_block_ids,
             ) in load_batches:
                 current_batch_keys = batch_keys
-                current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1281,8 +1280,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     num_failed_keys=len(failed),
                 )
                 if failed:
+                    # Later sub-batches are never attempted, so report them too.
                     self._report_load_error(
-                        req_id, [block_id for _, _, block_id in failed]
+                        req_id,
+                        [block_id for _, _, block_id in failed]
+                        + block_id_list_c[num_loaded_keys + len(batch_keys) :],
                     )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
@@ -1292,8 +1294,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         [(key, value) for key, value, _ in failed[:3]],
                     )
                     break
+                num_loaded_keys += len(batch_keys)
         except Exception as e:
-            self._report_load_error(req_id, current_batch_block_ids)
+            self._report_load_error(req_id, block_id_list_c[num_loaded_keys:])
             self._record_operation(
                 "load_get",
                 load_get_start,
