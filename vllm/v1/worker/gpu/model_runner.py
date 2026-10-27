@@ -1764,6 +1764,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if scheduler_output.fence_kv_loads:
+                # KV loads are not ordered against the GPU stream.
+                torch.accelerator.synchronize()
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)

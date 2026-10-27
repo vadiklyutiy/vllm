@@ -194,6 +194,7 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        self.num_unpinned_blocks_reused = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -703,6 +704,7 @@ class BlockPool:
         for block in blocks:
             watcher = self._reuse_watchers.pop(block.block_id, None)
             if watcher is not None:
+                self.num_unpinned_blocks_reused += 1
                 watcher(block)
 
     def unpin_blocks(

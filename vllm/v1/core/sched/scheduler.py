@@ -717,6 +717,7 @@ class Scheduler(SchedulerInterface):
         prefill_admitted = False
         # Whether any scheduled request has a synchronous connector KV load.
         has_sync_kv_loads = False
+        fence_kv_loads = False
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -1405,6 +1406,8 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
+                block_pool = self.kv_cache_manager.block_pool
+                num_unpinned_blocks_reused = block_pool.num_unpinned_blocks_reused
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_tokens_past_hit,
@@ -1468,6 +1471,17 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.record_prefix_cache_stats(
                         request, num_new_local_computed_tokens
                     )
+
+                if (
+                    load_kv_async
+                    and self.defer_block_free
+                    and self.processed_step_seq < self.sched_step_seq
+                    and block_pool.num_unpinned_blocks_reused
+                    > num_unpinned_blocks_reused
+                ):
+                    # An unpinned block is read until it is reused, so a step
+                    # still in flight may read a block this load will write.
+                    fence_kv_loads = True
 
                 if load_kv_async:
                     # This path deliberately does not reach `prefill_admitted`
@@ -1697,6 +1711,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
+            fence_kv_loads=fence_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,

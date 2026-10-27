@@ -286,6 +286,11 @@ class SchedulerOutput:
     # synchronously during this step (load_async=False).
     has_sync_kv_loads: bool = False
 
+    # Whether a KV load started this step writes a block that an earlier, possibly
+    # still running, step reads; the worker then waits for its earlier steps
+    # before starting KV loads.
+    fence_kv_loads: bool = False
+
     # Execution-auxiliary output control metadata consumed by the worker connector.
     aux_output_connector_metadata: AuxOutputConnectorMetadata | None = None
 

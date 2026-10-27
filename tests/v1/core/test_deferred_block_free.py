@@ -544,3 +544,49 @@ def test_cow_retentions_deferred_until_copy_step_processed():
     assert not scheduler.deferred_frees
     out2 = scheduler.schedule()
     assert [r.req_id for r in out2.scheduled_new_reqs] == ["late"]
+
+
+@pytest.mark.parametrize(
+    "step_in_flight,unpin", [(True, True), (False, True), (True, False)]
+)
+def test_async_load_into_unpinned_block_fences_kv_loads(step_in_flight, unpin):
+    """A block released with ``unpin_blocks`` is still read by its owner's
+    steps until the pool hands it out. When an async KV load receives it while
+    such a step may still be in flight, the worker must wait for that step
+    before starting the load: the load's write (e.g. NIXL RDMA) is not ordered
+    against the GPU stream.
+    """
+    scheduler = create_scheduler(
+        model=MODEL,
+        async_scheduling=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+    )
+    scheduler.defer_block_free = True
+    pool = scheduler.kv_cache_manager.block_pool
+
+    request = create_requests(num_requests=1, num_tokens=NUM_PROMPT_TOKENS)[0]
+    scheduler.add_request(request)
+    out0 = scheduler.schedule()
+    if not step_in_flight:
+        scheduler.update_from_output(out0, _make_model_runner_output(out0))
+
+    # Leave two free blocks for the import. With ``unpin`` their owner keeps
+    # reading them, as HiSparse does with clean resident pages.
+    unpinned = pool.get_new_blocks(2) if unpin else []
+    reused: list[int] = []
+    pool.unpin_blocks(unpinned, lambda block: reused.append(block.block_id))
+    pool.get_new_blocks(pool.get_num_free_blocks() - 2)
+
+    block_size = scheduler.block_size
+    scheduler.connector.config = mock_kv(
+        matched_tokens=2 * block_size - 1, is_async=True
+    )
+    importer = create_requests(
+        num_requests=1, num_tokens=2 * block_size, req_ids=["importer"]
+    )[0]
+    scheduler.add_request(importer)
+    out1 = scheduler.schedule()
+
+    assert importer.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert sorted(reused) == sorted(block.block_id for block in unpinned)
+    assert out1.fence_kv_loads == (step_in_flight and unpin)
