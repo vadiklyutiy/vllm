@@ -236,11 +236,16 @@ class OnlineRenderer:
         request: ChatCompletionRequest,
         *,
         skip_mm_cache: bool = False,
+        validate_tool_choice: bool = True,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """Core preprocessing logic for chat requests (no model/engine check).
 
         Called directly by render_chat_request and delegated to by
         OpenAIServingChat.render_chat_request after its engine-aware checks.
+
+        ``validate_tool_choice=False`` skips rejecting a ``tool_choice`` the
+        server cannot parse tool calls for; only set it when nothing will be
+        generated from the result, e.g. when counting prompt tokens.
 
         Decode-side token reuse (ids forwarded in ``kv_transfer_params``) is
         handled deeper, in ``preprocess_chat`` / ``_make_request_with_harmony``,
@@ -267,9 +272,10 @@ class OnlineRenderer:
         )
 
         # Validate tool_choice when tool parsing is required but unavailable
-        if tool_parsing_unavailable and request.tool_choice not in (
-            None,
-            "none",
+        if (
+            validate_tool_choice
+            and tool_parsing_unavailable
+            and request.tool_choice not in (None, "none")
         ):
             if request.tool_choice == "auto" and not self.enable_auto_tools:
                 # for hf tokenizers, "auto" tools requires
