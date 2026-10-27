@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tests.utils import large_gpu_test
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.rotary_embedding import (
@@ -118,3 +119,53 @@ def test_fused_qk_norm_rope_gate_matches_reference(
     torch.testing.assert_close(q_out, q_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(k_out, k_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(gate_out, gate_ref, atol=0, rtol=0)
+
+
+@large_gpu_test(min_gb=16)
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="fused_qk_rmsnorm_rope_gate Triton kernel requires CUDA/ROCm/XPU",
+)
+@torch.inference_mode()
+def test_fused_qk_norm_rope_gate_row_offset_int64(default_vllm_config) -> None:
+    # q_gate and k are column views of the packed qkv projection output; the
+    # last rows of this batch have token * row stride >= 2**31.
+    num_q_heads, num_kv_heads = 24, 4
+    device = torch.device(
+        current_platform.device_type, torch.accelerator.current_device_index()
+    )
+    set_random_seed(SEED)
+
+    q_size = num_q_heads * 2 * HEAD_DIM
+    kv_size = num_kv_heads * HEAD_DIM
+    row_stride = q_size + 2 * kv_size
+    num_tokens = 2**31 // row_stride + 8
+    qkv = torch.randn(num_tokens, row_stride, dtype=DTYPE, device=device)
+    q_gate, k, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    weight = torch.randn(HEAD_DIM, dtype=DTYPE, device=device) * 0.1
+    rope = RotaryEmbedding(
+        HEAD_DIM, ROTARY_DIM, MAX_POSITION_EMBEDDINGS, ROPE_THETA, True, DTYPE
+    ).to(device)
+    positions = torch.arange(num_tokens, dtype=torch.long, device=device)
+
+    def run(rows: slice) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return fused_qk_rmsnorm_rope_gate(
+            q_gate[rows],
+            k[rows],
+            weight,
+            weight,
+            rope.cos_sin_cache,
+            positions[rows],
+            RMS_NORM_EPS,
+            num_q_heads,
+            num_kv_heads,
+            HEAD_DIM,
+            ROTARY_DIM,
+            norm_beta=1.0,
+        )
+
+    # Each (token, head) program is independent, so the tail of the large
+    # launch must match a small launch over the same rows bit for bit.
+    tail = slice(-16, None)
+    for out, expected in zip(run(slice(None)), run(tail)):
+        assert torch.equal(out[tail], expected)
