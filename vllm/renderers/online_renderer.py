@@ -65,6 +65,8 @@ from vllm.renderers.chat_utils import (
     ConversationMessage,
     has_non_text_content,
 )
+from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+from vllm.renderers.deepseek_v32 import DeepseekV32Renderer
 from vllm.renderers.inputs.preprocess import (
     extract_prompt_components,
     parse_model_prompt,
@@ -806,6 +808,44 @@ class OnlineRenderer:
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
+
+        if isinstance(request, ResponsesRequest) and isinstance(
+            renderer, (DeepseekV32Renderer, DeepseekV4Renderer)
+        ):
+            # DeepSeek encoders read `developer` as a user turn and drop it once
+            # a later user turn follows. In the Responses API it is an
+            # instruction with the same standing as `system`. Only the ones
+            # leading up to the first user turn are folded, into one system
+            # message: these encoders render `system` well only as the system
+            # prompt before a user turn, attach the request tools to the first
+            # one, and V3.2 and V4 join two with no separator.
+            first_turn_idx = next(
+                (
+                    i
+                    for i, m in enumerate(messages)
+                    if m.get("role") not in ("system", "developer")
+                ),
+                len(messages),
+            )
+            system_prompt = messages[:first_turn_idx]
+            if (
+                first_turn_idx < len(messages)
+                and messages[first_turn_idx].get("role") == "user"
+                and any(m.get("role") == "developer" for m in system_prompt)
+            ):
+                content = [
+                    part
+                    for m in system_prompt
+                    for part in (
+                        [{"type": "text", "text": m["content"]}]
+                        if isinstance(m["content"], str)
+                        else m["content"]
+                    )
+                ]
+                messages = [
+                    {"role": "system", "content": content},
+                    *messages[first_turn_idx:],
+                ]
 
         reuse_ids = _reused_prompt_token_ids(request, renderer, messages)
         if reuse_ids:

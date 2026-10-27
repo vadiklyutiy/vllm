@@ -38,7 +38,12 @@ from pydantic import ValidationError
 from starlette.requests import Request
 
 import vllm.envs as envs
-from tests.entrypoints.openai.chat_completion.test_serving_chat import MockModelConfig
+from tests.entrypoints.openai.chat_completion.test_serving_chat import (
+    MockModelConfig,
+    MockParallelConfig,
+    MockVllmConfig,
+)
+from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.generate.base.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -78,7 +83,11 @@ from vllm.renderers.online_renderer import (
     OnlineRenderer,
     _extract_allowed_tools_from_mcp_requests,
 )
+from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.sampling_params import SamplingParams
+from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+from vllm.tokenizers.deepseek_v32 import get_deepseek_v32_tokenizer
+from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
 from vllm.v1.metrics.stats import RequestStateStats
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -414,6 +423,134 @@ async def test_online_renderer_renders_non_harmony_responses_with_explicit_histo
     assert preprocess_kwargs["default_template_content_format"] == "string"
     assert preprocess_kwargs["default_template_kwargs"]["server_default"] == "kept"
     assert preprocess_kwargs["default_template_kwargs"]["request_default"] == "kept"
+
+
+class _DeepseekFakeTokenizer(FakeHfTokenizer):
+    max_chars_per_token = 100
+
+    def __call__(self, text: str, **kwargs):
+        return {"input_ids": self.encode(text, **kwargs)}
+
+
+_DEEPSEEK_TOKENIZERS = pytest.mark.parametrize(
+    ("tokenizer_mode", "wrap_tokenizer"),
+    [
+        ("deepseek_v32", get_deepseek_v32_tokenizer),
+        ("deepseek_v4", get_deepseek_v4_tokenizer),
+        ("deepseek_v41", get_deepseek_v41_tokenizer),
+    ],
+)
+
+
+async def _render_deepseek_responses(
+    tokenizer_mode, wrap_tokenizer, messages: list[tuple[str, str]], **request_kwargs
+) -> str:
+    model_config = MockModelConfig()
+    tokenizer = wrap_tokenizer(_DeepseekFakeTokenizer())
+    renderer = RENDERER_REGISTRY.load_renderer_cls(tokenizer_mode)(
+        MockVllmConfig(model_config, MockParallelConfig()), tokenizer
+    )
+    online_renderer = OnlineRenderer(
+        model_config=model_config,
+        renderer=renderer,
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+    )
+    request = ResponsesRequest(
+        input=[
+            {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": text}],
+            }
+            for role, text in messages
+        ],
+        **({"reasoning": {"effort": "high"}} | request_kwargs),
+    )
+    result = await online_renderer.render_responses(request)
+    assert not isinstance(result, ErrorResponse)
+    return tokenizer.last_encode[0]
+
+
+@pytest.mark.asyncio
+@_DEEPSEEK_TOKENIZERS
+async def test_deepseek_renders_responses_developer_like_system(
+    tokenizer_mode, wrap_tokenizer
+):
+    """A Responses developer item is an instruction, so DeepSeek must not drop
+    it as an earlier user turn when reasoning is on."""
+    developer_prompt = await _render_deepseek_responses(
+        tokenizer_mode,
+        wrap_tokenizer,
+        [("developer", "Follow policy."), ("user", "OK.")],
+    )
+    assert "Follow policy." in developer_prompt
+    assert developer_prompt == await _render_deepseek_responses(
+        tokenizer_mode,
+        wrap_tokenizer,
+        [("system", "Follow policy."), ("user", "OK.")],
+    )
+
+
+@pytest.mark.asyncio
+@_DEEPSEEK_TOKENIZERS
+@pytest.mark.parametrize("roles", [("developer",), ("user", "developer")])
+async def test_deepseek_responses_last_developer_opens_generation(
+    tokenizer_mode, wrap_tokenizer, roles
+):
+    """A developer item with no later user item is the turn the model answers."""
+    prompt = await _render_deepseek_responses(
+        tokenizer_mode, wrap_tokenizer, [(role, f"{role} text") for role in roles]
+    )
+    assert prompt.index("developer text") < prompt.rindex("<｜Assistant｜>")
+    assert prompt.endswith("<｜Assistant｜><think>")
+
+
+@pytest.mark.asyncio
+@_DEEPSEEK_TOKENIZERS
+@pytest.mark.parametrize(
+    "roles",
+    [("user", "assistant", "developer", "user"), ("developer", "assistant", "user")],
+)
+async def test_deepseek_responses_developer_outside_system_prompt_keeps_its_turn(
+    tokenizer_mode, wrap_tokenizer, roles
+):
+    """A developer item that does not lead up to the first user turn stays a
+    user turn, and the request tools stay at the start of the prompt."""
+    prompt = await _render_deepseek_responses(
+        tokenizer_mode,
+        wrap_tokenizer,
+        [(role, f"{role} text") for role in roles],
+        tools=[{"type": "function", "name": "get_weather", "parameters": {}}],
+        reasoning={"effort": "none"},
+    )
+    assert prompt.index("get_weather") < min(
+        prompt.index(f"{role} text") for role in roles
+    )
+    developer_idx = prompt.index("developer text")
+    assert prompt.rfind("<｜User｜>", 0, developer_idx) > prompt.rfind(
+        "<｜Assistant｜>", 0, developer_idx
+    )
+
+
+@pytest.mark.asyncio
+@_DEEPSEEK_TOKENIZERS
+@pytest.mark.parametrize("effort", ["high", "none"])
+async def test_deepseek_responses_developer_after_instructions_kept_apart(
+    tokenizer_mode, wrap_tokenizer, effort
+):
+    """Request instructions and a leading developer item both reach the model,
+    not glued into one run of text."""
+    prompt = await _render_deepseek_responses(
+        tokenizer_mode,
+        wrap_tokenizer,
+        [("developer", "developer text"), ("user", "user text")],
+        instructions="instructions",
+        reasoning={"effort": effort},
+    )
+    assert "developer text" in prompt
+    assert "instructionsdeveloper text" not in prompt
 
 
 _REUSED_IDS = [10, 20, 30]
