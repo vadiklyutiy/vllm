@@ -66,6 +66,14 @@ async def test_chat_with_input_type(client: openai.AsyncOpenAI):
 
 
 @pytest.mark.asyncio
+async def test_completed_at(client: openai.AsyncOpenAI):
+    response = await client.responses.create(input="Hello!")
+    assert response.status == "completed"
+    assert response.completed_at is not None
+    assert response.completed_at >= response.created_at
+
+
+@pytest.mark.asyncio
 async def test_logprobs(client: openai.AsyncOpenAI):
     response = await client.responses.create(
         include=["message.output_text.logprobs"],
@@ -91,3 +99,15 @@ async def test_streaming(client: openai.AsyncOpenAI):
         for event in events
     )
     assert isinstance(events[-1], openai_responses_types.ResponseCompletedEvent)
+
+
+@pytest.mark.asyncio
+async def test_streaming_completed_at(client: openai.AsyncOpenAI):
+    stream = await client.responses.create(input="Hello!", stream=True)
+    events = [event async for event in stream]
+    assert [e.type for e in events[:2]] == ["response.created", "response.in_progress"]
+    assert all(e.response.completed_at is None for e in events[:2])
+    final = events[-1]
+    assert isinstance(final, openai_responses_types.ResponseCompletedEvent)
+    assert final.response.completed_at is not None
+    assert final.response.completed_at >= final.response.created_at
