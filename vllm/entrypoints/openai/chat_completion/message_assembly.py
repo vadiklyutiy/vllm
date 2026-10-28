@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import NamedTuple
+from collections.abc import Mapping, Sequence
+from typing import Any, NamedTuple
 
 from vllm.entrypoints.generate.base.protocol import FunctionCall, ToolCall
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -21,6 +22,52 @@ class ChatMessageFields(NamedTuple):
     reasoning: str | None
     content: str | None
     tool_calls: list[ToolCall]
+
+
+def get_chat_response_role(request: ChatCompletionRequest, response_role: str) -> str:
+    """The role of the response message.
+
+    Shared by `OpenAIServingChat` and chat derender.
+
+    Args:
+        request: Supplies `add_generation_prompt` and `messages`.
+        response_role: The server's `--response-role`.
+
+    Returns:
+        `response_role`, or the last message's role when the request
+        continues it with `add_generation_prompt=False`.
+
+    """
+    if request.add_generation_prompt:
+        return response_role
+    return request.messages[-1]["role"]
+
+
+def get_echo_content(messages: Sequence[Mapping[str, Any]], role: str) -> str:
+    """The text `echo` puts in front of the generated content.
+
+    Shared by `OpenAIServingChat` and chat derender.
+
+    Args:
+        messages: The parsed conversation or the request's messages.
+        role: The response message's role.
+
+    Returns:
+        The last message's content, with text parts joined by newlines, when
+        it has `role`. Otherwise "", also for a message without a `content`
+        key, such as the Harmony `Message` of a gpt-oss conversation.
+
+    """
+    if (
+        not messages
+        or "content" not in messages[-1]
+        or messages[-1].get("role") != role
+    ):
+        return ""
+    content = messages[-1]["content"] or ""
+    if isinstance(content, list):
+        content = "\n".join(part["text"] for part in content)
+    return content
 
 
 def assemble_chat_message_fields(

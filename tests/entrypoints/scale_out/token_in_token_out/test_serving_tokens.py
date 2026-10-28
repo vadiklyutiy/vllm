@@ -12,6 +12,7 @@ import pytest_asyncio
 from transformers import AutoTokenizer
 
 import vllm.envs as envs
+from tests.entrypoints.scale_out.derender.utils import stream_chat_derender
 from tests.utils import RemoteOpenAIServer
 from vllm.config import ModelConfig
 from vllm.v1.engine.detokenizer import check_stop_strings
@@ -839,6 +840,138 @@ async def test_derender_mode_with_parser_matches_chat_completions(client, messag
     assert got["message"]["content"] == expected["message"]["content"]
     assert got["message"].get("tool_calls") == expected["message"].get("tool_calls")
     assert got["finish_reason"] == expected["finish_reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    envs.VLLM_USE_RUST_FRONTEND,
+    reason="output_mode is not supported by the Rust frontend",
+)
+@pytest.mark.parametrize(
+    "server",
+    [
+        pytest.param(["--response-role", "bot"], id="no-parser"),
+        pytest.param(
+            [
+                "--response-role",
+                "bot",
+                "--tool-call-parser",
+                "hermes",
+                "--enable-auto-tool-choice",
+            ],
+            id="hermes",
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "chat_fields",
+    [
+        pytest.param(
+            {"messages": [{"role": "user", "content": "Say exactly: Hello there!"}]},
+            id="response-role",
+        ),
+        pytest.param(
+            {
+                "messages": [
+                    {"role": "user", "content": "Count to five."},
+                    {"role": "assistant", "content": "1, 2,"},
+                ],
+                "add_generation_prompt": False,
+                "continue_final_message": True,
+                "echo": True,
+            },
+            id="echo-continue-final-message",
+        ),
+        pytest.param(
+            {
+                "messages": [
+                    {"role": "user", "content": "Count to five."},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "refusal", "refusal": "1, 2,"}],
+                    },
+                ],
+                "add_generation_prompt": False,
+                "continue_final_message": True,
+                "echo": True,
+            },
+            id="echo-refusal-part",
+        ),
+        pytest.param(
+            {
+                "messages": [
+                    {"role": "user", "content": "Count to five."},
+                    {
+                        "role": "assistant",
+                        "content": ["1, ", {"type": "text", "text": "2,"}],
+                    },
+                ],
+                "add_generation_prompt": False,
+                "continue_final_message": True,
+                "echo": True,
+            },
+            id="echo-string-part",
+        ),
+    ],
+)
+async def test_derender_role_and_echo_match_chat_completions(client, chat_fields):
+    """Generate derender and batch and streaming /derender return the role and
+    echoed content /v1/chat/completions does for `--response-role`,
+    `add_generation_prompt: false` and `echo`."""
+    chat = {
+        "model": MODEL_NAME,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": False},
+        **chat_fields,
+    }
+    chat_resp = await client.post("/v1/chat/completions", json=chat)
+    chat_resp.raise_for_status()
+    expected = chat_resp.json()["choices"][0]["message"]
+    expected = (expected["role"], expected["content"])
+
+    render = await client.post("/v1/chat/completions/render", json=chat)
+    render.raise_for_status()
+    generate_request = render.json()
+    prompt_token_ids = generate_request["token_ids"]
+
+    inline = await client.post(
+        GEN_ENDPOINT, json={**generate_request, "output_mode": "derender"}
+    )
+    inline.raise_for_status()
+    message = inline.json()["choices"][0]["message"]
+    assert (message["role"], message["content"]) == expected
+
+    tokens = await client.post(GEN_ENDPOINT, json=generate_request)
+    tokens.raise_for_status()
+    generate_response = tokens.json()
+    batch = await client.post(
+        "/v1/chat/completions/derender",
+        json={
+            "model": MODEL_NAME,
+            "generate_response": generate_response,
+            "prompt_token_ids": prompt_token_ids,
+            "chat_request": chat,
+        },
+    )
+    batch.raise_for_status()
+    message = batch.json()["choices"][0]["message"]
+    assert (message["role"], message["content"]) == expected
+
+    choice = generate_response["choices"][0]
+    stream_choices: list[dict] = []
+    streamed = await stream_chat_derender(
+        client,
+        choice["token_ids"],
+        [1] * len(choice["token_ids"]),
+        chat,
+        len(prompt_token_ids),
+        prompt_token_ids,
+        finish_reason=choice["finish_reason"],
+        raw_choices=stream_choices,
+    )
+    assert (stream_choices[0]["delta"]["role"], streamed["content"]) == expected
 
 
 @pytest.mark.asyncio

@@ -1472,6 +1472,48 @@ async def test_e2e_harmony_tool_choice_none_drops_tool_calls(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_e2e_harmony_echo_matches_chat(harmony_client, harmony_tokenizer, stream):
+    """Coupled chat echoes nothing for Harmony, whose conversation has no
+    message `content`, so /derender must not put the last message in front
+    either, batch and streaming alike."""
+    messages = [
+        {"role": "user", "content": "Count to five."},
+        {"role": "assistant", "content": "1, 2,"},
+    ]
+    gen_req = await _e2e_render_chat(harmony_client, HARMONY_MODEL, messages)
+    output_ids = _harmony_extract_assistant_ids(
+        harmony_tokenizer, {"role": "assistant", "content": "3, 4, 5."}
+    )
+    body: dict = {
+        "model": HARMONY_MODEL,
+        "prompt_token_ids": gen_req["token_ids"],
+        "chat_request": {
+            "model": HARMONY_MODEL,
+            "messages": messages,
+            "add_generation_prompt": False,
+            "echo": True,
+        },
+    }
+    if stream:
+        body["stream"] = True
+        body["generate_chunk"] = _e2e_generate_response(output_ids)
+    else:
+        body["generate_response"] = _e2e_generate_response(output_ids)
+
+    resp = await harmony_client.post("/v1/chat/completions/derender", json=body)
+    assert resp.status_code == 200, resp.text
+    if stream:
+        content = "".join(
+            choice["delta"].get("content") or ""
+            for choice in resp.json()["chunk"]["choices"]
+        )
+    else:
+        content = resp.json()["choices"][0]["message"]["content"]
+    assert content == "3, 4, 5."
+
+
 @pytest.fixture(scope="module")
 def harmony_default_server():
     """gpt-oss render server with NO parser flags.

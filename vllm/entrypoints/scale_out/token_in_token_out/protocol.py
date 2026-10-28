@@ -39,6 +39,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import WeightVersionSpan
 from vllm.renderers import TokenizeParams
+from vllm.renderers.chat_utils import ChatCompletionMessageParam
 from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 
@@ -70,9 +71,19 @@ class ParseContext(BaseModel):
     without the API server only entries a handler keeps out of the engine."""
     history_tool_call_cnt: int = Field(default=0, ge=0)
     """Tool calls already in the rendered conversation, for sequential IDs."""
+    # Left out at their defaults so an older generate server still takes them.
+    add_generation_prompt: bool = Field(default=True, exclude_if=lambda v: v)
+    echo: bool = Field(default=False, exclude_if=lambda v: not v)
+    last_message: ChatCompletionMessageParam | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    """The role and content of the conversation's last message, which set the
+    response role with `add_generation_prompt=False` and the text `echo`
+    repeats. Only set when one of them reads it."""
 
     def to_chat_request(self) -> ChatCompletionRequest:
-        """Build the message less chat request the parser reads.
+        """Build the chat request the parser reads. Its only message is
+        `last_message`, if set.
 
         Built without the chat request validators: the Anthropic converter
         assigns tool fields that they would reject (e.g. `tools: []`) and the
@@ -91,12 +102,14 @@ class ParseContext(BaseModel):
                     parameter="tool_choice",
                 )
         return ChatCompletionRequest.model_construct(
-            messages=[],
+            messages=[] if self.last_message is None else [self.last_message],
             tools=self.tools,
             tool_choice=self.tool_choice,
             parallel_tool_calls=self.parallel_tool_calls,
             include_reasoning=self.include_reasoning,
             chat_template_kwargs=self.chat_template_kwargs,
+            add_generation_prompt=self.add_generation_prompt,
+            echo=self.echo,
         )
 
 

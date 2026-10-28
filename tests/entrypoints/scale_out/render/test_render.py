@@ -1081,3 +1081,23 @@ async def test_tokenize_matches_chat_render_for_gpt_oss(gpt_oss_server):
 
     assert render.status_code == tokenize.status_code == 200
     assert tokenize.json()["tokens"] == render.json()["token_ids"]
+
+
+@pytest.mark.asyncio
+async def test_chat_render_continuation_parse_context_for_gpt_oss(gpt_oss_server):
+    """A GPT-OSS request that continues an assistant message renders, and its
+    `parse_context` carries that message's role and content for derender."""
+    messages = [
+        {"role": "user", "content": "Count to five."},
+        {"role": "assistant", "content": "1, 2,"},
+    ]
+    async with httpx.AsyncClient(
+        base_url=gpt_oss_server.url_for(""), timeout=30.0
+    ) as client:
+        render = await client.post(
+            "/v1/chat/completions/render",
+            json={"messages": messages, "add_generation_prompt": False, "echo": True},
+        )
+
+    assert render.status_code == 200, render.text
+    assert render.json()["parse_context"]["last_message"] == messages[-1]

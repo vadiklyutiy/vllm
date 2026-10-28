@@ -247,13 +247,16 @@ class ServingTokens(GenerateBaseServing):
                 return self.create_error_response(
                     "output_mode='derender' does not support stream=true."
                 )
-            if self.online_derenderer.parser is not None:
-                if request.parse_context is None:
-                    return self.create_error_response(
-                        "output_mode='derender' requires parse_context on a "
-                        "server with a tool or reasoning parser. Use the one "
-                        "returned by /render."
-                    )
+            if (
+                self.online_derenderer.parser is not None
+                and request.parse_context is None
+            ):
+                return self.create_error_response(
+                    "output_mode='derender' requires parse_context on a "
+                    "server with a tool or reasoning parser. Use the one "
+                    "returned by /render."
+                )
+            if request.parse_context is not None:
                 try:
                     derender_request = request.parse_context.to_chat_request()
                 except (ValueError, VLLMValidationError) as e:
@@ -530,7 +533,9 @@ class ServingTokens(GenerateBaseServing):
             # Like coupled chat, hide per-token metadata when a parser hides
             # the reasoning: logprobs, token IDs or sampling masks would leak it.
             hide_metadata = (
-                derender_request is not None and not derender_request.include_reasoning
+                self.online_derenderer.parser is not None
+                and derender_request is not None
+                and not derender_request.include_reasoning
             )
             for (message, finish_reason), fields in zip(
                 parsed, derender_choice_fields, strict=True

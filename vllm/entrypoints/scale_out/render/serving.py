@@ -239,6 +239,16 @@ class ServingRender(BaseServing):
                 {} if self.online_renderer.use_harmony else chat_template_kwargs
             ),
             history_tool_call_cnt=count_history_tool_calls(request),
+            add_generation_prompt=request.add_generation_prompt,
+            echo=request.echo,
+            last_message=(
+                {
+                    "role": request.messages[-1]["role"],
+                    "content": request.messages[-1].get("content"),
+                }
+                if request.echo or not request.add_generation_prompt
+                else None
+            ),
         )
 
     async def render_messages_request(

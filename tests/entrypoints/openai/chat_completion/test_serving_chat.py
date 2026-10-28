@@ -2426,6 +2426,43 @@ class TestServingChatWithHarmony:
         )
 
     @pytest.mark.asyncio
+    async def test_echo_keeps_harmony_output(self, serving_chat):
+        """`echo` reads the Harmony conversation, whose messages have no
+        `content` key, so the final text comes back unchanged."""
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "what is 1+1?"}],
+            echo=True,
+        )
+        conversation, _ = serving_chat.online_renderer._make_request_with_harmony(req)
+        final_str = "The answer is 2."
+        token_ids = get_encoding().encode(
+            f"<|channel|>final<|message|>{final_str}<|end|>", allowed_special="all"
+        )
+
+        async def result_generator():
+            yield self.mock_request_output_from_req_and_token_ids(
+                req, token_ids, finished=True
+            )
+
+        tokenizer = get_tokenizer(GPT_OSS_MODEL_NAME)
+        response = await serving_chat.chat_completion_full_generator(
+            request=req,
+            result_generator=result_generator(),
+            request_id=req.request_id,
+            model_name=req.model,
+            conversation=conversation,
+            tokenizer=tokenizer,
+            request_metadata=RequestResponseMetadata(request_id=req.request_id),
+            parser=serving_chat.parser_cls(
+                tokenizer,
+                req.tools,
+                chat_template_kwargs=serving_chat._effective_chat_template_kwargs(req),
+            ),
+        )
+        verify_chat_response(response, content=final_str)
+
+    @pytest.mark.asyncio
     async def test_system_message_without_tools(self, serving_chat, stream):
         """Leading system message produces a developer message with
         DeveloperContent (# Instructions header)."""

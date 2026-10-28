@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.generate.base.protocol import (
@@ -14,6 +14,8 @@ from vllm.entrypoints.generate.base.serving import (
 )
 from vllm.entrypoints.openai.chat_completion.message_assembly import (
     assemble_chat_message_fields,
+    get_chat_response_role,
+    get_echo_content,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
@@ -51,6 +53,10 @@ from vllm.outputs import CompletionOutput
 from vllm.parser import Parser, ParserManager
 from vllm.renderers import BaseRenderer
 from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
+from vllm.renderers.chat_utils.chat_message import (
+    TEXT_PART_TYPES,
+    parse_chat_message_content_mm_part,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import (
     convert_prompt_ids_to_tokens,
@@ -73,6 +79,7 @@ class OnlineDerenderer:
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
         trust_request_chat_template: bool = False,
+        response_role: str = "assistant",
         enable_auto_tools: bool = False,
         exclude_tools_when_tool_choice_none: bool = False,
         tool_parser: str | None = None,
@@ -120,6 +127,7 @@ class OnlineDerenderer:
         )
         self.reasoning_effort_map: dict[str, str] = reasoning_effort_map or {}
         self.trust_request_chat_template = trust_request_chat_template
+        self.response_role = response_role
 
         self.log_error_stack = log_error_stack
         self.supports_browsing = False
@@ -299,6 +307,8 @@ class OnlineDerenderer:
             and not hide_metadata
         )
         top_limit = _chat_top_logprobs_limit(chat_request)
+        role = self._response_role(chat_request)
+        echo = self._echo_content(chat_request, role)
 
         for choice in generate_response.choices:
             if not choice.token_ids:
@@ -338,9 +348,12 @@ class OnlineDerenderer:
                     chat_request,
                     chat_template_kwargs,
                     generate_response.prompt_token_ids,
+                    role,
                 )
             else:
-                message = ChatMessage(role="assistant", content=decoded_text)
+                message = ChatMessage(role=role, content=decoded_text)
+            if echo is not None:
+                message.content = echo + (message.content or "")
 
             choices.append(
                 ChatCompletionResponseChoice(
@@ -389,10 +402,12 @@ class OnlineDerenderer:
         prompt_token_ids: list[int] | None,
     ) -> list[tuple[ChatMessage, str]]:
         tokenizer = self.renderer.get_tokenizer()
+        role = self._response_role(chat_request)
+        echo = self._echo_content(chat_request, role)
         results: list[tuple[ChatMessage, str]] = []
         for output in outputs:
             if self.parser is None or chat_request is None:
-                message = ChatMessage(role="assistant", content=output.text)
+                message = ChatMessage(role=role, content=output.text)
             else:
                 message = self._parse_and_assemble(
                     tokenizer,
@@ -401,13 +416,53 @@ class OnlineDerenderer:
                     chat_request,
                     chat_request.chat_template_kwargs or {},
                     prompt_token_ids,
+                    role,
                     history_tool_call_count=history_tool_call_cnt,
                 )
+            if echo is not None:
+                message.content = echo + (message.content or "")
             finish_reason = resolve_finish_reason(
                 output.finish_reason, chat_request, bool(message.tool_calls)
             )
             results.append((message, finish_reason))
         return results
+
+    def _response_role(self, chat_request: ChatCompletionRequest | None) -> str:
+        if chat_request is None:
+            return self.response_role
+        return get_chat_response_role(chat_request, self.response_role)
+
+    def _echo_content(
+        self, chat_request: ChatCompletionRequest | None, role: str
+    ) -> str | None:
+        """The text coupled chat puts in front of the content for `echo`, or
+        None when the request does not ask for it.
+
+        Coupled chat echoes the parsed conversation, where the message parser
+        has turned each plain string part and each text like part
+        (`TEXT_PART_TYPES`) into its text. The request's message is raw, so
+        its parts are read the same way here. A Harmony conversation has no
+        message `content`, so coupled chat echoes nothing for it.
+        """
+        if chat_request is None or not chat_request.echo:
+            return None
+        if self.use_harmony or not chat_request.messages:
+            return ""
+        last = chat_request.messages[-1]
+        content = last.get("content")
+        if content is not None and not isinstance(content, str):
+            parsed = (
+                ("text", part)
+                if isinstance(part, str)
+                else parse_chat_message_content_mm_part(part)
+                for part in content
+            )
+            content = "\n".join(
+                cast(str, text)
+                for part_type, text in parsed
+                if part_type in TEXT_PART_TYPES and text is not None
+            )
+        return get_echo_content([{"role": last["role"], "content": content}], role)
 
     def _resolve_chat_template_kwargs(
         self, chat_request: ChatCompletionRequest
@@ -432,6 +487,7 @@ class OnlineDerenderer:
         chat_request: ChatCompletionRequest,
         chat_template_kwargs: dict[str, Any],
         prompt_token_ids: list[int] | None,
+        role: str,
         history_tool_call_count: int | None = None,
     ) -> ChatMessage:
         """Parse decoded output text into an assistant `ChatMessage`.
@@ -444,6 +500,7 @@ class OnlineDerenderer:
                 `include_reasoning`.
             chat_template_kwargs: Already resolved template kwargs.
             prompt_token_ids: Prompt token IDs, if known.
+            role: Role of the message.
             history_tool_call_count: Tool calls in the conversation, for
                 requests that carry no messages. None derives it from
                 `chat_request`.
@@ -479,7 +536,7 @@ class OnlineDerenderer:
             parser_cls=self.parser,
         )
         return ChatMessage(
-            role="assistant",
+            role=role,
             reasoning=fields.reasoning,
             content=fields.content,
             tool_calls=fields.tool_calls,
@@ -569,7 +626,8 @@ class OnlineDerenderer:
         very first chunk, this emits it on the first chunk with a non empty
         `choices` list. A leading usage only chunk therefore defers the
         role to the following content chunk instead of sending an empty
-        role only delta.
+        role only delta. With `echo`, the echoed text leads that delta's
+        content, where coupled chat sends it as its own chunk.
 
         Args:
             model: Model name for the response object.
@@ -636,6 +694,7 @@ class OnlineDerenderer:
 
         return_token_ids = chat_request is not None and chat_request.return_token_ids
         top_limit = _chat_top_logprobs_limit(chat_request)
+        role = self._response_role(chat_request)
         for choice in generate_chunk.choices:
             delta_tids = choice.token_ids or []
             text_tids, stop_reason = self._drop_stop_token(
@@ -659,6 +718,8 @@ class OnlineDerenderer:
                 )
 
             include_role = not updated_state.role_sent
+            if include_role:
+                new_text = (self._echo_content(chat_request, role) or "") + new_text
             updated_state = updated_state.model_copy(
                 update={
                     "role_sent": True,
@@ -669,7 +730,7 @@ class OnlineDerenderer:
             )
 
             delta = DeltaMessage(
-                role="assistant" if include_role else None,
+                role=role if include_role else None,
                 content=new_text if new_text else None,
             )
             stream_choices.append(
@@ -863,7 +924,11 @@ class OnlineDerenderer:
                         last_tool_call_ids.append(tc.id)
 
             if not role_sent:
-                delta_message.role = "assistant"
+                role = self._response_role(chat_request)
+                delta_message.role = role
+                echo = self._echo_content(chat_request, role)
+                if echo:
+                    delta_message.content = echo + (delta_message.content or "")
                 role_sent = True
 
             stream_choices.append(
