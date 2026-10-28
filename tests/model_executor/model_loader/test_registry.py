@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
+
 import pytest
 import torch
 from torch import nn
@@ -93,6 +95,22 @@ def test_default_loader_hf_still_falls_back_to_pt(tmp_path):
     )
     assert use_safetensors is False
     assert any(f.endswith("model.pt") for f in files)
+
+
+def test_default_loader_times_model_that_skips_weights_iterator(default_vllm_config):
+    # Flint GGUF reads its own checkpoint and never pulls the weights iterator;
+    # "Loading weights took" used to log the raw perf_counter() (host uptime).
+    class SelfLoadingModel(nn.Module):
+        def load_weights(self, weights):
+            return set()
+
+    loader = DefaultModelLoader(LoadConfig())
+    start = time.perf_counter()
+    loader.load_weights(SelfLoadingModel(), ModelConfig())
+    elapsed = time.perf_counter() - start
+
+    took = loader.counter_after_loading_weights - loader.counter_before_loading_weights
+    assert 0.0 <= took <= elapsed
 
 
 class _QuantMethod:

@@ -500,9 +500,14 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model_config)
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
+        counter_before_model_load_weights = time.perf_counter()
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
         self.counter_after_loading_weights = time.perf_counter()
+        # Models that read their checkpoint themselves (e.g. Flint GGUF) never
+        # pull the lazy weights iterator, which is what sets the start counter.
+        if self.counter_before_loading_weights == 0.0:
+            self.counter_before_loading_weights = counter_before_model_load_weights
         logger.info_once(
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
