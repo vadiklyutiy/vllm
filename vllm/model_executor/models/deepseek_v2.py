@@ -124,7 +124,6 @@ from .utils import (
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -1439,12 +1438,13 @@ class DeepseekV2Model(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
         if self.is_v32:
             topk_tokens = config.index_topk
-            topk_indices_buffer = torch.empty(
+            self.topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 topk_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
+            topk_indices_buffer = self.topk_indices_buffer
         else:
             topk_indices_buffer = None
         index_group_builder = (
@@ -1486,9 +1486,6 @@ class DeepseekV2Model(nn.Module):
             self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], self.hidden_size
-        )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
@@ -1501,6 +1498,26 @@ class DeepseekV2Model(nn.Module):
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        tensors = {
+            key: torch.zeros((batch_size, self.hidden_size), dtype=dtype, device=device)
+            for key in ("hidden_states", "residual")
+        }
+        # Layers without an indexer reuse the top-k of the last indexer layer,
+        # which can sit on an earlier PP stage.
+        if self.is_v32:
+            tensors["topk_indices"] = torch.zeros(
+                (batch_size, self.config.index_topk),
+                dtype=self.topk_indices_buffer.dtype,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1527,6 +1544,9 @@ class DeepseekV2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            if self.is_v32:
+                topk_indices = intermediate_tensors["topk_indices"]
+                self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
 
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
@@ -1571,9 +1591,10 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self.is_v32:
+                tensors["topk_indices"] = self.topk_indices_buffer[: positions.shape[0]]
+            return IntermediateTensors(tensors)
 
         if hidden_states.shape[0] != positions.shape[0]:
             combined_states = torch.cat([hidden_states, residual], dim=-1)

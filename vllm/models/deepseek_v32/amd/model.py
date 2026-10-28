@@ -34,7 +34,6 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
@@ -145,7 +144,7 @@ class DeepseekV32Model(torch.nn.Module):
 
         self.vocab_size = config.vocab_size
         self.is_v32 = True
-        topk_indices_buffer = torch.empty(
+        self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
             dtype=torch.int32,
@@ -167,7 +166,7 @@ class DeepseekV32Model(torch.nn.Module):
             lambda prefix: DeepseekV32DecoderLayer(
                 vllm_config=vllm_config,
                 prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
+                topk_indices_buffer=self.topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -182,13 +181,34 @@ class DeepseekV32Model(torch.nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
+        )
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        # Layers without an indexer reuse the top-k of the last indexer layer,
+        # which can sit on an earlier PP stage.
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+                "topk_indices": torch.zeros(
+                    (batch_size, self.config.index_topk),
+                    dtype=self.topk_indices_buffer.dtype,
+                    device=device,
+                ),
+            }
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -212,6 +232,8 @@ class DeepseekV32Model(torch.nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            topk_indices = intermediate_tensors["topk_indices"]
+            self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
 
         aux_hidden_states = []
         for idx, layer in enumerate(
@@ -224,7 +246,11 @@ class DeepseekV32Model(torch.nn.Module):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": self.topk_indices_buffer[: positions.shape[0]],
+                }
             )
 
         hidden_states, _ = fused_allreduce_rms_norm(hidden_states, residual, self.norm)
