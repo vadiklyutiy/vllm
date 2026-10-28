@@ -11,6 +11,10 @@ import torch
 import vllm.device_allocator.cumem as cumem
 import vllm.envs as envs
 from vllm import LLM, AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm.device_allocator.sleep_mode_backend import (
+    CuMemBackend,
+    SleepModeBackendFactory,
+)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
@@ -417,6 +421,53 @@ def test_deep_sleep_compressed_tensors_kv_scales(
     ]
     assert all(math.isfinite(x) for x in logprobs[1])
     assert logprobs[0] == logprobs[1]
+
+
+class _ConcurrentAllocBackend(CuMemBackend):
+    """Maps device memory outside the sleep pool while suspending, as another
+    process on the same GPU would."""
+
+    def suspend(self, level: int = 1) -> None:
+        free_before = torch.accelerator.get_memory_info()[0]
+        super().suspend(level)
+        # Take everything this suspend freed, and 1 GiB more.
+        nbytes = torch.accelerator.get_memory_info()[0] - free_before + GiB_bytes
+        self.other_process_memory = torch.empty(
+            nbytes, dtype=torch.uint8, device=current_platform.device_type
+        )
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        self.other_process_memory = None
+        super().resume(tags)
+
+
+@create_new_process_for_each_test()
+def test_sleep_while_device_free_memory_drops(monkeypatch: pytest.MonkeyPatch):
+    """Free memory is device-wide; another process allocating during sleep
+    must not fail the sleep or leave the engine in a wrong state."""
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    envs.disable_envs_cache()
+    SleepModeBackendFactory.register_backend(
+        "concurrent-alloc", __name__, "_ConcurrentAllocBackend"
+    )
+    llm = LLM(
+        "Qwen/Qwen3-0.6B",
+        enable_sleep_mode=True,
+        sleep_mode_backend="concurrent-alloc",
+        enforce_eager=True,
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+        max_model_len=1024,
+    )
+    prompt = "How are you?"
+    sampling_params = SamplingParams(temperature=0, max_tokens=10)
+    expected = llm.generate(prompt, sampling_params)[0].outputs[0].token_ids
+
+    llm.sleep(level=1)
+    assert llm.llm_engine.is_sleeping()
+    llm.wake_up()
+
+    actual = llm.generate(prompt, sampling_params)[0].outputs[0].token_ids
+    assert actual == expected
 
 
 @requires_fp8

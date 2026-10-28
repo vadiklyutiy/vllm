@@ -331,12 +331,18 @@ class Worker(WorkerBase):
             time.sleep(0.1)
 
         used_bytes = total - free_bytes_after_sleep
-        assert freed_bytes >= 0, "Memory usage increased after sleeping."
-        logger.info(
-            "Sleep mode freed %s GiB memory, %s GiB memory is still in use.",
-            format_gib(freed_bytes),
-            format_gib(used_bytes),
-        )
+        if freed_bytes < 0:
+            logger.warning(
+                "Device free memory decreased by %s GiB during sleep; another "
+                "process on the device is likely allocating memory.",
+                format_gib(-freed_bytes),
+            )
+        else:
+            logger.info(
+                "Sleep mode freed %s GiB memory, %s GiB memory is still in use.",
+                format_gib(freed_bytes),
+                format_gib(used_bytes),
+            )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.sleep_mode_backend.resume(tags)
