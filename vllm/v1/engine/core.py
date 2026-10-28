@@ -227,6 +227,7 @@ class EngineCore:
                 hash_block_size,
                 caching_hash_fn,
                 vllm_config.num_hash_lookahead_tokens,
+                vllm_config.model_config.mm_prefix_covers_prompt,
             )
 
         self.step_fn = (

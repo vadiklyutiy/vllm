@@ -7,6 +7,7 @@ import pytest
 import torch
 from transformers import AutoModelForImageTextToText
 
+from vllm import SamplingParams
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
@@ -120,3 +121,92 @@ def test_mm_prefix_lm_e2e(
         "Gemma3 mm-prefix-LM image prefill hidden states should be close to HF; "
         f"got {image_cos=}"
     )
+
+
+PALIGEMMA_MODEL = "google/paligemma2-3b-pt-224"
+PALIGEMMA_PROMPT = "caption en"
+
+
+@pytest.mark.core_model
+@pytest.mark.skipif(
+    current_platform.is_rocm(), reason="ROCm attention has accuracy issue for this test"
+)
+@pytest.mark.parametrize("use_v2_model_runner", ["0", "1"])
+def test_paligemma_prefix_covers_prompt(
+    hf_runner: type[HfRunner],
+    vllm_runner: type[VllmRunner],
+    image_assets: ImageTestAssets,
+    monkeypatch: pytest.MonkeyPatch,
+    use_v2_model_runner: str,
+):
+    """Regression: PaliGemma's bidirectional prefix is the whole prompt (image
+    and instruction, all token_type_ids=0 in HF), not only the image tokens."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2_model_runner)
+    image = image_assets[0].pil_image
+
+    with vllm_runner(
+        PALIGEMMA_MODEL,
+        max_model_len=2048,
+        max_num_seqs=1,
+        enforce_eager=True,
+        limit_mm_per_prompt={"image": 1},
+    ) as vllm_model:
+        vllm_model.apply_model(_install_prefill_hidden_capture)
+        vllm_model.generate_greedy([PALIGEMMA_PROMPT], max_tokens=1, images=[image])
+        vllm_hidden = vllm_model.apply_model(_get_prefill_hidden)[0]
+
+    with hf_runner(PALIGEMMA_MODEL, auto_cls=AutoModelForImageTextToText) as hf_model:
+        inputs = hf_model.get_inputs([PALIGEMMA_PROMPT], images=[image])[0]
+        with torch.no_grad():
+            outputs = hf_model.model.model(
+                **hf_model.wrap_device(inputs), use_cache=False
+            )
+        hf_hidden = outputs.last_hidden_state[0].detach().float().cpu()
+
+    assert vllm_hidden.shape == hf_hidden.shape
+
+    num_image_tokens = 256
+    image_cos = torch.nn.functional.cosine_similarity(
+        vllm_hidden[:num_image_tokens].flatten(),
+        hf_hidden[:num_image_tokens].flatten(),
+        dim=0,
+    )
+    text_cos = torch.nn.functional.cosine_similarity(
+        vllm_hidden[num_image_tokens:], hf_hidden[num_image_tokens:], dim=-1
+    )
+
+    assert image_cos > 0.9, (
+        f"PaliGemma image prefill hidden states should be close to HF; got {image_cos=}"
+    )
+    assert text_cos.min() > 0.9, (
+        "PaliGemma instruction prefill hidden states should be close to HF; "
+        f"got {text_cos=}"
+    )
+
+
+@pytest.mark.core_model
+def test_paligemma_prefix_cache_needs_same_prompt(
+    vllm_runner: type[VllmRunner], image_assets: ImageTestAssets
+):
+    """The image KV depends on the text after it, so only an identical prompt
+    may reuse it from the prefix cache."""
+    image = image_assets[0].pil_image
+    params = SamplingParams(temperature=0, max_tokens=1)
+
+    with vllm_runner(
+        PALIGEMMA_MODEL,
+        max_model_len=2048,
+        max_num_seqs=1,
+        enforce_eager=True,
+        limit_mm_per_prompt={"image": 1},
+        enable_prefix_caching=True,
+    ) as vllm_model:
+
+        def num_cached_tokens(prompt: str) -> int:
+            request = {"prompt": prompt, "multi_modal_data": {"image": image}}
+            return vllm_model.llm.generate(request, params)[0].num_cached_tokens
+
+        num_cached_tokens(PALIGEMMA_PROMPT)
+        assert num_cached_tokens(PALIGEMMA_PROMPT) > 0
+        assert num_cached_tokens("answer en what is written on the sign?") == 0

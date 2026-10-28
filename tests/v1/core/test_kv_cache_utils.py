@@ -263,6 +263,7 @@ def make_request(
     cache_salt: str | None = None,
     prompt_embeds: torch.Tensor | None = None,
     num_hash_lookahead_tokens: int = 0,
+    mm_prefix_covers_prompt: bool = False,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -288,7 +289,7 @@ def make_request(
         lora_request=None,
         cache_salt=cache_salt,
         block_hasher=get_request_block_hasher(
-            block_size, hash_fn, num_hash_lookahead_tokens
+            block_size, hash_fn, num_hash_lookahead_tokens, mm_prefix_covers_prompt
         ),
         prompt_embeds=prompt_embeds,
     )
@@ -1042,6 +1043,30 @@ def test_request_block_hasher(hash_fn):
     assert block_hashes[1] == hash_fn(
         (block_hashes[0], (3, 4, 5), (("mm", "hash2", 0),))
     )
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+def test_request_block_hasher_mm_prefix_covers_prompt(hash_fn):
+    """When the whole prompt is one bidirectional prefix (PaliGemma), the KV of
+    the image block depends on the text after it, so requests that share only
+    the image must not share it. Identical requests still do."""
+
+    def block_hashes(prompt_token_ids: list[int], mm_prefix_covers_prompt: bool):
+        return make_request(
+            "0",
+            prompt_token_ids,
+            hash_fn=hash_fn,
+            mm_positions=[PlaceholderRange(offset=0, length=3)],
+            mm_hashes=["image"],
+            mm_prefix_covers_prompt=mm_prefix_covers_prompt,
+        ).block_hashes
+
+    caption = [0, 0, 0, 1, 2, 3]
+    question = [0, 0, 0, 4, 5, 6]
+
+    assert block_hashes(caption, False)[0] == block_hashes(question, False)[0]
+    assert block_hashes(caption, True)[0] != block_hashes(question, True)[0]
+    assert block_hashes(caption, True) == block_hashes(caption, True)
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

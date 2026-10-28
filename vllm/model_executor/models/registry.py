@@ -926,6 +926,7 @@ class _ModelInfo:
     supports_kv_cache_grouping: bool
     supported_video_pruning_methods: tuple[str, ...]
     supports_mm_device_do_normalize: bool
+    mm_prefix_covers_prompt: bool
 
     @staticmethod
     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
@@ -964,6 +965,7 @@ class _ModelInfo:
             supports_mm_device_do_normalize=getattr(
                 model, "supports_mm_device_do_normalize", False
             ),
+            mm_prefix_covers_prompt=getattr(model, "mm_prefix_covers_prompt", False),
         )
 
 

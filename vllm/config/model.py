@@ -1650,6 +1650,12 @@ class ModelConfig:
         return self.model_arch_config.is_mm_prefix_lm
 
     @property
+    def mm_prefix_covers_prompt(self) -> bool:
+        """Whether the bidirectional prefix of a multimodal request is its whole
+        prompt rather than only its image/video tokens."""
+        return self.is_mm_prefix_lm and self._model_info.mm_prefix_covers_prompt
+
+    @property
     def rswa_window(self) -> int | None:
         return self.model_arch_config.rswa_window
 

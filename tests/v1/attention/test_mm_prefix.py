@@ -19,8 +19,10 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import (
+    compute_mm_prefix_ranges,
     fill_mm_prefix_query_ranges,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout
@@ -188,6 +190,26 @@ def test_returns_none_when_no_range_covers_a_query_token():
     assert _query_ranges({0: [(1, 1)]}, query_lens=[4], seq_lens=[4]) is None
     # Decode rows: the query token is generated, so it is in no range.
     assert _query_ranges({0: [(1, 3)]}, query_lens=[1], seq_lens=[9]) is None
+
+
+def test_whole_prompt_range_is_kept_past_the_sliding_window():
+    """PaliGemma 2 at 896 px has 4096 image tokens and a 4096 sliding window,
+    so its whole-prompt prefix is always longer than the window. HF ORs the
+    prefix block over the window, so the range must not be dropped."""
+    image = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(
+            offset=0,
+            length=4097,
+            is_embed=torch.tensor([True] * 4096 + [False]),
+        ),
+    )
+    ranges = compute_mm_prefix_ranges(
+        [[image], []], sliding_window=4096, prompt_lens=np.array([4100, 5])
+    )
+    assert ranges == {0: [(0, 4099)], 1: []}
 
 
 # --------------------------------------------------------------------------- #

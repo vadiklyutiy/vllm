@@ -954,6 +954,7 @@ def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
     num_hash_lookahead_tokens: int = 0,
+    mm_prefix_covers_prompt: bool = False,
 ) -> Callable[[Request], list[BlockHash]]:
     """Returns a function which computes the list of un-computed block hashes
     of a request.
@@ -968,6 +969,11 @@ def get_request_block_hasher(
     depends on, so it is emitted only once those tokens exist. The block tokens
     stay the hashed tokens; the extra keys become ``(E, *tokens)``, where ``E``
     covers the block and those tokens.
+
+    With ``mm_prefix_covers_prompt``, the whole prompt of a multimodal request
+    attends bidirectionally, so the KV of every prompt block depends on the
+    whole prompt. The first block's extra keys then also cover the whole
+    prompt, and the chain carries it to every later block.
     """
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
@@ -1019,6 +1025,11 @@ def get_request_block_hasher(
             else:
                 extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
                     request, start_token_idx, end_token_idx, curr_mm_idx
+                )
+            if mm_prefix_covers_prompt and start_token_idx == 0 and request.mm_features:
+                extra_keys = (
+                    extra_keys,
+                    *request.all_token_ids[: request.num_prompt_tokens],
                 )
 
             # Compute the hash of the current block

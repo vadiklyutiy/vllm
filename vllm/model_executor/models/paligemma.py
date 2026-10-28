@@ -258,6 +258,10 @@ class PaliGemmaForConditionalGeneration(
 
     supports_tower_connector_lora = True
 
+    # HF marks the whole prompt (image and instruction) with token_type_ids=0,
+    # so it is all one bidirectional prefix; only generated tokens are causal.
+    mm_prefix_covers_prompt = True
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):

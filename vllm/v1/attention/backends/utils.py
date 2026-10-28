@@ -80,11 +80,22 @@ def compute_mm_prefix_ranges(
     sliding_window: int | None = None,
     clamp_sliding_window: bool = False,
     span_pad: int = 0,
+    prompt_lens: np.ndarray | None = None,
 ) -> dict[int, list[tuple[int, int]]]:
-    """Per-request PrefixLM bidirectional ranges for image/video tokens."""
+    """Per-request PrefixLM bidirectional ranges for image/video tokens.
+
+    With ``prompt_lens``, a request with image/video inputs instead gets one
+    range over its whole prompt, for models whose prefix is the image and the
+    text after it (e.g. PaliGemma). That range overrides the sliding window.
+    """
     req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
     for req_idx, mm_features in enumerate(mm_features_per_req):
         image_doc_ranges = []
+        if prompt_lens is not None:
+            if any(f.modality in ("image", "video") for f in mm_features):
+                image_doc_ranges.append((0, int(prompt_lens[req_idx]) - 1))
+            req_doc_ranges[req_idx] = image_doc_ranges
+            continue
         for mm_feature in mm_features:
             if mm_feature.modality not in ("image", "video"):
                 continue

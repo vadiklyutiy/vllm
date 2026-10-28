@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -62,7 +63,13 @@ class DefaultModelState(ModelState):
             self.model_config, model, self.rope_state, encoder_cache
         )
 
+        self.mm_prefix_prompt_lens: np.ndarray | None = None
+        if self.model_config.mm_prefix_covers_prompt:
+            self.mm_prefix_prompt_lens = np.zeros(self.max_num_reqs, dtype=np.int32)
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        if self.mm_prefix_prompt_lens is not None:
+            self.mm_prefix_prompt_lens[req_index] = new_req_data.prompt_len
         if self.rope_state is not None:
             assert new_req_data.prefill_token_ids is not None
             # `prompt_embeds` is a passthrough modality with no grid info, but
@@ -213,6 +220,11 @@ class DefaultModelState(ModelState):
                 )
                 or getattr(hf_text_config, "mm_prefix_clamp_sliding_window", False),
                 span_pad=getattr(self.model, "mm_prefix_span_leading_pad_modulus", 0),
+                prompt_lens=(
+                    None
+                    if self.mm_prefix_prompt_lens is None
+                    else self.mm_prefix_prompt_lens[input_batch.idx_mapping_np]
+                ),
             )
         dcp_local_seq_lens_cpu_upper_bound = None
         if input_batch.pcp is not None:

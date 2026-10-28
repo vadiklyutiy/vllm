@@ -2345,6 +2345,11 @@ class GPUModelRunner(
                 )
                 or getattr(hf_text_config, "mm_prefix_clamp_sliding_window", False),
                 span_pad=getattr(self.model, "mm_prefix_span_leading_pad_modulus", 0),
+                prompt_lens=(
+                    num_prompt_tokens_cpu.numpy()
+                    if self.model_config.mm_prefix_covers_prompt
+                    else None
+                ),
             )
 
         # Reference Sliding Window Attention (R-SWA): pass per-request prompt
