@@ -426,6 +426,34 @@ def test_qwen2_5_vl_video_fps_to_second_per_grid_ts(model_id: str) -> None:
         assert float(spg) == pytest.approx(temporal_patch_size / fps, rel=2e-2)
 
 
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen2.5-VL-3B-Instruct"])
+def test_qwen2_5_vl_pruned_video_reports_unpruned_embeds(model_id: str) -> None:
+    """Video pruning drops embeddings only after the vision tower has encoded
+    every frame. The placeholder must report the encoded count, which the
+    scheduler charges to the encoder compute budget (#63187)."""
+    ctx = build_model_context(
+        model_id,
+        model_config_kwargs={"video_pruning_rate": 0.75},
+        limit_mm_per_prompt={"image": 0, "video": 1},
+    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+
+    processed = processor(
+        "<|vision_start|><|video_pad|><|vision_end|>",
+        mm_items=processor.info.parse_mm_data(
+            _build_qwen2_5_vl_video_mm_data(num_frames=16, fps=2.0)
+        ),
+    )
+
+    merge_size = ctx.get_hf_config().vision_config.spatial_merge_size
+    grid_thw = processed["mm_kwargs"].get_data()["video_grid_thw"][0]
+    (placeholder,) = processed["mm_placeholders"]["video"]
+    assert placeholder.get_num_unpruned_embeds() == (
+        int(grid_thw.prod()) // merge_size**2
+    )
+    assert placeholder.get_num_embeds() < placeholder.get_num_unpruned_embeds()
+
+
 @pytest.mark.usefixtures("default_vllm_config")
 @pytest.mark.parametrize(
     "model_id", ["Qwen/Qwen2-VL-2B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"]

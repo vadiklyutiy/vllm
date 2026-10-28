@@ -29,7 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.multimodal.inputs import MultiModalKwargsItem
+from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
 from vllm.utils.math_utils import cdiv
@@ -950,8 +950,11 @@ class Scheduler(SchedulerInterface):
                             if preempted_encoder_inputs:
                                 # Restore encoder compute budget if the preempted
                                 # request had encoder inputs scheduled in this step.
+                                features = preempted_req.mm_features
                                 num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
+                                    self._get_encoder_compute_cost(
+                                        features[i].mm_position
+                                    )
                                     for i in preempted_encoder_inputs
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
@@ -1989,6 +1992,14 @@ class Scheduler(SchedulerInterface):
         for input_id in duplicate_input_ids:
             self.encoder_cache_manager.check_and_update_cache(request, input_id)
 
+    def _get_encoder_compute_cost(self, mm_position: PlaceholderRange) -> int:
+        # The encoder computes the item in full; pruning only shrinks what is
+        # cached and placed into the prompt. A pruned item can be larger than
+        # the whole budget; it is then scheduled alone.
+        return min(
+            mm_position.get_num_unpruned_embeds(), self.max_num_encoder_input_tokens
+        )
+
     def _try_schedule_encoder_inputs(
         self,
         request: Request,
@@ -2125,8 +2136,12 @@ class Scheduler(SchedulerInterface):
                     # previous step.
                     continue
 
-            if not self.encoder_cache_manager.can_allocate(
-                request, i, encoder_compute_budget, num_embeds_to_schedule
+            num_compute_embeds = self._get_encoder_compute_cost(mm_feature.mm_position)
+            if (
+                num_compute_embeds > encoder_compute_budget
+                or not self.encoder_cache_manager.can_allocate(
+                    request, i, encoder_compute_budget, num_embeds_to_schedule
+                )
             ):
                 # The encoder cache is full or the encoder budget is exhausted.
                 # NOTE(woosuk): We assume that the encoder input tokens should
@@ -2170,7 +2185,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             num_embeds_to_schedule += num_encoder_embeds
-            encoder_compute_budget -= num_encoder_embeds
+            encoder_compute_budget -= num_compute_embeds
             mm_hashes_to_schedule[item_identifier] = num_encoder_embeds
             encoder_inputs_to_schedule.append(i)
 

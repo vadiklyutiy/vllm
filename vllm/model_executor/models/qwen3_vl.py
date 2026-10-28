@@ -1716,7 +1716,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 tokens_per_frame = [tokens_per_frame_base] * num_frames
                 select_token_id = True
 
-            return Qwen3VLMultiModalProcessor.get_video_repl(
+            video_repl = Qwen3VLMultiModalProcessor.get_video_repl(
                 tokens_per_frame=tokens_per_frame,
                 timestamps=timestamps,
                 tokenizer=tokenizer,
@@ -1725,6 +1725,9 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 video_token_id=video_token_id,
                 select_token_id=select_token_id,
             )
+            if pruning_spec is not None:
+                video_repl.num_unpruned_embeds = tokens_per_frame_base * num_frames
+            return video_repl
 
         if self._expands_only_video_token(hf_processor):
             # transformers>=5.10 expands only the bare video_token
@@ -2995,6 +2998,7 @@ class Qwen3VLForConditionalGeneration(
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
             vision_start_token_id=self.config.vision_start_token_id,
+            vision_end_token_id=self.config.vision_end_token_id,
         )
 
     @staticmethod
@@ -3006,6 +3010,7 @@ class Qwen3VLForConditionalGeneration(
         vision_start_token_id: int,
         image_token_id: int,
         video_token_id: int,
+        vision_end_token_id: int | None = None,
     ) -> tuple[Sequence[torch.Tensor], torch.Tensor, int]:
         # Device
         device = (
@@ -3046,6 +3051,7 @@ class Qwen3VLForConditionalGeneration(
                 vision_start_token_id,
                 image_token_id,
                 video_token_id,
+                vision_end_token_id,
             )
 
         return mm_embeddings_out, positions, mrope_positions_delta

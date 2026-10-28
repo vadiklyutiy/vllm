@@ -288,6 +288,35 @@ def test_processor_multi_video(
         )
 
 
+@pytest.mark.parametrize("model_id", [MODEL_ID])
+def test_processor_pruned_video_reports_unpruned_embeds(model_id: str) -> None:
+    """Video pruning drops embeddings only after the vision tower has encoded
+    every frame. The placeholder must report the encoded count, which the
+    scheduler charges to the encoder compute budget (#63187)."""
+    ctx = build_model_context(
+        model_id,
+        model_config_kwargs={"video_pruning_rate": 0.75},
+        limit_mm_per_prompt={"image": 0, "video": 1},
+    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+
+    processed = processor(
+        "<|vision_start|><|video_pad|><|vision_end|>",
+        mm_items=processor.info.parse_mm_data(
+            _build_video_mm_data(num_frames=8, width=256, height=256)
+        ),
+        hf_processor_mm_kwargs={"num_frames": 8},
+    )
+
+    merge_size = ctx.get_hf_config().vision_config.spatial_merge_size
+    grid_thw = processed["mm_kwargs"].get_data()["video_grid_thw"][0]
+    (placeholder,) = processed["mm_placeholders"]["video"]
+    assert placeholder.get_num_unpruned_embeds() == (
+        int(grid_thw.prod()) // merge_size**2
+    )
+    assert placeholder.get_num_embeds() < placeholder.get_num_unpruned_embeds()
+
+
 # Qwen3-VL / Qwen3.8 "Long Video Understanding" pixel budget from the
 # model card. Used to check --mm-processor-kwargs scoping (#52834).
 _LONG_VIDEO_SIZE = {"longest_edge": 469762048, "shortest_edge": 4096}

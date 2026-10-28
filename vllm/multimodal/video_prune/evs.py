@@ -159,6 +159,7 @@ def recompute_mrope_positions(
     vision_start_token_id: int,
     image_token_id: int,
     video_token_id: int,
+    vision_end_token_id: int | None = None,
 ) -> tuple[torch.LongTensor, int]:
     """Update part of input mrope positions.
     Original mrope_positions are computed incorrectly, so once we prune media
@@ -200,6 +201,9 @@ def recompute_mrope_positions(
         vision_start_token_id: Token indicating start of vision media.
         image_token_id: Image token id
         video_token_id: Video token id
+        vision_end_token_id: Token indicating end of vision media. Needed to
+            tell a frame's vision start token from the prompt's own vision
+            start token in front of a video with timestamp tokens.
 
     Returns:
         Tuple of (mrope_positions, mrope_position_delta).
@@ -234,7 +238,7 @@ def recompute_mrope_positions(
         0
     ]
 
-    for mm_pos in multimodal_positions:
+    for mm_idx, mm_pos in enumerate(multimodal_positions):
         # Each mm_pos can be a complete embedding for single media
         # or it can be a part of a single media (due to chunked prefill)
 
@@ -273,13 +277,13 @@ def recompute_mrope_positions(
             in_the_middle_of_media = (
                 seen_mm_tokens > seem_mm_tokens_before_last_vision_start
             )
-            # For Qwen3 VL, we can be inside a media segment even before any
-            # video tokens appear (timestamp tokens are text). If we've passed
-            # the last vision_start token but haven't reached the first video
-            # embedding, treat this as "in the middle of media".
+            # We can be inside a media segment before any media tokens appear:
+            # (Qwen3 VL) within the timestamp tokens that precede the first
+            # video embedding, or right after the vision_start token of the
+            # chunk's first media. Treat this as "in the middle of media".
             if (
                 not in_the_middle_of_media
-                and has_video_tokens
+                and (has_video_tokens or mm_idx == 0)
                 and num_computed_tokens > last_vision_start_token
                 and num_computed_tokens
                 <= last_vision_start_token + num_timestamp_tokens + 1
@@ -314,7 +318,20 @@ def recompute_mrope_positions(
         # when starting a new media. Adjust global_mm_start to point to where
         # the sequence actually begins (before timestamp tokens).
         adjusted_for_timestamps = False
-        if mm_pos.shape[0] == 5 and mm_embeddings_seen == 0 and has_video_tokens:
+        if (
+            mm_pos.shape[0] == 5
+            and mm_embeddings_seen == 0
+            and has_video_tokens
+            # Transformers>=5.10 processors keep the prompt's own vision_start
+            # in front of the timestamp tokens, so the media starts right
+            # after it. A frame's vision_start is followed by its video tokens
+            # or by vision_end.
+            and (
+                vision_end_token_id is None
+                or input_ids[global_mm_start + 1].item()
+                in (image_token_id, video_token_id, vision_end_token_id)
+            )
+        ):
             # NOTE: -1 is because there is a vision start token right after
             # timestamp tokens before any video embeddings appear.
 

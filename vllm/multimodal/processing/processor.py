@@ -190,6 +190,12 @@ class PromptUpdateDetails:
     [`SupportsMultiModal.embed_multimodal`][vllm.model_executor.models.interfaces.SupportsMultiModal.embed_multimodal].
     """
 
+    num_unpruned_embeds: int | None = None
+    """
+    The number of embeddings the encoder computes before pruning, see
+    [`PlaceholderRange.num_unpruned_embeds`][vllm.multimodal.inputs.PlaceholderRange.num_unpruned_embeds].
+    """
+
     @staticmethod
     def from_seq(seq: list[int]) -> "PromptUpdateDetails":
         return PromptUpdateDetails(full=seq)
@@ -582,6 +588,7 @@ class PlaceholderFeaturesInfo:
     start_idx: int
     tokens: list[int]
     is_embed: torch.Tensor | None
+    num_unpruned_embeds: int | None = None
 
     @property
     def length(self) -> int:
@@ -594,6 +601,7 @@ class PlaceholderFeaturesInfo:
             offset=self.start_idx,
             length=self.length,
             is_embed=self.is_embed,
+            num_unpruned_embeds=self.num_unpruned_embeds,
         )
 
 
@@ -890,6 +898,7 @@ def _apply_token_matches_with_placeholders(
                     start_idx=start_idx,
                     tokens=tokens,
                     is_embed=content_is_embed,
+                    num_unpruned_embeds=update.content.num_unpruned_embeds,
                 )
             )
             new_token_ids.extend(tokens)
@@ -963,6 +972,7 @@ def _iter_placeholders(
                     start_idx=start_idx,
                     tokens=content_tokens_full,
                     is_embed=content_is_embed,
+                    num_unpruned_embeds=content.num_unpruned_embeds,
                 )
 
                 # Exclude overlapping matches

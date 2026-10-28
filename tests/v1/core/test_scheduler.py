@@ -806,6 +806,45 @@ def test_max_loras_counts_running_request_skipped_for_encoder_budget():
     assert req_c.status == RequestStatus.WAITING
 
 
+def test_encoder_compute_budget_charges_unpruned_embeds():
+    """Pruning shrinks what an item puts into the prompt, not what the encoder
+    computes for it. Three items that each keep 100 of 400 embeddings must not
+    share one step with a 400-embedding compute budget (#63187)."""
+    scheduler = create_scheduler()
+    scheduler.max_num_encoder_input_tokens = 400
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=1000)
+    requests = create_requests(
+        num_requests=3,
+        num_tokens=200,
+        mm_positions=[[PlaceholderRange(offset=0, length=100, num_unpruned_embeds=400)]]
+        * 3,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.scheduled_encoder_inputs == {"0": [0]}
+
+
+def test_item_over_encoder_compute_budget_is_scheduled_alone():
+    """A pruned item can encode more embeddings than the whole compute budget.
+    It must still be scheduled, alone in its step, not wait forever."""
+    scheduler = create_scheduler()
+    scheduler.max_num_encoder_input_tokens = 400
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=1000)
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=200,
+        mm_positions=[[PlaceholderRange(offset=0, length=100, num_unpruned_embeds=500)]]
+        * 2,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.scheduled_encoder_inputs == {"0": [0]}
+
+
 def test_cached_request_data_resumed_all_token_ids_mrv1_only():
     """all_token_ids carries a resumed request's token ids to the connector
     for the V1 model runner, but is skipped entirely for the V2 model runner.

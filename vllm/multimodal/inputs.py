@@ -146,6 +146,16 @@ class PlaceholderRange:
     between `offset` and `offset + length` to assign embeddings to.
     """
 
+    num_unpruned_embeds: int | None = None
+    """
+    The number of embeddings the encoder computes for this item before
+    pruning drops some of them, e.g. with `video_pruning_rate`.
+
+    `None` (default) means that nothing is pruned, so the encoder computes
+    [`get_num_embeds`][vllm.multimodal.inputs.PlaceholderRange.get_num_embeds]
+    embeddings.
+    """
+
     @cached_property
     def embeds_cumsum(self) -> list[int] | None:
         # python list so python indexing avoids torch C++ overhead/conversions/deallocs
@@ -156,6 +166,13 @@ class PlaceholderRange:
             return self.length
 
         return self.embeds_cumsum[-1] if self.embeds_cumsum else 0
+
+    def get_num_unpruned_embeds(self) -> int:
+        """The encoder compute cost of this item, in embeddings."""
+        if self.num_unpruned_embeds is None:
+            return self.get_num_embeds()
+
+        return self.num_unpruned_embeds
 
     def get_embeds_indices_in_range(
         self, start_idx: int, end_idx: int
@@ -206,7 +223,11 @@ class PlaceholderRange:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return False
-        if not (self.offset, self.length) == (other.offset, other.length):
+        if not (self.offset, self.length, self.num_unpruned_embeds) == (
+            other.offset,
+            other.length,
+            other.num_unpruned_embeds,
+        ):
             return False
 
         if self.is_embed is None:
