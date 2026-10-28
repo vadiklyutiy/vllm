@@ -67,6 +67,9 @@ def _kpool_compress_insert(
     kpool: int,
     head_dim: int,
     round_scale: bool,
+    positions: torch.Tensor | None = None,
+    tail_kv_cache: torch.Tensor | None = None,
+    tail_slot_mapping: torch.Tensor | None = None,
 ) -> None:
     """Pool ``kpool`` consecutive tokens into one fp8 K and write at pool slots.
 
@@ -75,24 +78,45 @@ def _kpool_compress_insert(
     intra-pool tokens are -1. Every position is treated as a pool-completion
     candidate and non-completions are masked off inside the kernel. Compacting
     the valid rows first costs two device syncs on the eager prefill path and
-    buys nothing numerically. Assumes pool-aligned chunk starts.
+    buys nothing numerically.
+
+    A chunk need not start on a pool boundary, so a pool's earlier members can
+    belong to the request's previous chunk. Given the tail ring and its
+    token-granular ``tail_slot_mapping``, a member is taken from its batch row
+    only if that row carries the member's tail slot, else from the ring, where
+    the previous chunk's tail seed left it. Without the ring, members are the
+    preceding batch rows, which assumes pool-aligned chunk starts.
     """
     n = slot_mapping.shape[0]
-    # No pool can complete in a batch smaller than one pool; also keeps the
-    # clamped gather indices below in bounds.
-    if n < kpool:
-        return
     pos = torch.arange(n, device=k.device)
     valid = slot_mapping >= 0
-    # Drop pools whose start falls before the batch (leading padding); their
-    # gate/k data is undefined anyway.
-    write_mask = valid & (pos >= kpool - 1)
     offs = torch.arange(kpool, device=k.device)
-    idx = (pos - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
+    if positions is None or tail_kv_cache is None or tail_slot_mapping is None:
+        # No pool can complete in a batch smaller than one pool; also keeps the
+        # clamped gather indices below in bounds.
+        if n < kpool:
+            return
+        # Drop pools whose start falls before the batch (leading padding); their
+        # gate/k data is undefined anyway.
+        write_mask = valid & (pos >= kpool - 1)
+        idx = (pos - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
+        slot_k, slot_score = k[idx], gate_score[idx]
+    else:
+        ring = tail_kv_cache.shape[2]
+        block = tail_slot_mapping.clamp_min(0)[:, None] // ring
+        ring_idx = (positions[:, None] - (kpool - 1) + offs) % ring
+        rows = pos[:, None] - (kpool - 1) + offs
+        rows_c = rows.clamp_min(0)
+        in_batch = (rows >= 0) & (tail_slot_mapping[rows_c] == block * ring + ring_idx)
+        in_batch = in_batch[..., None]
+        from_ring = tail_kv_cache[block, :, ring_idx]  # [n, kpool, 2, head_dim]
+        slot_k = torch.where(in_batch, k[rows_c], from_ring[:, :, 0])
+        slot_score = torch.where(in_batch, gate_score[rows_c], from_ring[:, :, 1])
+        write_mask = valid
     kpool_ops.kpool_compress_and_write_cache(
         kv_cache,
-        k[idx],  # [n, kpool, head_dim]
-        gate_score[idx],
+        slot_k,  # [n, kpool, head_dim]
+        slot_score,
         ape,
         slot_mapping.to(torch.int64),
         pool_size=kpool,
@@ -225,6 +249,14 @@ def sparse_attn_indexer_kpool(
             if n_prefill > 0:
                 # decode tokens are batched first; prefill tokens follow.
                 prefill_slice = slice(num_decode_tokens, num_tokens)
+                tail_slot_mapping = None
+                if tail_kv_cache is not None and tail_prefix is not None:
+                    tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
+                    if tail_meta is not None:
+                        assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
+                        tail_slot_mapping = tail_meta.slot_mapping[prefill_slice]
+                # Pools straddling a chunk start read the tail ring, so this
+                # must run before the seed below overwrites it.
                 _kpool_compress_insert(
                     k[prefill_slice],
                     gate_score[prefill_slice],
@@ -234,24 +266,26 @@ def sparse_attn_indexer_kpool(
                     index_kpool,
                     head_dim,
                     round_scale=(scale_fmt is not None),
+                    positions=(
+                        positions[prefill_slice] if positions is not None else None
+                    ),
+                    tail_kv_cache=tail_kv_cache,
+                    tail_slot_mapping=tail_slot_mapping,
                 )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
                 # ``pos % kpool`` within the request's tail block. Processing
                 # only the batch's trailing tokens would miss all but the last
                 # request in a multi-request prefill.
-                if tail_kv_cache is not None and tail_prefix is not None:
-                    tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
-                    if tail_meta is not None:
-                        assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
-                        kpool_ops.kpool_seed_tail_cache(
-                            tail_kv_cache,
-                            k[prefill_slice],
-                            gate_score[prefill_slice],
-                            tail_meta.slot_mapping[prefill_slice],
-                            index_kpool,
-                            head_dim,
-                        )
+                if tail_kv_cache is not None and tail_slot_mapping is not None:
+                    kpool_ops.kpool_seed_tail_cache(
+                        tail_kv_cache,
+                        k[prefill_slice],
+                        gate_score[prefill_slice],
+                        tail_slot_mapping,
+                        index_kpool,
+                        head_dim,
+                    )
         else:
             # standard: per-token fp8 quant + scatter (all tokens).
             assert scale_fmt is not None

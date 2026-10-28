@@ -37,12 +37,14 @@ if current_platform.is_rocm():
         kpool_decode_update_and_maybe_write_cache_batched,
         kpool_seed_tail_cache,
     )
+    from vllm.models.glm5next.amd.sparse_indexer import _kpool_compress_insert
 else:
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
         kpool_compress_and_write_cache,
         kpool_decode_update_and_maybe_write_cache_batched,
         kpool_seed_tail_cache,
     )
+    from vllm.models.glm5next.nvidia.sparse_indexer import _kpool_compress_insert
 
 HEAD_DIM = 128
 POOL_SIZE = 16
@@ -539,6 +541,72 @@ def test_prefill_seed_honors_padded_tail_block_stride():
 
     compact_offset = (block * 2 * kpool + ring_slot) * HEAD_DIM
     assert torch.all(backing[compact_offset : compact_offset + HEAD_DIM] == sentinel)
+
+
+@pytest.mark.parametrize("behind_other", [False, True])
+@pytest.mark.parametrize("split", list(range(1, 12)))
+def test_prefill_writer_matches_unchunked_at_any_split(split, behind_other):
+    """The scheduler can end a prefill chunk anywhere, so the next chunk may
+    start inside a pool. That pool's earlier members are in the request's tail
+    ring, not in the batch; the writer once pooled the preceding batch rows
+    (another request's tokens) or, with none, left the pool unwritten."""
+    kpool, ring, nblk, blk, other_blk = 4, 8, 4, 1, 2
+    n_tok = 3 * kpool
+    dev = "cuda"
+    torch.manual_seed(0)
+    k = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    score = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    ape = torch.randn(kpool, HEAD_DIM, dtype=torch.float32, device=dev)
+
+    kv_ref = torch.zeros(nblk, PAGE_SIZE, HEAD_DIM + 4, dtype=torch.uint8, device=dev)
+    kpool_compress_and_write_cache(
+        kv_ref,
+        k.view(-1, kpool, HEAD_DIM),
+        score.view(-1, kpool, HEAD_DIM),
+        ape,
+        torch.arange(n_tok // kpool, dtype=torch.int64, device=dev),
+        pool_size=kpool,
+        head_dim=HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+
+    kv = torch.zeros_like(kv_ref)
+    tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    for start, end in ((0, split), (split, n_tok)):
+        pos = torch.arange(start, end, device=dev)
+        rows_k, rows_score = k[start:end], score[start:end]
+        slots = torch.where((pos + 1) % kpool == 0, pos // kpool, -1)
+        tail_slot = blk * ring + pos % ring
+        if behind_other:
+            # Two rows of another request that complete no pool.
+            other_pos = torch.arange(4, 6, device=dev)
+            other = torch.randn(2, 2, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+            pos = torch.cat([other_pos, pos])
+            rows_k = torch.cat([other[0], rows_k])
+            rows_score = torch.cat([other[1], rows_score])
+            slots = torch.cat([torch.full_like(other_pos, -1), slots])
+            tail_slot = torch.cat([other_blk * ring + other_pos % ring, tail_slot])
+        _kpool_compress_insert(
+            rows_k,
+            rows_score,
+            ape,
+            kv,
+            slots,
+            kpool,
+            HEAD_DIM,
+            ROUND_SCALE,
+            positions=pos,
+            tail_kv_cache=tail,
+            tail_slot_mapping=tail_slot,
+        )
+        kpool_seed_tail_cache(tail, rows_k, rows_score, tail_slot, kpool, HEAD_DIM)
+
+    differing = [
+        p
+        for p in range(n_tok // kpool)
+        if not torch.equal(_cache_pool_bytes(kv, p), _cache_pool_bytes(kv_ref, p))
+    ]
+    assert not differing, f"pools {differing} differ from the unchunked prefill"
 
 
 @pytest.mark.parametrize(
