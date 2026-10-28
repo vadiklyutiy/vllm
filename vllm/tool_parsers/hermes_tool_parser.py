@@ -79,45 +79,46 @@ class Hermes2ProToolParser(ToolParser):
             )
 
         else:
-            try:
-                # there are two possible captures - between tags, or between a
-                # tag and end-of-string so the result of
-                # findall is an array of tuples where one is a function call and
-                # the other is None
-                function_call_tuples = self.tool_call_regex.findall(model_output)
+            # there are two possible captures - between tags, or between a
+            # tag and end-of-string so the result of
+            # findall is an array of tuples where one is a function call and
+            # the other is None
+            function_call_tuples = self.tool_call_regex.findall(model_output)
 
-                # load the JSON, and then use it to build the Function and
-                # Tool Call
-                raw_function_calls = [
-                    json.loads(match[0] if match[0] else match[1])
-                    for match in function_call_tuples
-                ]
-                tool_calls = [
-                    ToolCall(
-                        type="function",
-                        function=FunctionCall(
-                            name=function_call["name"],
-                            # function call args are JSON but as a string
-                            arguments=json.dumps(
-                                function_call["arguments"], ensure_ascii=False
+            # load the JSON, and then use it to build the Function and
+            # Tool Call. Like streaming, stop at the first malformed block
+            # but keep the calls before it.
+            tool_calls: list[ToolCall] = []
+            for match in function_call_tuples:
+                try:
+                    function_call = json.loads(match[0] if match[0] else match[1])
+                    tool_calls.append(
+                        ToolCall(
+                            type="function",
+                            function=FunctionCall(
+                                name=function_call["name"],
+                                # function call args are JSON but as a string
+                                arguments=json.dumps(
+                                    function_call["arguments"], ensure_ascii=False
+                                ),
                             ),
-                        ),
+                        )
                     )
-                    for function_call in raw_function_calls
-                ]
+                except Exception:
+                    logger.exception("Error in extracting tool call from response.")
+                    break
 
-                content = model_output[: model_output.find(self.tool_call_start_token)]
-                return ExtractedToolCallInformation(
-                    tools_called=True,
-                    tool_calls=tool_calls,
-                    content=content if content else None,
-                )
-
-            except Exception:
-                logger.exception("Error in extracting tool call from response.")
+            if not tool_calls:
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
+
+            content = model_output[: model_output.find(self.tool_call_start_token)]
+            return ExtractedToolCallInformation(
+                tools_called=True,
+                tool_calls=tool_calls,
+                content=content if content else None,
+            )
 
     def _extract_content(self, current_text: str) -> str | None:
         """Return unsent non-tool-call text, or None.

@@ -397,6 +397,48 @@ def test_hermes_parser_non_streaming_tool_call_invalid_json(
     assert not tool_call.tools_called
 
 
+@pytest.mark.parametrize(
+    "malformed_tail",
+    [
+        " Second. <tool_call>",
+        " <tool_call> opens a call. Done.",
+        " <tool_call></tool_call> Third.",
+        " <tool_call>not json</tool_call> Third.",
+        ' <tool_call>not json</tool_call> <tool_call>{"name": "get_time", '
+        '"arguments": {}}</tool_call>',
+    ],
+)
+def test_hermes_malformed_tool_call_after_valid_one(
+    qwen_tokenizer: TokenizerLike,
+    any_chat_request: ChatCompletionRequest,
+    malformed_tail: str,
+) -> None:
+    """A malformed <tool_call> must not drop the valid call before it, and
+    non-streaming must return the same result as streaming (#63358)."""
+    text = (
+        "First. <tool_call>\n"
+        '{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>" + malformed_tail
+    )
+
+    result = Hermes2ProToolParser(qwen_tokenizer).extract_tool_calls(
+        text, any_chat_request
+    )
+    assert result.tools_called
+    assert [tc.function.name for tc in result.tool_calls] == ["get_weather"]
+    assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Paris"}
+    assert result.content == "First. "
+
+    deltas = _simulate_streaming(
+        qwen_tokenizer, Hermes2ProToolParser(qwen_tokenizer), any_chat_request, text
+    )
+    tool_deltas = [tc for d in deltas if d.tool_calls for tc in d.tool_calls]
+    assert [tc.function.name for tc in tool_deltas if tc.function.name] == [
+        "get_weather"
+    ]
+    assert "".join(d.content for d in deltas if d.content) == result.content
+
+
 def test_hermes_streaming_content_and_tool_call_in_single_chunk(
     qwen_tokenizer: TokenizerLike,
     any_chat_request: ChatCompletionRequest,
