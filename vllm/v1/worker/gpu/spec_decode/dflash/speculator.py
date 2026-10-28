@@ -465,6 +465,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
+        if dummy_run:
+            # A dummy batch padded to a FULL graph's request count can hold more
+            # requests than one draft pass fits; the scheduler never runs more.
+            num_reqs = min(num_reqs, self.max_num_tokens // self.num_query_per_req)
         if dummy_run and dp_sync_state is not None:
             num_reqs = min(num_reqs, dp_sync_state.num_reqs)
         num_target_tokens = input_batch.num_tokens
