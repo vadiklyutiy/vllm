@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from tests.tool_parsers.utils import get_function_delta
+from tests.tool_parsers.utils import get_function_delta, run_tool_extraction
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
@@ -420,3 +420,48 @@ def test_hermes_streaming_content_and_tool_call_in_single_chunk(
     assert tool_parts[0].function.name == "f"
     args_str = "".join(tc.function.arguments or "" for tc in tool_parts)
     assert json.loads(args_str) == {"x": 1}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_hermes_tool_call_tag_in_prose_is_content(
+    qwen_tokenizer: TokenizerLike,
+    streaming: bool,
+) -> None:
+    """A <tool_call> tag quoted in prose must not swallow the text after it."""
+    text = "The literal <tool_call> tag opens a call. Done."
+    parser = Hermes2ProToolParser(qwen_tokenizer)
+    content, tool_calls = run_tool_extraction(parser, text, streaming=streaming)
+
+    assert content == text
+    assert tool_calls == []
+
+
+def test_hermes_streaming_tool_call_after_tag_in_prose(
+    qwen_tokenizer: TokenizerLike,
+) -> None:
+    """A real tool call after a <tool_call> tag quoted in prose is parsed."""
+    prose = "The literal <tool_call> tag opens a call. "
+    text = prose + '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
+    parser = Hermes2ProToolParser(qwen_tokenizer)
+    content, tool_calls = run_tool_extraction(parser, text, streaming=True)
+
+    assert content == prose
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "f"
+    assert json.loads(tool_calls[0].function.arguments) == {"x": 1}
+
+
+def test_hermes_streaming_tag_in_prose_between_tool_calls(
+    qwen_tokenizer: TokenizerLike,
+) -> None:
+    """A <tool_call> tag quoted in prose between calls is not a call body."""
+    text = (
+        '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
+        " The literal <tool_call> tag opens a call. "
+        '<tool_call>{"name": "g", "arguments": {"y": 2}}</tool_call>'
+    )
+    parser = Hermes2ProToolParser(qwen_tokenizer)
+    _, tool_calls = run_tool_extraction(parser, text, streaming=True)
+
+    assert [tc.function.name for tc in tool_calls] == ["f", "g"]
+    assert json.loads(tool_calls[1].function.arguments) == {"y": 2}

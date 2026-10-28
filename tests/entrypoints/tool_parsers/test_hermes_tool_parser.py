@@ -318,3 +318,32 @@ async def test_streaming_product_tool_call(
     print("\n[Streaming Product Test Passed]")
     print(f"Reconstructed Tool Call: {reconstructed_tool_call['name']}")
     print(f"Reconstructed Arguments: {arguments}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_config", ["llama"], indirect=True)
+async def test_streaming_tool_call_tag_in_prose_is_content(
+    client: openai.AsyncOpenAI, server_config: ServerConfig
+):
+    """A <tool_call> tag quoted in prose is streamed back as content."""
+    text = "The literal <tool_call> tag opens a call. Done."
+    # Force the output text so the test does not depend on the model.
+    stream = await client.chat.completions.create(
+        model=server_config["model_arg"],
+        messages=MESSAGES,
+        tools=TOOLS,
+        tool_choice="auto",
+        temperature=0.0,
+        stream=True,
+        extra_body={"structured_outputs": {"choice": [text]}},
+    )
+
+    content = ""
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        assert not delta.tool_calls
+        content += delta.content or ""
+
+    assert content == text

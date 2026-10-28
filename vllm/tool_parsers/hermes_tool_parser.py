@@ -25,7 +25,11 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
-from vllm.tool_parsers.utils import is_complete_json, partial_tag_overlap
+from vllm.tool_parsers.utils import (
+    consume_space,
+    is_complete_json,
+    partial_tag_overlap,
+)
 from vllm.utils.mistral import is_mistral_tokenizer
 
 logger = init_logger(__name__)
@@ -119,18 +123,33 @@ class Hermes2ProToolParser(ToolParser):
                     tools_called=False, tool_calls=[], content=model_output
                 )
 
+    def _find_tool_call_start(self, text: str, pos: int) -> int:
+        """Return the index of the next <tool_call> that may open a call, or -1.
+
+        A tool call body is a JSON object, so a tag followed by anything else
+        is part of the content (e.g. a tag quoted in prose).
+        """
+        start = text.find(self.tool_call_start_token, pos)
+        while start != -1:
+            body_start = consume_space(start + len(self.tool_call_start_token), text)
+            if body_start == len(text) or text[body_start] == "{":
+                return start
+            start = text.find(self.tool_call_start_token, body_start)
+        return -1
+
     def _extract_content(self, current_text: str) -> str | None:
         """Return unsent non-tool-call text, or None.
 
         Holds back any suffix that could be a partial <tool_call> tag.
         """
-        if self.tool_call_start_token not in current_text:
+        start = self._find_tool_call_start(current_text, self._sent_content_idx)
+        if start == -1:
             overlap_length = partial_tag_overlap(
                 current_text, self.tool_call_start_token
             )
             sendable_idx = len(current_text) - overlap_length
         else:
-            sendable_idx = current_text.index(self.tool_call_start_token)
+            sendable_idx = start
 
         if sendable_idx > self._sent_content_idx:
             content = current_text[self._sent_content_idx : sendable_idx]
@@ -143,7 +162,7 @@ class Hermes2ProToolParser(ToolParser):
         results: list[tuple[str, bool]] = []
         pos = 0
         while True:
-            start = text.find(self.tool_call_start_token, pos)
+            start = self._find_tool_call_start(text, pos)
             if start == -1:
                 break
             json_start = start + len(self.tool_call_start_token)
