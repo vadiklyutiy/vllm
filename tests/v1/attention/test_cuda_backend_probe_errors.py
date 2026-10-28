@@ -8,6 +8,9 @@ terminating engine init; programming errors must still propagate.
 See https://github.com/vllm-project/vllm/issues/51658.
 """
 
+import os
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -144,3 +147,78 @@ def test_selected_backend_probe_failure_raises_value_error_with_cause():
             num_heads=32,
         )
     assert excinfo.value.__cause__ is exc
+
+
+def test_llm_generates_without_fa_extensions():
+    """A CUDA build without _vllm_fa2_C/_vllm_fa3_C must start an engine on a
+    backend it can run. See https://github.com/vllm-project/vllm/issues/63267."""
+    code = (
+        "import sys\n"
+        "sys.modules['vllm.vllm_flash_attn._vllm_fa2_C'] = None\n"
+        "sys.modules['vllm.vllm_flash_attn._vllm_fa3_C'] = None\n"
+        "from vllm import LLM, SamplingParams\n"
+        "llm = LLM(model='facebook/opt-125m', enforce_eager=True,\n"
+        "          gpu_memory_utilization=0.3)\n"
+        "params = SamplingParams(temperature=0, max_tokens=8)\n"
+        "out = llm.generate(['Hello, my name is'], params)\n"
+        "assert out[0].outputs[0].token_ids\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "VLLM_ENABLE_V1_MULTIPROCESSING": "0"},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+# On SM90 an FA4-only build resolves to the missing FA2.
+@pytest.mark.parametrize("fa_versions", [(), (4,)], ids=["no_fa", "fa4_only"])
+def test_flash_attn_not_valid_without_usable_fa_version(fa_versions):
+    with (
+        patch(
+            "vllm.vllm_flash_attn.flash_attn_interface.is_fa_version_supported",
+            side_effect=lambda v: v in fa_versions,
+        ),
+        patch.object(CudaPlatform, "get_device_capability", return_value=SM90),
+    ):
+        valid, invalid_reasons = CudaPlatform.get_valid_backends(
+            device_capability=SM90,
+            attn_selector_config=SELECTOR_CONFIG,
+            num_heads=32,
+        )
+    assert AttentionBackendEnum.FLASH_ATTN in invalid_reasons
+    assert valid
+
+
+@pytest.mark.parametrize("fa_versions", [(), (4,)], ids=["no_fa", "fa4_only"])
+def test_vit_skips_flash_attn_without_usable_fa_version(fa_versions):
+    with (
+        patch(
+            "vllm.vllm_flash_attn.flash_attn_interface.is_fa_version_supported",
+            side_effect=lambda v: v in fa_versions,
+        ),
+        patch.object(CudaPlatform, "get_device_capability", return_value=SM90),
+    ):
+        backend = CudaPlatform.get_vit_attn_backend(head_size=64, dtype=torch.bfloat16)
+    assert backend != AttentionBackendEnum.FLASH_ATTN
+
+
+def test_flash_attn_not_valid_when_head_size_resolves_to_missing_fa2():
+    """FA4-only build on SM100: FA4 has no head_size=192 kernel, so the
+    layer resolves to the missing FA2."""
+    sm100 = DeviceCapability(major=10, minor=0)
+    with (
+        patch(
+            "vllm.vllm_flash_attn.flash_attn_interface.is_fa_version_supported",
+            side_effect=lambda v: v == 4,
+        ),
+        patch.object(CudaPlatform, "get_device_capability", return_value=sm100),
+    ):
+        valid, invalid_reasons = CudaPlatform.get_valid_backends(
+            device_capability=sm100,
+            attn_selector_config=SELECTOR_CONFIG._replace(head_size=192),
+            num_heads=32,
+        )
+    assert AttentionBackendEnum.FLASH_ATTN in invalid_reasons
+    assert valid

@@ -209,7 +209,7 @@ def get_flash_attn_version(
             fa_version = 2
 
         if not is_fa_version_supported(fa_version):
-            logger.error(
+            logger.error_once(
                 "Cannot use FA version %d is not supported due to %s",
                 fa_version,
                 fa_version_unsupported_reason(fa_version),
@@ -365,9 +365,12 @@ def is_flash_attn_varlen_func_available() -> bool:
         bool: True if a working flash_attn_varlen_func implementation is available.
 
     """
-    if current_platform.is_cuda() or current_platform.is_xpu():
-        # CUDA and XPU always have flash_attn_varlen_func available
+    if current_platform.is_xpu():
         return True
+
+    if current_platform.is_cuda():
+        # CUDA builds may ship without any of the FA2/FA3/FA4 kernels.
+        return any(is_fa_version_supported(v) for v in (2, 3, 4))
 
     if current_platform.is_rocm():
         # Use the flag set during module import to check if

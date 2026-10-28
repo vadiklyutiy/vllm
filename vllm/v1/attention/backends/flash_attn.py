@@ -456,7 +456,10 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability >= DeviceCapability(8, 0)
+        return (
+            capability >= DeviceCapability(8, 0)
+            and get_flash_attn_version() is not None
+        )
 
     @classmethod
     def supports_combination(
@@ -496,16 +499,15 @@ class FlashAttentionBackend(AttentionBackend):
                 "FP8 KV cache requires FA3 on SM90, FA4 with head_size=512 "
                 "on SM90, or FA4 on SM100"
             )
-        if (
-            use_mm_prefix
-            and get_flash_attn_version(
-                head_size=head_size,
-                has_sinks=has_sink,
-                kv_cache_block_size=block_size,
-                supports_fa4_hd256=True,
-            )
-            != 4
-        ):
+        fa_version = get_flash_attn_version(
+            head_size=head_size,
+            has_sinks=has_sink,
+            kv_cache_block_size=block_size,
+            supports_fa4_hd256=True,
+        )
+        if fa_version is None:
+            return "FlashAttention version for this configuration is not available"
+        if use_mm_prefix and fa_version != 4:
             return (
                 "mm_prefix (PrefixLM bidirectional attention) requires "
                 "FlashAttention v4, which does not resolve for this "

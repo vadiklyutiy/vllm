@@ -11,6 +11,7 @@ steps:
     - vllm/config/attention.py
     - vllm/model_executor/layers/attention
     - vllm/v1/attention
+    - vllm/vllm_flash_attn
     - tests/v1/attention
   commands:
     - pytest -v -s v1/attention
@@ -48,6 +49,7 @@ steps:
     - vllm/config/attention.py
     - vllm/model_executor/layers/attention
     - vllm/v1/attention
+    - vllm/vllm_flash_attn
     - tests/v1/attention
   commands:
     - pytest -v -s v1/attention

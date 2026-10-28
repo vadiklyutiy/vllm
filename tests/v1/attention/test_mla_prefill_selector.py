@@ -479,6 +479,29 @@ class TestBackendValidation:
         assert len(invalid_reasons) == 1
         assert "supported MLA dimensions" in invalid_reasons[0]
 
+    @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA FA kernels")
+    def test_flash_attn_invalid_without_fa_kernels(self):
+        """A CUDA build without any FA kernel must not pick FA for MLA prefill.
+        See https://github.com/vllm-project/vllm/issues/63267."""
+        from vllm.v1.attention.backends.mla.prefill.flash_attn import (
+            FlashAttnPrefillBackend,
+        )
+
+        selector_config = MLAPrefillSelectorConfig(
+            dtype=torch.bfloat16,
+            mla_dimensions=MLADimensions(
+                qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128
+            ),
+        )
+        with patch(
+            "vllm.vllm_flash_attn.flash_attn_interface.is_fa_version_supported",
+            return_value=False,
+        ):
+            invalid_reasons = FlashAttnPrefillBackend.validate_configuration(
+                DeviceCapability(major=10, minor=0), selector_config
+            )
+        assert invalid_reasons == ["required dependencies not available"]
+
 
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
