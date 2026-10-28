@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
-from tests.utils import multi_gpu_marks
+from tests.utils import multi_gpu_marks, multi_gpu_test
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -267,3 +270,135 @@ async def test_deepseek_mtp_load_dp(monkeypatch: pytest.MonkeyPatch, dp_size: in
         f"  spec_tokens   = {spec_tokens}\n"
         f"  no_spec_tokens= {no_spec_tokens}"
     )
+
+
+TINY_DEEPSEEK_MTP_CONFIG: dict[str, Any] = {
+    "architectures": ["DeepseekV3ForCausalLM"],
+    "model_type": "deepseek_v3",
+    "torch_dtype": "bfloat16",
+    "vocab_size": 1024,
+    "hidden_size": 256,
+    "intermediate_size": 128,
+    "moe_intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "num_nextn_predict_layers": 1,
+    "first_k_dense_replace": 1,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 32,
+    "q_lora_rank": 64,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "n_routed_experts": 4,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "n_group": 1,
+    "topk_group": 1,
+    "topk_method": "noaux_tc",
+    "scoring_func": "sigmoid",
+    "norm_topk_prob": True,
+    "max_position_embeddings": 4096,
+    "tie_word_embeddings": False,
+}
+
+
+def _write_tiny_deepseek_mtp(path: Path) -> tuple[str, str, torch.Tensor]:
+    """Write a random DeepSeek-V3 target and a draft dir holding only its MTP
+    layer (no embed_tokens). Returns both dirs and the target embedding."""
+    c = TINY_DEEPSEEK_MTP_CONFIG
+    h, heads, mtp = c["hidden_size"], c["num_attention_heads"], c["num_hidden_layers"]
+    gen = torch.Generator().manual_seed(0)
+
+    def w(*shape: int) -> torch.Tensor:
+        return (torch.randn(*shape, generator=gen) * 0.05).to(torch.bfloat16)
+
+    def ones(n: int) -> torch.Tensor:
+        return torch.ones(n, dtype=torch.bfloat16)
+
+    def mlp(p: str, inter: int) -> dict[str, torch.Tensor]:
+        return {
+            f"{p}.gate_proj.weight": w(inter, h),
+            f"{p}.up_proj.weight": w(inter, h),
+            f"{p}.down_proj.weight": w(h, inter),
+        }
+
+    def layer(i: int) -> dict[str, torch.Tensor]:
+        p, attn = f"model.layers.{i}", f"model.layers.{i}.self_attn"
+        qk_dim = c["qk_nope_head_dim"] + c["qk_rope_head_dim"]
+        kv_dim = c["qk_nope_head_dim"] + c["v_head_dim"]
+        t = {
+            f"{p}.input_layernorm.weight": ones(h),
+            f"{p}.post_attention_layernorm.weight": ones(h),
+            f"{attn}.q_a_proj.weight": w(c["q_lora_rank"], h),
+            f"{attn}.q_a_layernorm.weight": ones(c["q_lora_rank"]),
+            f"{attn}.q_b_proj.weight": w(heads * qk_dim, c["q_lora_rank"]),
+            f"{attn}.kv_a_proj_with_mqa.weight": w(
+                c["kv_lora_rank"] + c["qk_rope_head_dim"], h
+            ),
+            f"{attn}.kv_a_layernorm.weight": ones(c["kv_lora_rank"]),
+            f"{attn}.kv_b_proj.weight": w(heads * kv_dim, c["kv_lora_rank"]),
+            f"{attn}.o_proj.weight": w(h, heads * c["v_head_dim"]),
+        }
+        if i < c["first_k_dense_replace"]:
+            return t | mlp(f"{p}.mlp", c["intermediate_size"])
+        t[f"{p}.mlp.gate.weight"] = w(c["n_routed_experts"], h)
+        t[f"{p}.mlp.gate.e_score_correction_bias"] = torch.zeros(c["n_routed_experts"])
+        for e in range(c["n_routed_experts"]):
+            t |= mlp(f"{p}.mlp.experts.{e}", c["moe_intermediate_size"])
+        return t | mlp(f"{p}.mlp.shared_experts", c["moe_intermediate_size"])
+
+    embed = w(c["vocab_size"], h)
+    lm_head = w(c["vocab_size"], h)
+    mtp_layer = layer(mtp) | {
+        f"model.layers.{mtp}.enorm.weight": ones(h),
+        f"model.layers.{mtp}.hnorm.weight": ones(h),
+        f"model.layers.{mtp}.eh_proj.weight": w(h, 2 * h),
+        f"model.layers.{mtp}.shared_head.norm.weight": ones(h),
+        f"model.layers.{mtp}.shared_head.head.weight": lm_head.clone(),
+    }
+    target = {
+        "model.embed_tokens.weight": embed,
+        "model.norm.weight": ones(h),
+        "lm_head.weight": lm_head,
+        **layer(0),
+        **layer(1),
+        **mtp_layer,
+    }
+    for name, tensors in [("target", target), ("draft", mtp_layer)]:
+        (path / name).mkdir()
+        save_file(tensors, path / name / "model.safetensors", {"format": "pt"})
+        (path / name / "config.json").write_text(json.dumps(c))
+    return str(path / "target"), str(path / "draft"), embed
+
+
+def _draft_input_embedding(worker) -> torch.Tensor | None:
+    speculator = worker.model_runner.speculator
+    if speculator is None:
+        return None
+    return speculator.model.model.embed_tokens.weight.cpu()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_deepseek_mtp_pp_draft_without_embedding(monkeypatch, tmp_path, vllm_runner):
+    """Under PP, an MTP draft checkpoint without embed_tokens runs on the
+    target's input embedding instead of a never-loaded one."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    target, draft, target_embed = _write_tiny_deepseek_mtp(tmp_path)
+    with vllm_runner(
+        target,
+        pipeline_parallel_size=2,
+        speculative_config={
+            "method": "mtp",
+            "model": draft,
+            "num_speculative_tokens": 1,
+        },
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=GPU_MEM_UTIL,
+    ) as runner:
+        draft_embeds = runner.llm.collective_rpc(_draft_input_embedding)
+    draft_embeds = [e for e in draft_embeds if e is not None]
+    assert len(draft_embeds) == 1
+    assert torch.equal(draft_embeds[0], target_embed)

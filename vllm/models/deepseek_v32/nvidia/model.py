@@ -36,6 +36,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.common.ops.sequence_parallel import (
@@ -200,7 +201,9 @@ class DeepseekV32Model(torch.nn.Module):
             get_sparse_mla_index_group_max_rows(vllm_config),
         )
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(
+            vllm_config, include_mtp=vllm_config.use_v2_model_runner
+        ):
             self.embed_tokens = make_input_embedding(
                 config.vocab_size,
                 config.hidden_size,

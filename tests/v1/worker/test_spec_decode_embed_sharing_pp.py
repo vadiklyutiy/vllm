@@ -361,3 +361,147 @@ def test_nemotron_shares_target_embedding_and_refit(
         nemotron_draft.get_input_embeddings(torch.tensor([1])),
         torch.full((1, HIDDEN), 3.0),
     )
+
+
+DEEPSEEK_MTP_LAYER = 1
+DEEPSEEK_TARGETS = {
+    "deepseek_v3": (
+        "vllm.model_executor.models.deepseek_v2",
+        "DeepseekV2Model",
+        "VocabParallelEmbedding",
+    ),
+    "deepseek_v32": (
+        "vllm.models.deepseek_v32.nvidia.model",
+        "DeepseekV32Model",
+        "make_input_embedding",
+    ),
+    "deepseek_v32_amd": (
+        "vllm.models.deepseek_v32.amd.model",
+        "DeepseekV32Model",
+        "VocabParallelEmbedding",
+    ),
+}
+DEEPSEEK_DRAFTS = {
+    "deepseek_v3": (
+        "vllm.model_executor.models.deepseek_mtp",
+        "DeepSeekMultiTokenPredictor",
+        "DeepSeekMTP",
+    ),
+    "deepseek_v32": (
+        "vllm.models.deepseek_v32.nvidia.mtp",
+        "DeepseekV32MultiTokenPredictor",
+        "DeepseekV32MTP",
+    ),
+    "deepseek_v32_amd": (
+        "vllm.models.deepseek_v32.amd.mtp",
+        "DeepseekV32MultiTokenPredictor",
+        "DeepseekV32MTP",
+    ),
+}
+
+
+@pytest.fixture(params=list(DEEPSEEK_TARGETS))
+def deepseek_variant(request):
+    if request.param == "deepseek_v32" and not current_platform.is_cuda():
+        pytest.skip("The deepseek_v32 modules require CUDA")
+    if request.param == "deepseek_v32_amd" and not current_platform.is_cuda_alike():
+        pytest.skip("The deepseek_v32 modules require CUDA or ROCm")
+    return request.param
+
+
+def _deepseek_config(use_v2: bool = True, method: str | None = "mtp"):
+    hf_config = SimpleNamespace(
+        model_type="deepseek_v3",
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        num_hidden_layers=DEEPSEEK_MTP_LAYER,
+        num_nextn_predict_layers=1,
+        index_topk=1,
+        n_group=1,
+        n_routed_experts=0,
+        n_shared_experts=0,
+        rms_norm_eps=1e-6,
+    )
+    return SimpleNamespace(
+        use_v2_model_runner=use_v2,
+        load_config=SimpleNamespace(load_format="auto"),
+        model_config=SimpleNamespace(hf_config=hf_config),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
+        quant_config=None,
+        parallel_config=SimpleNamespace(
+            use_sequence_parallel_moe=False,
+            pipeline_parallel_size=3,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=1),
+        compilation_config=SimpleNamespace(mode=0),
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        None,
+        "model.embed_tokens.weight",
+        f"model.layers.{DEEPSEEK_MTP_LAYER}.embed_tokens.weight",
+    ],
+)
+def test_deepseek_mtp_checkpoint_embedding_ownership(
+    monkeypatch, deepseek_variant, key
+):
+    """A draft checkpoint without embed_tokens borrows the target's under PP
+    instead of running on its never-loaded embedding."""
+    module, predictor, cls = DEEPSEEK_DRAFTS[deepseek_variant]
+    mtp = importlib.import_module(module)
+    inner = _inner(_embed())
+    inner.layers = nn.ModuleDict()
+    inner.mtp_start_layer_idx = DEEPSEEK_MTP_LAYER
+    inner.num_mtp_layers = 0
+    monkeypatch.setattr(mtp, predictor, lambda **_: inner)
+    monkeypatch.setattr(
+        mtp, "fused_moe_make_expert_params_mapping", lambda *_, **kw: []
+    )
+    monkeypatch.setattr(mtp, "get_pp_group", _fake_pp(2), raising=False)
+    monkeypatch.setattr(eagle_utils, "get_pp_group", _fake_pp(2))
+    draft = getattr(mtp, cls)(vllm_config=_deepseek_config())
+
+    draft.load_weights([] if key is None else [(key, torch.ones(VOCAB, HIDDEN))])
+    target = _inner(_embed(fill=2.0))
+    original = draft.model.embed_tokens
+    eagle_utils.maybe_share_target_embed(draft, draft.model, target)
+
+    if key is None:
+        assert draft.model.embed_tokens is target.embed_tokens
+    else:
+        assert draft.model.embed_tokens is original
+        torch.testing.assert_close(original.weight, torch.ones(VOCAB, HIDDEN))
+
+
+@pytest.mark.parametrize(
+    "rank,use_v2,method,expected",
+    [
+        (0, True, "mtp", True),
+        (1, True, "mtp", False),
+        (2, True, "mtp", True),
+        (2, False, "mtp", False),
+        (2, True, None, False),
+    ],
+)
+def test_deepseek_target_allocates_embedding_on_required_stage(
+    monkeypatch, deepseek_variant, rank, use_v2, method, expected
+):
+    module, cls, embed_factory = DEEPSEEK_TARGETS[deepseek_variant]
+    model = importlib.import_module(module)
+    pp = lambda: SimpleNamespace(
+        world_size=3, is_first_rank=rank == 0, is_last_rank=rank == 2
+    )
+    monkeypatch.setattr(model, "get_pp_group", pp)
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pp_group", pp)
+    monkeypatch.setattr(model, embed_factory, lambda *_, **kw: _embed())
+    monkeypatch.setattr(
+        model, "get_sparse_mla_index_group_max_rows", lambda _: 1, raising=False
+    )
+    monkeypatch.setattr(model, "make_layers", lambda *_, **kw: (0, 0, nn.ModuleList()))
+    monkeypatch.setattr(model, "RMSNorm", lambda *_, **kw: nn.Identity())
+    target = getattr(model, cls)(vllm_config=_deepseek_config(use_v2, method))
+    assert isinstance(target.embed_tokens, nn.Embedding) is expected
