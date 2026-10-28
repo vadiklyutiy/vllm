@@ -79,6 +79,18 @@ async def test_logprobs(client: openai.AsyncOpenAI):
 
 
 @pytest.mark.asyncio
+async def test_include_web_search_call(client: openai.AsyncOpenAI):
+    """Include values for items vLLM never produces are accepted, not a 400."""
+    response = await client.responses.create(
+        include=["web_search_call.results", "web_search_call.action.sources"],
+        input="What is 13 * 24?",
+    )
+    print(response)
+    assert response.status == "completed"
+    assert response.output[-1].type == "message"
+
+
+@pytest.mark.asyncio
 async def test_streaming(client: openai.AsyncOpenAI):
     stream = await client.responses.create(
         input="What is 13 * 24?",

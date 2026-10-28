@@ -17,6 +17,7 @@ from openai.types.responses import (
     ResponseCustomToolCallInputDeltaEvent,
     ResponseCustomToolCallInputDoneEvent,
     ResponseFunctionToolCall,
+    ResponseIncludable,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
     ResponseMcpCallArgumentsDoneEvent,
@@ -247,19 +248,7 @@ class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
     background: bool | None = False
-    include: (
-        list[
-            Literal[
-                "code_interpreter_call.outputs",
-                "computer_call_output.output.image_url",
-                "file_search_call.results",
-                "message.input_image.image_url",
-                "message.output_text.logprobs",
-                "reasoning.encrypted_content",
-            ],
-        ]
-        | None
-    ) = None
+    include: list[ResponseIncludable] | None = None
     input: (
         str
         | list[
