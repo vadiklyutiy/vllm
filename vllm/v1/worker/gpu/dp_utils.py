@@ -40,6 +40,9 @@ class DPSyncState:
     # Whether every rank's scheduler found that none of its requests can use this
     # step's drafts, so all ranks skip drafting together.
     skip_drafts: bool = False
+    # Agreed query-length bound for varlen decode graphs. None if any rank
+    # passed None.
+    max_query_len: int | None = None
 
 
 def sync_cudagraph_and_dp_padding(
@@ -205,6 +208,7 @@ def sync_cudagraph_and_dp_padding(
         eager=False,
         num_reqs=int(num_reqs_across_dp.max()),
         skip_drafts=skip_drafts,
+        max_query_len=synced_max_query_len,
     )
 
 
@@ -243,7 +247,8 @@ def dispatch_cg_and_sync_dp(
         dp_rank: This rank's index in the DP group.
         max_query_len: Upper bound on per-request query length, for selecting
             varlen decode graphs. None, as for a batch with a prefill, keeps
-            the batch out of graphs that constrain it.
+            the batch out of graphs that constrain it. `dp_sync_state.max_query_len`
+            takes its place when a sync is reused.
         need_eager: Force `CUDAGraphMode.NONE` instead of dispatching.
         num_active_loras: Active LoRA count for this rank. Does not need
             cross-rank agreement; it never changes a bucket's token count.
@@ -286,7 +291,9 @@ def dispatch_cg_and_sync_dp(
             num_tokens,
             dp_sync_state.uniform_token_count if dp_sync_state else uniform_token_count,
             num_active_loras=num_active_loras,
-            max_query_len=max_query_len,
+            max_query_len=(
+                dp_sync_state.max_query_len if dp_sync_state else max_query_len
+            ),
         )
 
     if dp_size == 1:

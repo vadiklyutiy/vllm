@@ -19,16 +19,19 @@ from vllm.config import (
 from vllm.distributed.device_communicators import pynccl_allocator
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+from vllm.v1.worker.gpu import dp_utils as gpu_dp_utils
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
     cudagraph_utils as spec_cudagraph_utils,
 )
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
+from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 pytestmark = pytest.mark.cpu_test
 
@@ -452,6 +455,109 @@ def test_varlen_decode_graph_takes_bounded_decode_batches_only(monkeypatch):
     assert desc.max_query_len == _DECODE_QUERY_LEN
     assert dispatch(None).cg_mode == CUDAGraphMode.PIECEWISE
     assert dispatch(_DECODE_QUERY_LEN + 1).cg_mode == CUDAGraphMode.PIECEWISE
+
+
+def _make_draft_prefill_manager(
+    target: gpu_cudagraph_utils.CudaGraphManager, enable_adaptive_verification: bool
+) -> gpu_cudagraph_utils.CudaGraphManager:
+    """The draft-prefill manager an Eagle speculator builds next to `target`.
+
+    The real constructor needs a draft model config and allocates device buffers;
+    init_cudagraph_manager reads only the attributes set here.
+    """
+    speculator = object.__new__(EagleSpeculator)
+    speculator.vllm_config = target.vllm_config
+    speculator.device = target.device
+    speculator.num_speculative_steps = _DECODE_QUERY_LEN - 1
+    speculator.enable_adaptive_verification = enable_adaptive_verification
+    speculator.init_cudagraph_manager(target.cudagraph_mode)
+    draft = speculator.prefill_cudagraph_manager
+    assert draft is not None
+    draft._graphs_captured = True
+    return draft
+
+
+@pytest.mark.parametrize("enable_adaptive_verification", [False, True])
+def test_draft_prefill_pads_decode_batch_like_target(
+    monkeypatch, enable_adaptive_verification
+):
+    """Draft prefill replays on the target's attention metadata, which is laid
+    out for the target's padded request count (e.g. FA3 scheduler metadata), so
+    its graph must pad every decode batch the same way. Adaptive verification
+    captures the target's decode graphs as varlen decode."""
+    target = _make_spec_decode_manager(
+        monkeypatch, varlen_decode=enable_adaptive_verification
+    )
+    draft = _make_draft_prefill_manager(target, enable_adaptive_verification)
+
+    for num_reqs in range(1, target.max_num_reqs + 1):
+        # The full draft budget first, then adaptive verification trims down to
+        # one token per request.
+        for num_tokens in range(num_reqs * _DECODE_QUERY_LEN, num_reqs - 1, -1):
+            uniform_token_count = get_uniform_decode_token_count(
+                num_reqs, num_tokens, _DECODE_QUERY_LEN, decode_graph_eligible=True
+            )
+            target_desc = target.dispatch(
+                num_reqs, num_tokens, uniform_token_count, 0, _DECODE_QUERY_LEN
+            )
+            assert target_desc.cg_mode == CUDAGraphMode.FULL or (
+                uniform_token_count is None and not enable_adaptive_verification
+            )
+            draft_desc = draft.dispatch(
+                num_reqs,
+                target_desc.num_tokens,
+                uniform_token_count,
+                0,
+                _DECODE_QUERY_LEN,
+            )
+            assert draft_desc == target_desc, (num_reqs, num_tokens)
+
+
+@pytest.mark.parametrize("other_rank_prefills", [False, True])
+def test_draft_prefill_pads_like_target_across_dp(monkeypatch, other_rank_prefills):
+    """Under DP the target dispatches on the query-length bound agreed across
+    ranks, and the draft prefill reuses that sync, so it must dispatch on the
+    same bound. A prefill on another rank keeps both out of varlen graphs."""
+    target = _make_spec_decode_manager(monkeypatch, varlen_decode=True)
+    draft = _make_draft_prefill_manager(target, enable_adaptive_verification=True)
+
+    # This rank runs 4 full-budget decodes; the other rank runs the same, or one
+    # short prefill.
+    num_reqs = 4
+    num_tokens = num_reqs * _DECODE_QUERY_LEN
+
+    def fake_all_reduce(tensor):
+        tensor[0][1] = 10 if other_rank_prefills else num_tokens
+        tensor[1][1] = (
+            CUDAGraphMode.PIECEWISE if other_rank_prefills else CUDAGraphMode.FULL
+        ).value
+        tensor[2][1] = 0 if other_rank_prefills else _DECODE_QUERY_LEN
+        tensor[3][1] = -1 if other_rank_prefills else _DECODE_QUERY_LEN
+        tensor[5][1] = 1 if other_rank_prefills else num_reqs
+
+    with patch.object(gpu_dp_utils, "get_dp_group") as dp_group:
+        dp_group.return_value.cpu_all_reduce_ = fake_all_reduce
+        target_desc, sync = dispatch_cg_and_sync_dp(
+            target,
+            num_reqs,
+            num_tokens,
+            _DECODE_QUERY_LEN,
+            dp_size=2,
+            dp_rank=0,
+            max_query_len=_DECODE_QUERY_LEN,
+        )
+    # The draft prefill's dispatch as TargetDependentARSpeculator.propose makes it.
+    draft_desc, _ = dispatch_cg_and_sync_dp(
+        draft,
+        num_reqs,
+        target_desc.num_tokens,
+        _DECODE_QUERY_LEN,
+        dp_size=2,
+        dp_rank=0,
+        max_query_len=_DECODE_QUERY_LEN,
+        dp_sync_state=sync,
+    )
+    assert draft_desc == target_desc
 
 
 def test_mixed_batch_at_decode_only_token_count_still_gets_a_graph(monkeypatch):
