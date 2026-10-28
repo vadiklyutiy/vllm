@@ -848,6 +848,10 @@ _patch_cpp_indirect_assert_if_needed()
 #     the standard entries like "torchvision::roi_align", "aten::index_add")
 #   - Forwards add()/__iter__()/__len__()/etc. so other Inductor code paths
 #     that mutate or iterate the set keep working.
+#
+# The fast path passes no layout_constraint to make_fallback, so we also wrap
+# the make_fallback used by GraphLowering to apply the one the implicit path
+# derives from the op's tags (needs_exact_strides for untagged ops).
 
 _VLLM_FALLBACK_NAMESPACE_PREFIXES = ("vllm::", "vllm_aiter::")
 
@@ -884,6 +888,19 @@ class _VllmFallbackAllowList:
         return getattr(self._inner, name)
 
 
+def _make_fallback_with_default_layout(op, layout_constraint=None, **kwargs):
+    from torch._inductor import lowering as _lowering
+    from torch._library.utils import get_layout_constraint_tag
+
+    if layout_constraint is None and op.name().startswith(
+        _VLLM_FALLBACK_NAMESPACE_PREFIXES
+    ):
+        layout_constraint = _lowering.tag_to_layout_constraint(
+            get_layout_constraint_tag(op, with_default=True)
+        )
+    return _lowering.make_fallback(op, layout_constraint, **kwargs)
+
+
 def _patch_inductor_fallback_allow_list() -> None:
     """Wrap torch._inductor.lowering.FALLBACK_ALLOW_LIST so any custom op in
     the ``vllm::`` or ``vllm_aiter::`` namespaces is treated as a member.
@@ -901,15 +918,16 @@ def _patch_inductor_fallback_allow_list() -> None:
 
     _lowering.FALLBACK_ALLOW_LIST = _VllmFallbackAllowList(base)
 
-    # torch/_inductor/graph.py imports the symbol at module load time:
-    #   from torch._inductor.lowering import FALLBACK_ALLOW_LIST
-    # so we also need to overwrite the local binding in the graph module if
+    # torch/_inductor/graph.py imports the symbols at module load time:
+    #   from torch._inductor.lowering import FALLBACK_ALLOW_LIST, make_fallback
+    # so we also need to overwrite the local bindings in the graph module if
     # it has already been imported.
     try:
         from torch._inductor import graph as _graph
 
         if hasattr(_graph, "FALLBACK_ALLOW_LIST"):
             _graph.FALLBACK_ALLOW_LIST = _lowering.FALLBACK_ALLOW_LIST
+            _graph.make_fallback = _make_fallback_with_default_layout
     except ImportError:
         pass
 

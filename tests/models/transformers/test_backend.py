@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel, PreTrainedConfig
 
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import CompilationMode, ModelConfig, VllmConfig
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.transformers.base import Base
 from vllm.model_executor.models.transformers.fusers import AttentionFuser
@@ -143,6 +143,30 @@ def test_hybrid_attention(vllm_runner: type[VllmRunner]) -> None:
         vllm_runner,
         prompts,
         model="hmellor/tiny-random-Gemma2ForCausalLM",
+        kwargs_ref=kwargs_ref,
+        kwargs_test=kwargs_test,
+    )
+
+
+def test_attention_in_inductor_graph(
+    vllm_runner: type[VllmRunner],
+    example_prompts: list[str],
+    use_fresh_inductor_cache,
+) -> None:
+    """Mode 2 keeps the attention ops in the Inductor graph (#62865)."""
+    kwargs_ref = {"model_impl": "transformers", "enforce_eager": True}
+    kwargs_test = {
+        "model_impl": "transformers",
+        "compilation_config": {
+            "mode": CompilationMode.DYNAMO_TRACE_ONCE,
+            "backend": "inductor",
+        },
+    }
+    check_implementation(
+        vllm_runner,
+        vllm_runner,
+        example_prompts,
+        model="Qwen/Qwen3-0.6B",
         kwargs_ref=kwargs_ref,
         kwargs_test=kwargs_test,
     )

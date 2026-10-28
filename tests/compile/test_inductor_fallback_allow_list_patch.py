@@ -13,16 +13,38 @@ The slow path is what made ``torch.compile`` effectively hang on Kimi-K2.6
 TP=8 (deep MoE/TP IR provenance trees). These tests cover both the proxy's
 semantics in isolation and the membership-check fast-path that Inductor's
 ``GraphLowering.call_function`` actually performs, so we can validate the
-optimization without needing a full GPU compile.
+optimization without needing a full GPU compile. One test compiles through
+Inductor to check that the fast path keeps the op's layout constraint.
 """
 
 import time
 
 import pytest
+import torch
 
 from vllm.env_override import (
     _patch_inductor_fallback_allow_list,
     _VllmFallbackAllowList,
+)
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
+
+_layout_probe_strides: list[tuple[int, ...]] = []
+
+
+def _layout_probe(x: torch.Tensor) -> torch.Tensor:
+    _layout_probe_strides.append(x.stride())
+    return x.new_empty(0)
+
+
+def _layout_probe_fake(x: torch.Tensor) -> torch.Tensor:
+    return x.new_empty(0)
+
+
+direct_register_custom_op(
+    op_name="fallback_allow_list_layout_probe",
+    op_func=_layout_probe,
+    fake_impl=_layout_probe_fake,
 )
 
 
@@ -139,6 +161,23 @@ class TestPatchApplication:
         assert "vllm::all_reduce" in allow_list
         assert "vllm::fused_add_rms_norm" in allow_list
         assert "vllm_aiter::fused_add_rms_norm" in allow_list
+
+    def test_untagged_vllm_op_gets_eager_strides(self, use_fresh_inductor_cache):
+        """The fast path keeps the default layout constraint (#62865)."""
+
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            # RoPE-like op on [heads, tokens, dim], then back to
+            # [tokens, heads, dim] through [tokens, heads * dim], as the
+            # Transformers backend and Attention do.
+            y = (x.transpose(0, 1) * 2).transpose(0, 1).reshape(x.shape[0], -1)
+            return torch.ops.vllm.fallback_allow_list_layout_probe(y.view(x.shape))
+
+        x = torch.randn(16, 4, 8, device=current_platform.device_type)
+        _layout_probe_strides.clear()
+        fn(x)
+        torch.compile(fn, backend="inductor", fullgraph=True)(x)
+        eager_strides, compiled_strides = _layout_probe_strides
+        assert compiled_strides == eager_strides
 
 
 class TestInductorFallbackFastPath:
