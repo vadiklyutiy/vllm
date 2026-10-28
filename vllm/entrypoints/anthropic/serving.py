@@ -630,16 +630,24 @@ class AnthropicServingMessages(OpenAIServingChat):
         openai_messages: list[dict[str, Any]],
     ) -> ChatCompletionRequest:
         """Build base ChatCompletionRequest."""
+        # A final assistant message is a prefill: the model continues it.
+        continue_final_message = (
+            bool(openai_messages) and openai_messages[-1]["role"] == "assistant"
+        )
         if isinstance(anthropic_request, AnthropicCountTokensRequest):
             return ChatCompletionRequest(
                 model=anthropic_request.model,
                 messages=openai_messages,
+                add_generation_prompt=not continue_final_message,
+                continue_final_message=continue_final_message,
                 chat_template_kwargs=anthropic_request.chat_template_kwargs,
             )
 
         return ChatCompletionRequest(
             model=anthropic_request.model,
             messages=openai_messages,
+            add_generation_prompt=not continue_final_message,
+            continue_final_message=continue_final_message,
             max_tokens=anthropic_request.max_tokens,
             max_completion_tokens=anthropic_request.max_tokens,
             stop=anthropic_request.stop_sequences,

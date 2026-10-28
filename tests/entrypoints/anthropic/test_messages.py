@@ -195,6 +195,42 @@ async def test_anthropic_structured_output(client: anthropic.AsyncAnthropic):
 
 
 @pytest.mark.asyncio
+async def test_anthropic_assistant_prefill(
+    server: RemoteOpenAIServer, client: anthropic.AsyncAnthropic
+):
+    """A final assistant message is continued, so /v1/messages and count_tokens
+    render the prompt of /v1/chat/completions with continue_final_message."""
+    messages = [
+        {"role": "user", "content": "What is the capital of France?"},
+        {"role": "assistant", "content": "The capital of France is"},
+    ]
+    async with server.get_async_client() as openai_client:
+        expected = await openai_client.chat.completions.create(
+            model="claude-3-7-sonnet-latest",
+            max_tokens=1,
+            messages=messages,
+            extra_body={"continue_final_message": True, "add_generation_prompt": False},
+        )
+    prompt_tokens = expected.usage.prompt_tokens
+
+    resp = await client.messages.create(
+        model="claude-3-7-sonnet-latest", max_tokens=1, messages=messages
+    )
+    usage = resp.usage
+    assert (
+        usage.input_tokens
+        + (usage.cache_read_input_tokens or 0)
+        + (usage.cache_creation_input_tokens or 0)
+        == prompt_tokens
+    )
+
+    count = await client.messages.count_tokens(
+        model="claude-3-7-sonnet-latest", messages=messages
+    )
+    assert count.input_tokens == prompt_tokens
+
+
+@pytest.mark.asyncio
 async def test_anthropic_streaming_cache_usage(client: anthropic.AsyncAnthropic):
     async def get_stream_usage(resp):
         prompt_tokens = None

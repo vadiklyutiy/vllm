@@ -2264,3 +2264,43 @@ class TestWatermarking:
         params = _convert(request).to_sampling_params(16, {})
 
         assert params.watermarking is watermarking
+
+
+@pytest.mark.parametrize(
+    "request_cls,request_kwargs",
+    [
+        pytest.param(AnthropicMessagesRequest, {"max_tokens": 16}, id="messages"),
+        pytest.param(AnthropicCountTokensRequest, {}, id="count_tokens"),
+    ],
+)
+class TestAssistantPrefill:
+    """A final assistant message is continued, as in Anthropic prefill."""
+
+    def test_final_assistant_message_is_continued(self, request_cls, request_kwargs):
+        request = request_cls(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "The capital of France is"},
+            ],
+            **request_kwargs,
+        )
+
+        result = _convert(request)
+
+        assert result.continue_final_message is True
+        assert result.add_generation_prompt is False
+
+    def test_final_user_message_gets_generation_prompt(
+        self, request_cls, request_kwargs
+    ):
+        request = request_cls(
+            model="test-model",
+            messages=[{"role": "user", "content": "What is the capital of France?"}],
+            **request_kwargs,
+        )
+
+        result = _convert(request)
+
+        assert result.continue_final_message is False
+        assert result.add_generation_prompt is True
