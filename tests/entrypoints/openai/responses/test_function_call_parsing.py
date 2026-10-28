@@ -8,6 +8,7 @@ import pytest
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage
 
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.openai.responses.utils import construct_input_messages
 
 
 def test_function_call_dict_converted_to_object():
@@ -375,3 +376,40 @@ def test_assistant_output_style_content_coerced():
     assert item.content[0].annotations == []
     assert item.status == "completed"
     assert item.id.startswith("msg_")
+
+
+def test_assistant_output_style_content_without_type_coerced():
+    """`type` is optional on message items, so an assistant message replayed
+    without it is coerced like one with `type: "message"`."""
+    request_data = {
+        "model": "test-model",
+        "input": [
+            {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "world"}],
+            },
+        ],
+    }
+
+    request = ResponsesRequest(**request_data)
+
+    item = request.input[0]
+    assert isinstance(item, ResponseOutputMessage)
+    assert item.type == "message"
+    assert item.content[0].text == "world"
+    assert item.status == "completed"
+    assert item.id.startswith("msg_")
+
+
+@pytest.mark.parametrize("type_field", [{}, {"type": "message"}])
+def test_assistant_empty_content_stays_easyinput(type_field):
+    """An assistant message with empty list content has nothing to coerce
+    and stays an EasyInputMessageParam, with or without `type`."""
+    request = ResponsesRequest(
+        model="test-model",
+        input=[{**type_field, "role": "assistant", "content": []}],
+    )
+
+    item = request.input[0]
+    assert isinstance(item, dict)
+    assert construct_input_messages(request_input=request.input) == [item]

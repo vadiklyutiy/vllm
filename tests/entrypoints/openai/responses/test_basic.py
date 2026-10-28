@@ -52,6 +52,28 @@ async def test_chat(client: openai.AsyncOpenAI):
 
 
 @pytest.mark.asyncio
+async def test_chat_with_untyped_output_text_assistant(client: openai.AsyncOpenAI):
+    """Assistant history replayed without `type`, as some clients send it."""
+    response = await client.responses.create(
+        input=[
+            {"role": "user", "content": "My name is Alice."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Nice to meet you, Alice."}
+                ],
+            },
+            {"role": "user", "content": "What is my name?"},
+        ],
+        temperature=0.0,
+    )
+    print(response)
+
+    assert response.status == "completed"
+    assert "Alice" in response.output[-1].content[0].text
+
+
+@pytest.mark.asyncio
 async def test_chat_with_input_type(client: openai.AsyncOpenAI):
     response = await client.responses.create(
         input=[

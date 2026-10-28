@@ -709,7 +709,7 @@ class ResponsesRequest(OpenAIBaseModel):
         - function_call -> ResponseFunctionToolCall
         - reasoning     -> ResponseReasoningItem (auto-generates id)
         - message(role=assistant) -> ResponseOutputMessage (auto-generates
-          id/status and annotations)
+          type/id/status and annotations; a missing type means message)
 
         Invalid structures are left for Pydantic to reject.
         """
@@ -735,7 +735,7 @@ class ResponsesRequest(OpenAIBaseModel):
                 processed_input.append(item)
                 continue
 
-            item_type = item.get("type")
+            item_type = item.get("type", "message")
 
             if item_type == "function_call":
                 try:
@@ -761,14 +761,14 @@ class ResponsesRequest(OpenAIBaseModel):
 
             elif item_type == "message" and item.get("role") == "assistant":
                 content = item.get("content")
-                if not isinstance(content, list):
-                    # String content is a valid EasyInputMessageParam,
+                if not isinstance(content, list) or not content:
+                    # String or empty content is a valid EasyInputMessageParam,
                     # do not coerce it to ResponseOutputMessage
                     processed_input.append(item)
                     continue
 
                 original_item = item
-                item = dict(item)
+                item = {**item, "type": "message"}
                 if "id" not in item:
                     item["id"] = f"msg_{random_uuid()}"
                 if "status" not in item:
