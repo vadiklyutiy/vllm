@@ -877,6 +877,10 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     ):
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
+    elif backend == Mxfp4MoeBackend.HUMMING:
+        # Humming quantizes grouped FP8 inputs in whole groups of w2's
+        # unpadded K; block FP8 uses groups of 128.
+        intermediate_size = round_up(intermediate_size, 128)
     elif current_platform.is_rocm():
         from vllm.platforms.rocm import get_cdna_version
 
@@ -915,6 +919,27 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     else:
         intermediate_size = round_up(intermediate_size, 64)
     return hidden_size, intermediate_size
+
+
+def _zero_humming_intermediate_padding(layer: torch.nn.Module) -> None:
+    """Zero intermediate padding; reloads rewrite only the checkpoint slices."""
+    padded = layer.moe_config.intermediate_size_per_partition
+    # gpt-oss loads whole MXFP4 blocks per rank (e.g. 736 rows for 720 at TP=4).
+    loaded = round_up(
+        layer.moe_config.intermediate_size_per_partition_unpadded, OCP_MX_BLOCK_SIZE
+    )
+    if loaded >= padded:
+        return
+    for name in ("w13_weight", "w13_weight_scale", "w13_bias"):
+        w13 = getattr(layer, name, None)
+        if w13 is None:
+            continue
+        if layer.moe_config.activation == MoEActivation.SWIGLUOAI:
+            w13[:, 2 * loaded :].zero_()
+        else:
+            w13.unflatten(1, (-1, padded))[:, :, loaded:].zero_()
+    layer.w2_weight[..., loaded // 2 :].zero_()
+    layer.w2_weight_scale[..., loaded // OCP_MX_BLOCK_SIZE :].zero_()
 
 
 def _interleave_gate_up_rows(t: torch.Tensor) -> torch.Tensor:
@@ -978,6 +1003,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             convert_to_humming_moe_kernel_format,
         )
 
+        _zero_humming_intermediate_padding(layer)
         convert_to_humming_moe_kernel_format(
             layer,
             quant_config={"quant_method": "gpt_oss_mxfp4"},
@@ -1627,6 +1653,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             convert_to_humming_moe_kernel_format,
         )
 
+        _zero_humming_intermediate_padding(layer)
         convert_to_humming_moe_kernel_format(
             layer,
             quant_config={"quant_method": "mxfp4"},

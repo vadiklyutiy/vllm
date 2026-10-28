@@ -2123,6 +2123,106 @@ def test_mxfp4_emulation_rounds_up_to_block_size(
     assert rounded_intermediate % OCP_MX_BLOCK_SIZE == 0
 
 
+@pytest.mark.parametrize(
+    "intermediate_size,expected_intermediate",
+    [
+        (576, 640),  # DeepSeek-V4.1 TP=4 shard
+        (288, 384),  # DeepSeek-V4.1 TP=8 shard
+    ],
+)
+def test_mxfp4_humming_rounds_intermediate_to_block_fp8_group(
+    intermediate_size: int, expected_intermediate: int
+):
+    """Humming quantizes block-FP8 inputs in whole 128-element groups of w2's
+    unpadded K, so the intermediate size must be a multiple of 128."""
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        mxfp4_round_up_hidden_size_and_intermediate_size,
+    )
+
+    assert mxfp4_round_up_hidden_size_and_intermediate_size(
+        Mxfp4MoeBackend.HUMMING, 5120, intermediate_size
+    ) == (5120, expected_intermediate)
+
+
+@pytest.mark.parametrize(
+    "gpt_oss,activation,unpadded,padded,loaded",
+    [
+        (False, "SILU", 576, 640, 576),  # DeepSeek-V4.1 TP=4 shard
+        (True, "SWIGLUOAI", 2880, 2944, 2880),  # gpt-oss TP=1
+        (True, "SWIGLUOAI", 720, 768, 736),  # gpt-oss TP=4: whole-block shards
+        (True, "SILU", 192, 256, 192),  # Quark: split layout, gpt-oss converter
+    ],
+)
+def test_mxfp4_humming_zeroes_intermediate_padding(
+    monkeypatch: pytest.MonkeyPatch,
+    gpt_oss: bool,
+    activation: str,
+    unpadded: int,
+    padded: int,
+    loaded: int,
+):
+    """A reload writes only the checkpoint slices, so the Humming conversion
+    must zero the intermediate padding the size table adds."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.oracle import mxfp4 as oracle
+    from vllm.model_executor.layers.quantization.utils import humming
+
+    interleaved = MoEActivation[activation] == MoEActivation.SWIGLUOAI
+    num_experts, hidden_size = 2, 64
+    shapes = {
+        "w13_weight": (num_experts, 2 * padded, hidden_size // 2),
+        "w13_weight_scale": (num_experts, 2 * padded, hidden_size // 32),
+        "w13_bias": (num_experts, 2 * padded),
+        "w2_weight": (num_experts, hidden_size, padded // 2),
+        "w2_weight_scale": (num_experts, hidden_size, padded // 32),
+    }
+    layer = torch.nn.Module()
+    layer.moe_config = replace(
+        make_dummy_moe_config(
+            intermediate_size=padded, activation=MoEActivation[activation]
+        ),
+        intermediate_size_per_partition_unpadded=unpadded,
+    )
+    for name, shape in shapes.items():
+        dtype = torch.bfloat16 if name == "w13_bias" else torch.uint8
+        stale = torch.full(shape, 0xFF, dtype=dtype)
+        layer.register_parameter(name, torch.nn.Parameter(stale, requires_grad=False))
+
+    seen: dict[str, torch.Tensor] = {}
+    monkeypatch.setattr(oracle, "_humming_input_schema", lambda _: None)
+    monkeypatch.setattr(
+        humming,
+        "convert_to_humming_moe_kernel_format",
+        lambda layer, **_: seen.update(
+            {name: getattr(layer, name).clone() for name in shapes}
+        ),
+    )
+    convert = (
+        oracle.convert_gpt_oss_weight_to_mxfp4_moe_kernel_format
+        if gpt_oss
+        else oracle.convert_weight_to_mxfp4_moe_kernel_format
+    )
+    convert(
+        oracle.Mxfp4MoeBackend.HUMMING,
+        layer,
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale,
+        layer.w2_weight_scale,
+        layer.w13_bias,
+    )
+
+    rows = torch.arange(2 * padded)
+    pad_rows = rows >= 2 * loaded if interleaved else rows % padded >= loaded
+    for name in ("w13_weight", "w13_weight_scale", "w13_bias"):
+        assert torch.all(seen[name][:, pad_rows] == 0)
+        assert torch.all(seen[name][:, ~pad_rows] == 0xFF)
+    for name, block in (("w2_weight", 2), ("w2_weight_scale", 32)):
+        assert torch.all(seen[name][..., loaded // block :] == 0)
+        assert torch.all(seen[name][..., : loaded // block] == 0xFF)
+
+
 def test_select_mxfp4_moe_backend_raises_with_unsupported_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ):
