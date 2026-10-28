@@ -86,7 +86,7 @@ print(response["choices"][0]["token_ids"])
 
 ### Derender
 
-`derender` returns the assistant `message` a coupled `/v1/chat/completions` would, without a separate [derender](derenderer.md) call. `/v1/chat/completions/render` and `/v1/messages/render` return `parse_context` on the `GenerateRequest`. Send it back with `output_mode: "derender"`. It carries the tools, `tool_choice`, `include_reasoning`, resolved JSON only `chat_template_kwargs` and the history tool call count. A `parse_context` field this server doesn't know fails a `derender` request and is ignored at the other levels.
+`derender` returns the assistant `message` a coupled `/v1/chat/completions` would, without a separate [derender](derenderer.md) call. `/v1/chat/completions/render` and `/v1/messages/render` return `parse_context` on the `GenerateRequest`. Send it back with `output_mode: "derender"`. It carries the tools, `tool_choice`, `include_reasoning`, resolved JSON only `chat_template_kwargs`, the history tool call count and `return_tokens_as_token_ids`. A `parse_context` field this server doesn't know fails a `derender` request and is ignored at the other levels, so upgrade generate servers before render servers.
 
 - The parser reads the engine's `text`, so it sees the stop string cut and the post `adjust_request` decode flags. That makes it match coupled chat for parsers whose `adjust_request` changes decoding which `/derender` can't.
 - A server with a tool or reasoning parser needs `parse_context`. Without a parser, `message.content` is the plain text.
@@ -98,7 +98,7 @@ print(response["choices"][0]["token_ids"])
 
 ### Logprobs
 
-With `output_mode: "tokens"`, logprobs are `GenerateLogProbs` with an integer `token_id` and `rank` per entry and no `token` or `bytes` (see [Generate Output Logprobs](renderer.md#generate-output-logprobs)). With `output_mode: "text"`, they are `ChatCompletionLogProbs` carrying the decoded token strings and their UTF-8 `bytes` for the sampled token and every entry in `top_logprobs`; a server started with `--return-tokens-as-token-ids` returns `token_id:N` placeholders there instead, as `/v1/completions` does.
+With `output_mode: "tokens"`, logprobs are `GenerateLogProbs` with an integer `token_id` and `rank` per entry and no `token` or `bytes` (see [Generate Output Logprobs](renderer.md#generate-output-logprobs)). With `output_mode: "text"`, they are `ChatCompletionLogProbs` carrying the decoded token strings and their UTF-8 `bytes` for the sampled token and every entry in `top_logprobs`; a server started with `--return-tokens-as-token-ids` returns `token_id:N` placeholders there instead, as `/v1/completions` does. With `output_mode: "derender"`, the shape is the same, and `return_tokens_as_token_ids` from `parse_context` decides whether the tokens are placeholders. When it is unset, the server flag decides, as on `/v1/chat/completions`.
 
 ### Errors
 

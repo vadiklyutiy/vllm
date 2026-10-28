@@ -844,6 +844,60 @@ async def test_derender_mode_with_parser_matches_chat_completions(client, messag
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     envs.VLLM_USE_RUST_FRONTEND,
+    reason="output_mode is not supported by the Rust frontend",
+)
+@pytest.mark.parametrize("return_tokens_as_token_ids", [True, False, None])
+async def test_derender_logprob_tokens_match_chat_completions(
+    client, messages, return_tokens_as_token_ids
+):
+    """Both derender paths write logprob tokens as coupled chat does for the
+    request's `return_tokens_as_token_ids` (#63162)."""
+    chat = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "logprobs": True,
+        "top_logprobs": 2,
+        "return_tokens_as_token_ids": return_tokens_as_token_ids,
+    }
+    render = await client.post("/v1/chat/completions/render", json=chat)
+    render.raise_for_status()
+    generate_request = render.json()
+
+    derender_level = await client.post(
+        GEN_ENDPOINT, json={**generate_request, "output_mode": "derender"}
+    )
+    derender_level.raise_for_status()
+    tokens = await client.post(GEN_ENDPOINT, json=generate_request)
+    tokens.raise_for_status()
+    derendered = await client.post(
+        "/v1/chat/completions/derender",
+        json={
+            "generate_response": tokens.json(),
+            "chat_request": chat,
+            "prompt_token_ids": generate_request["token_ids"],
+        },
+    )
+    derendered.raise_for_status()
+    coupled = await client.post("/v1/chat/completions", json=chat)
+    coupled.raise_for_status()
+
+    def logprob_tokens(response: httpx.Response) -> list[list[str]]:
+        return [
+            [entry["token"], *(top["token"] for top in entry["top_logprobs"])]
+            for entry in response.json()["choices"][0]["logprobs"]["content"]
+        ]
+
+    expected = logprob_tokens(coupled)
+    assert expected[0][0].startswith("token_id:") == bool(return_tokens_as_token_ids)
+    assert logprob_tokens(derender_level) == expected
+    assert logprob_tokens(derendered) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    envs.VLLM_USE_RUST_FRONTEND,
     reason="--tokens-only is not supported by the Rust frontend",
 )
 @pytest.mark.parametrize("server", [["--tokens-only"]], indirect=True)

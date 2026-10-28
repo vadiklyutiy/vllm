@@ -432,7 +432,12 @@ class ServingTokens(GenerateBaseServing):
         sampling_params: SamplingParams = request.sampling_params
         derender_mode = request.output_mode == "derender"
         text_mode = request.output_mode == "text" or derender_mode
-        tokenizer = self._logprobs_tokenizer(text_mode)
+        tokenizer = self._logprobs_tokenizer(
+            text_mode,
+            request.parse_context.return_tokens_as_token_ids
+            if derender_mode and request.parse_context is not None
+            else None,
+        )
         # The derender level returns chat logprobs, so it honors
         # logprob_token_ids and applies the chat top_logprobs cut.
         if derender_mode:
@@ -819,13 +824,18 @@ class ServingTokens(GenerateBaseServing):
             yield f"data: {data}\n\n"
         yield "data: [DONE]\n\n"
 
-    def _logprobs_tokenizer(self, text_mode: bool) -> TokenizerLike | None:
+    def _logprobs_tokenizer(
+        self, text_mode: bool, return_as_token_id: bool | None = None
+    ) -> TokenizerLike | None:
         """Tokenizer that resolves logprob tokens, or None for placeholders.
 
-        ``--return-tokens-as-token-ids`` keeps placeholders at every level, as
-        it does on ``/v1/completions``.
+        ``return_as_token_id`` is the request's ``return_tokens_as_token_ids``.
+        When it is None, ``--return-tokens-as-token-ids`` decides, as on
+        ``/v1/chat/completions`` and ``/v1/completions``.
         """
-        if not text_mode or self.return_tokens_as_token_ids:
+        if return_as_token_id is None:
+            return_as_token_id = self.return_tokens_as_token_ids
+        if not text_mode or return_as_token_id:
             return None
         return self.renderer.tokenizer
 
@@ -839,7 +849,7 @@ class ServingTokens(GenerateBaseServing):
         """Create OpenAI style logprobs for the `text` and `derender` levels.
 
         With a `tokenizer` the tokens are decoded strings and carry `bytes`.
-        Without one (`--return-tokens-as-token-ids`) they are `token_id:N`
+        Without one (`return_tokens_as_token_ids`) they are `token_id:N`
         placeholders. `top_logprobs` keeps the first `top_limit` candidates
         the engine returned (the sampled token first, then the top k) or all
         of them when `top_limit` is None, as in tokens mode.

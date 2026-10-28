@@ -1648,6 +1648,20 @@ class TestDerenderChatStreamParsed:
         assert len(content[0].top_logprobs) == expected_candidates
 
     @pytest.mark.asyncio
+    async def test_logprobs_follow_return_tokens_as_token_ids(self, parsed_derenderer):
+        """The parsed path writes `token_id:N` placeholders when the request
+        asks for them, like the plain path does (#63162)."""
+        ids = [_FakeParser.CONTENT]
+        chunk, _ = await parsed_derenderer.derender_chat_stream(
+            model=MODEL_NAME,
+            generate_chunk=_make_stream_chunk(ids, logprobs=_generate_logprobs(ids)),
+            chat_request=_chat_request(logprobs=True, return_tokens_as_token_ids=True),
+            prompt_token_ids=[1, 2],
+        )
+        content = chunk.choices[0].logprobs.content
+        assert [entry.token for entry in content] == [f"token_id:{ids[0]}"]
+
+    @pytest.mark.asyncio
     async def test_logprobs_kept_when_parser_swallows_chunk(
         self, parsed_derenderer, tokenizer
     ):

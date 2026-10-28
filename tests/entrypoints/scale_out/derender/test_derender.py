@@ -38,6 +38,14 @@ async def client(server):
 
 
 @pytest.fixture(scope="module")
+def token_ids_server():
+    with RemoteLaunchRenderServer(
+        MODEL_NAME, ["--return-tokens-as-token-ids"]
+    ) as remote_server:
+        yield remote_server
+
+
+@pytest.fixture(scope="module")
 def tokenizer():
     return get_tokenizer(MODEL_NAME)
 
@@ -735,6 +743,72 @@ async def test_derender_completion_logprobs(client):
     assert isinstance(logprobs["token_logprobs"][0], float)
     assert len(logprobs["text_offset"]) == 1
     assert logprobs["text_offset"][0] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["chat", "completion"])
+@pytest.mark.parametrize(
+    ("server_flag", "request_value"),
+    [(False, True), (False, None), (True, None), (True, False)],
+)
+async def test_derender_logprobs_follow_return_tokens_as_token_ids(
+    server, token_ids_server, tokenizer, endpoint, stream, server_flag, request_value
+):
+    """As on the coupled endpoints, the request's `return_tokens_as_token_ids`
+    wins and the server's `--return-tokens-as-token-ids` decides when it is
+    unset (#63162)."""
+    remote = token_ids_server if server_flag else server
+    token_id = tokenizer.encode("Hello", add_special_tokens=False)[0]
+    logprobs = _make_generate_logprobs(token_id)
+    if endpoint == "chat":
+        path = "/v1/chat/completions/derender"
+        generate_response = _make_generate_response([token_id], logprobs=logprobs)
+        body: dict = {
+            "chat_request": {
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "logprobs": True,
+                "top_logprobs": 1,
+                "return_tokens_as_token_ids": request_value,
+            },
+            "generate_response": generate_response,
+        }
+    else:
+        path = "/v1/completions/derender"
+        generate_response = _make_completion_generate_response(
+            [token_id], "cmpl-test-id", logprobs=logprobs
+        )
+        body = {
+            "completion_request": {
+                "model": MODEL_NAME,
+                "prompt": "Hello",
+                "logprobs": 1,
+                "return_tokens_as_token_ids": request_value,
+            },
+            "generate_responses": [generate_response],
+        }
+    if stream:
+        body.pop("generate_response", None)
+        body.pop("generate_responses", None)
+        body.update(stream=True, generate_chunk=generate_response)
+
+    async with httpx.AsyncClient(base_url=remote.url_for(""), timeout=30.0) as client:
+        response = await client.post(path, json={"model": MODEL_NAME, **body})
+
+    assert response.status_code == 200
+    data = response.json()
+    resolved = (data["chunk"] if stream else data)["choices"][0]["logprobs"]
+    if endpoint == "chat":
+        entry = resolved["content"][0]
+        tokens = [entry["token"], *(top["token"] for top in entry["top_logprobs"])]
+    else:
+        tokens = [resolved["tokens"][0], *resolved["top_logprobs"][0]]
+    if request_value if request_value is not None else server_flag:
+        assert tokens == [f"token_id:{token_id}", f"token_id:{token_id + 1}"]
+    else:
+        assert len(tokens) == 2
+        assert not any(token.startswith("token_id:") for token in tokens)
 
 
 @pytest.mark.asyncio

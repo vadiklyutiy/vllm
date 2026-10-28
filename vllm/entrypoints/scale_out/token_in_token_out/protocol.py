@@ -70,6 +70,9 @@ class ParseContext(BaseModel):
     without the API server only entries a handler keeps out of the engine."""
     history_tool_call_cnt: int = Field(default=0, ge=0)
     """Tool calls already in the rendered conversation, for sequential IDs."""
+    return_tokens_as_token_ids: bool | None = None
+    """The chat request's `return_tokens_as_token_ids`. None falls back to the
+    generate server's `--return-tokens-as-token-ids`."""
 
     def to_chat_request(self) -> ChatCompletionRequest:
         """Build the message less chat request the parser reads.
