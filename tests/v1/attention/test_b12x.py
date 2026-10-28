@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.models.utils import check_logprobs_close
 from tests.v1.attention.test_attention_backends import (
     BATCH_SPECS,
     _test_backend_correctness,
@@ -359,4 +360,38 @@ def test_b12x_speculative_verification_uses_cuda_graph_plan(
         use_cuda_graph=True,
         max_num_seqs=batch_spec.batch_size,
         max_num_batched_tokens=max(sum(batch_spec.query_lens), 64),
+    )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_b12x_engine_startup_warms_up_paged_prefill(
+    vllm_runner,
+    example_prompts: list[str],
+    kv_cache_dtype: str,
+) -> None:
+    """Engine startup runs the b12x CuTeDSL prefill warmup, then serves
+    the same greedy tokens as the default attention backend."""
+    _require_b12x_paged_attention()
+    model = "Qwen/Qwen3-0.6B"
+    max_tokens = 16
+    num_logprobs = 5
+    runner_kwargs = dict(
+        block_size=128,
+        kv_cache_dtype=kv_cache_dtype,
+        max_num_seqs=4,
+        enforce_eager=True,
+    )
+
+    with vllm_runner(model, **runner_kwargs) as llm:
+        expected = llm.generate_greedy_logprobs(
+            example_prompts, max_tokens, num_logprobs
+        )
+    with vllm_runner(model, attention_backend="b12x", **runner_kwargs) as llm:
+        actual = llm.generate_greedy_logprobs(example_prompts, max_tokens, num_logprobs)
+
+    check_logprobs_close(
+        outputs_0_lst=expected,
+        outputs_1_lst=actual,
+        name_0="default",
+        name_1="b12x",
     )

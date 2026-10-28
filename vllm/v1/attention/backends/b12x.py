@@ -415,7 +415,6 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
         max_model_len = int(model_config.max_model_len)
-        self._max_num_seqs = max_num_seqs
         max_page_table_widths = {
             page_size: _max_page_table_width(
                 max_model_len,
@@ -734,24 +733,20 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         )
 
     def _compile_paged_extend_entry(self, page_size: int) -> None:
-        """Compile fixed-capacity paged-prefill entries without a live plan."""
-        warmup_plans: list[tuple[int, int, Any, bool]] = []
-        for batch_size in range(1, self._max_num_seqs + 1):
-            candidates = sorted(
-                (q_capacity, plan)
-                for (plan_page_size, plan_batch, q_capacity), plan in (
-                    self._extend_plans.items()
-                )
-                if plan_page_size == page_size and plan_batch == batch_size
+        """Warm fixed-capacity paged-prefill entries by running each plan once."""
+        warmup_plans = [
+            (batch_size, q_capacity, plan)
+            for (plan_page_size, batch_size, q_capacity), plan in (
+                self._extend_plans.items()
             )
-            for index, (q_capacity, plan) in enumerate(candidates):
-                warmup_plans.append((batch_size, q_capacity, plan, index == 0))
+            if plan_page_size == page_size
+        ]
         if not warmup_plans:
             return
 
         max_q_rows = max(
             min(q_capacity, max(64, batch_size + 1))
-            for batch_size, q_capacity, _, _ in warmup_plans
+            for batch_size, q_capacity, _ in warmup_plans
         )
         q = torch.zeros(
             (max_q_rows, self.num_heads, self.head_size),
@@ -772,7 +767,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         (scratch_storage,) = current_workspace_manager().get_simultaneous(
             ((self._scratch_nbytes,), torch.uint8),
         )
-        for batch_size, q_capacity, plan, execute in warmup_plans:
+        for batch_size, q_capacity, plan in warmup_plans:
             q_rows = min(q_capacity, max(64, batch_size + 1))
             page_table = torch.zeros(
                 (batch_size, plan.caps.max_page_table_width),
@@ -812,12 +807,9 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                 k_descale=k_descale,
                 v_descale=v_descale,
             )
-            self._paged_attention.compile(binding=binding)
-            if execute:
-                # Compile-only warmup does not launch the device-side compact
-                # scheduler. One execution per batch covers the capture-static
-                # metadata variant shared by its Q-capacity plans.
-                self._paged_attention.run(binding=binding)
+            # b12x 1.5.1 compile() accepts only FakeTensor bindings, and
+            # plan.bind() returns real ones.
+            self._paged_attention.run(binding=binding)
 
     def get_cutedsl_warmup_compile_units(self) -> tuple[CuTeDSLCompileUnit, ...]:
         common_key = (
