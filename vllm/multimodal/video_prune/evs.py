@@ -151,6 +151,31 @@ def compute_mrope_for_media(
     return positions
 
 
+def _find_first_frame_vision_start(
+    media_indices: torch.Tensor,
+    vision_start_token: torch.Tensor,
+    mm_pos: torch.Tensor,
+    num_timestamp_tokens: int,
+) -> torch.Tensor:
+    """Find the first frame's VISION_START of a Qwen3 VL video that starts at
+    or after `vision_start_token`.
+
+    The prompt may keep an outer VISION_START before the first frame's
+    timestamp tokens, so the video is located from its first video token after
+    `vision_start_token`, at the offset `mm_pos` gives. The prompt keeps all
+    retained video tokens in the first frame, but pruning may leave the first
+    frame of `mm_pos` empty. Then that offset points before
+    `vision_start_token`, and the first frame's VISION_START is the token right
+    before the first video token.
+    """
+    first_video_token = media_indices[media_indices > vision_start_token][0]
+    first_video = mm_pos[4, :].nonzero(as_tuple=True)[0][0]
+    first_frame_vision_start = first_video_token - (first_video - num_timestamp_tokens)
+    if first_frame_vision_start < vision_start_token:
+        return first_video_token - 1
+    return first_frame_vision_start
+
+
 def recompute_mrope_positions(
     input_ids: torch.LongTensor,
     multimodal_positions: list[torch.Tensor],
@@ -233,6 +258,7 @@ def recompute_mrope_positions(
     vision_start_indices = (input_ids == vision_start_token_id).nonzero(as_tuple=True)[
         0
     ]
+    media_indices = media_mask.nonzero(as_tuple=True)[0]
 
     for mm_pos in multimodal_positions:
         # Each mm_pos can be a complete embedding for single media
@@ -315,6 +341,9 @@ def recompute_mrope_positions(
         # the sequence actually begins (before timestamp tokens).
         adjusted_for_timestamps = False
         if mm_pos.shape[0] == 5 and mm_embeddings_seen == 0 and has_video_tokens:
+            global_mm_start = _find_first_frame_vision_start(
+                media_indices, global_mm_start, mm_pos, num_timestamp_tokens
+            )
             # NOTE: -1 is because there is a vision start token right after
             # timestamp tokens before any video embeddings appear.
 
