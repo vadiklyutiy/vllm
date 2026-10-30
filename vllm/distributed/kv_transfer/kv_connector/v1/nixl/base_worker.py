@@ -80,7 +80,7 @@ from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
-from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.utils.torch_utils import async_tensor_h2d, is_non_overlapping_and_dense
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CircularBufferSpec,
@@ -1040,6 +1040,9 @@ class NixlBaseConnectorWorker:
         # Page length of the PLE short-conv state; its region may be shared with
         # pages of a different (smaller) size, so it cannot use the region's.
         self._ple_block_len: int | None = None
+        # Set when a cache row holds several physical blocks, which are then byte
+        # pieces of the row rather than the kernel's blocks.
+        self._has_byte_split_pages = False
 
         # Enable different block lengths for different layers *only* when MLA is used.
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
@@ -1577,6 +1580,7 @@ class NixlBaseConnectorWorker:
         region_groups: list[set[int]] = []
         self._ple_block_len = None
         self._ple_region_index = None
+        self._has_byte_split_pages = False
 
         # A shared packed row may transfer whole only if every page in it is
         # replicated across TP ranks: MLA without SSM state. Head-sharded
@@ -1695,6 +1699,17 @@ class NixlBaseConnectorWorker:
                     block_stride = physical_page_size
                 else:
                     block_stride = cache.stride(0) * cache.element_size()
+                    if (
+                        cache[0].nbytes > physical_page_size
+                        and is_non_overlapping_and_dense(cache[0])
+                        and cache[0].nbytes == block_stride
+                    ):
+                        # A group whose kernel block is larger than the physical
+                        # block (e.g. Gemma 4 sliding window) keeps several
+                        # physical blocks in each dense row. Regions are shared by
+                        # all groups, so step through the row in those blocks.
+                        block_stride = physical_page_size
+                        self._has_byte_split_pages = True
                 # A connector that registers the backing as one memory region
                 # may need its length rounded up to a page boundary. Such a tail
                 # is shorter than one block, so it cannot make the storage
@@ -1832,6 +1847,14 @@ class NixlBaseConnectorWorker:
                     f"{[backend.get_name() for backend in self.attn_backends]}, "
                     f"kv_cache_layout={self.kv_cache_layout}"
                 )
+
+        if self._has_byte_split_pages and self.use_host_buffer:
+            # Host copies index each layer's rows with the physical block ids.
+            raise NotImplementedError(
+                "NIXL host buffers do not support KV cache pages the attention "
+                "kernel splits less finely than the connector's physical blocks "
+                "(e.g. Gemma 4 sliding window). Use a device kv_buffer_device."
+            )
 
         logger.debug(
             "Different block lengths collected: %s", set(self.block_len_per_layer)
@@ -2807,6 +2830,22 @@ class NixlBaseConnectorWorker:
                 f"Local: {self._physical_blocks_per_logical_kv_block}, "
                 f"Remote: {remote_physical_per_logical}. "
                 "Disable prefix caching with --disable-prefix-caching."
+            )
+        # Byte pieces of a page hold only some of its heads (or tokens), so they
+        # can't be head-sliced, regrouped or indexed as rows of the local cache.
+        if self._has_byte_split_pages and (
+            block_size_ratio != 1
+            or remote_physical_per_logical != self._physical_blocks_per_logical_kv_block
+            or (
+                abs(tp_ratio) != 1
+                and not self.transfer_topo.replicates_kv_cache(remote_engine_id)
+            )
+        ):
+            raise NotImplementedError(
+                "NIXL transfers of KV cache pages the attention kernel splits less "
+                "finely than the connector's physical blocks (e.g. Gemma 4 sliding "
+                "window) need the same TP size, block size and kernel block size "
+                "on prefill and decode."
             )
 
         if block_size_ratio != 1:

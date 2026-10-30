@@ -98,6 +98,8 @@ By default, a **compatibility hash** is checked during handshake. P and D instan
   resulting KV block layout is validated at handshake time rather than via the
   compatibility hash)
 
+Exception: when the attention kernel splits the KV cache pages of only some cache groups (e.g. Gemma 4 with an FP8 KV cache on Hopper), P and D must use the same `tensor-parallel-size` (unless the KV cache is replicated across TP ranks), `block-size` and attention kernel block size, and `kv_buffer_device` must not be `cpu`. Otherwise the connector raises `NotImplementedError`.
+
 ### KV cache layout
 
 - NixlConnector defaults to **`LBHNC`** (head-major, formerly `HND`) layout for optimal transfer performance (non-MLA models).

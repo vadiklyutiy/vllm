@@ -575,6 +575,183 @@ def test_registration_ignores_a_sub_block_padding_tail(page_covers_view):
     assert _descriptor_geometry(padded) == _descriptor_geometry(unpadded)
 
 
+def _make_unsplit_swa_hma_worker(
+    engine_id,
+    layout="LBHNC",
+    tp_size=1,
+    block_size=4,
+    kernel_block_size=4,
+    kv_buffer_device="cuda",
+):
+    """Register Gemma 4-like HMA caches made by the real planner and allocator.
+
+    The sliding window pages hold half the tokens of the full attention pages
+    they alias, so a kernel block of ``block_size`` tokens splits only the full
+    attention pages.
+    """
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+    from vllm.v1.worker.utils import allocate_kv_cache, select_common_block_size
+
+    swa = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=4 // tp_size,
+        head_size=8,
+        dtype=torch.float16,
+        sliding_window=8,
+    )
+    full = FullAttentionSpec(
+        block_size=2 * block_size,
+        num_kv_heads=2 // tp_size,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    num_layers = 3
+    groups = [
+        KVCacheGroupSpec([f"{kind}.{i}" for i in range(num_layers)], spec)
+        for kind, spec in (("swa", swa), ("full", full))
+    ]
+    vllm_config = create_vllm_config(block_size=block_size)
+    vllm_config.cache_config.kv_cache_layout = layout
+    vllm_config.kv_transfer_config.kv_buffer_device = kv_buffer_device
+    kv_cache_config = get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=4 * num_layers * swa.page_size_bytes
+    )
+    backend = MagicMock()
+    backend.get_supported_kernel_block_sizes.return_value = [kernel_block_size]
+    backend.get_name.return_value = "FLASH_ATTN"
+    backend.full_cls_name.return_value = "fake.FLASH_ATTN"
+    kernel_block_sizes = [
+        select_common_block_size(
+            g.kv_cache_spec.block_size, [backend], [g.kv_cache_spec]
+        )
+        for g in groups
+    ]
+    caches = allocate_kv_cache(
+        kv_cache_config, torch.device("cpu"), KVCacheLayout[layout], kernel_block_sizes
+    )
+    fake_platform = MagicMock()
+    fake_platform.device_type = "cuda"
+    fake_platform.get_nixl_memory_type.return_value = None
+    with (
+        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=tp_size),
+        patch.object(bw, "get_current_attn_backends", return_value=[backend]),
+        patch.object(bw, "current_platform", fake_platform),
+        set_current_vllm_config(vllm_config),
+    ):
+        worker = NixlConnectorWorker(vllm_config, engine_id, kv_cache_config)
+        worker.register_kv_caches(caches)
+    return worker, caches
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
+def test_unsplit_sliding_window_pages_transfer_whole(layout):
+    """Gemma 4: each group's pages land whole in the matching decode pages,
+    though only the full attention pages are split into kernel blocks."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    producer, p_caches = _make_unsplit_swa_hma_worker("producer", layout)
+    consumer, d_caches = _make_unsplit_swa_hma_worker("consumer", layout)
+    metadata = msgspec.msgpack.decode(
+        producer.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    _register_remote_agents(consumer, metadata, 1)
+
+    def storage(caches):
+        cache = next(iter(caches.values()))
+        return torch.empty(0, dtype=torch.uint8).set_(cache.untyped_storage())
+
+    p_raw, d_raw = storage(p_caches), storage(d_caches)
+    generator = torch.Generator().manual_seed(0)
+    p_raw.copy_(
+        torch.randint(0, 256, p_raw.shape, dtype=torch.uint8, generator=generator)
+    )
+    # (decode, prefill) logical block of each group: sliding window, full.
+    blocks = {"swa": (1, 3), "full": (2, 0)}
+    request = NixlConnectorMetadata()
+    request.add_new_req_to_recv(
+        request_id="req",
+        local_block_ids=tuple([d] for d, _ in blocks.values()),
+        kv_transfer_params={
+            "remote_block_ids": [[p] for _, p in blocks.values()],
+            "remote_engine_id": "producer",
+            "remote_request_id": "prefill-req",
+            "remote_host": "remote-host",
+            "remote_port": 1234,
+            "tp_size": 1,
+        },
+    )
+    consumer.start_load_kv(request)
+
+    ((_, local_handle, local_ids, remote_handle, remote_ids),) = (
+        consumer.nixl_wrapper.xfers
+    )
+    local_descs = consumer.nixl_wrapper.dlists[local_handle][local_ids]
+    remote_descs = consumer.nixl_wrapper.dlists[remote_handle][remote_ids]
+    written = torch.zeros(d_raw.numel(), dtype=torch.bool)
+    for (dst, size, _), (src, src_size, _) in zip(
+        local_descs.tolist(), remote_descs.tolist(), strict=True
+    ):
+        assert size == src_size
+        dst -= d_raw.data_ptr()
+        src -= p_raw.data_ptr()
+        written[dst : dst + size] = True
+        d_raw[dst : dst + size] = p_raw[src : src + size]
+
+    expected = torch.zeros_like(written)
+    num_blocks = consumer.kv_cache_config.num_blocks
+    for name, d_cache in d_caches.items():
+        ratio = d_cache.shape[0] // num_blocks
+        d_block, p_block = blocks[name.split(".")[0]]
+        d_pages = d_cache[d_block * ratio : (d_block + 1) * ratio]
+        p_pages = p_caches[name][p_block * ratio : (p_block + 1) * ratio]
+        start = d_pages.data_ptr() - d_raw.data_ptr()
+        expected[start : start + d_pages.nbytes] = True
+        assert torch.equal(d_pages.view(torch.uint8), p_pages.view(torch.uint8)), name
+    assert torch.equal(written, expected)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "producer_kwargs, consumer_kwargs",
+    [
+        ({}, {"tp_size": 2}),
+        ({"block_size": 2, "kernel_block_size": 2}, {}),
+        ({"block_size": 8}, {}),
+    ],
+    ids=["tp", "kernel-block-size", "block-size"],
+)
+def test_unsplit_sliding_window_pages_need_the_same_peer_geometry(
+    producer_kwargs, consumer_kwargs
+):
+    """A sliding window page is cut into physical blocks by bytes, so each holds
+    only some of its heads: head slicing or regrouping them would mix heads."""
+    producer, _ = _make_unsplit_swa_hma_worker("producer", **producer_kwargs)
+    consumer, _ = _make_unsplit_swa_hma_worker("consumer", **consumer_kwargs)
+    metadata = msgspec.msgpack.decode(
+        producer.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    with pytest.raises(NotImplementedError, match="same TP size"):
+        consumer.add_remote_agent(metadata, remote_tp_rank=0, remote_tp_size=1)
+
+
+@pytest.mark.cpu_test
+def test_unsplit_sliding_window_pages_reject_host_buffer():
+    """Host copies index each layer's rows with the physical block ids, which
+    are byte pieces of an unsplit sliding window row."""
+    with pytest.raises(NotImplementedError, match="host buffers"):
+        _make_unsplit_swa_hma_worker("consumer", kv_buffer_device="cpu")
+
+
 def _make_mla_hybrid_worker(
     local_block_size,
     kernel_block_size,
