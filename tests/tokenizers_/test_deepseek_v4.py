@@ -188,6 +188,51 @@ def test_deepseek_v4_transitions_from_system_to_assistant(enable_thinking, expec
     assert prompt == expected
 
 
+def test_deepseek_v4_omits_generation_prompt_when_not_requested():
+    messages = [{"role": "user", "content": "Hello"}]
+    request = ChatCompletionRequest(messages=messages, add_generation_prompt=False)
+
+    prompt = _tokenizer().apply_chat_template(
+        messages,
+        tokenize=False,
+        **request.build_chat_params(None, "auto").get_apply_chat_template_kwargs(),
+    )
+
+    assert prompt.endswith("<｜User｜>Hello")
+
+
+def test_deepseek_v4_continue_final_message_leaves_assistant_turn_open():
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi, I"},
+    ]
+    request = ChatCompletionRequest(
+        messages=messages, add_generation_prompt=False, continue_final_message=True
+    )
+
+    prompt = _tokenizer().apply_chat_template(
+        messages,
+        tokenize=False,
+        **request.build_chat_params(None, "auto").get_apply_chat_template_kwargs(),
+    )
+
+    assert prompt.endswith("<｜User｜>Hello<｜Assistant｜><think></think>Hi, I")
+
+
+@pytest.mark.parametrize(
+    ("task", "suffix"),
+    [("query", "<｜query｜>"), ("action", "<｜Assistant｜><think><｜action｜>")],
+)
+def test_deepseek_v4_task_tokens_do_not_depend_on_generation_prompt(task, suffix):
+    prompt = _tokenizer().apply_chat_template(
+        [{"role": "user", "content": "Hello", "task": task}],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    assert prompt.endswith(f"<｜User｜>Hello{suffix}")
+
+
 def test_deepseek_v4_unknown_role_raises_value_error():
     # Invalid roles are client errors: they must surface as ValueError
     # (mapped to HTTP 400 by the OpenAI serving layer), not

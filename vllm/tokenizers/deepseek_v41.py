@@ -79,6 +79,8 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             # The generic renderer's conversation has already flattened text
             # parts with '\n'. V4.1 encodes the original messages with '\n\n'.
             conversation = _normalize_messages(messages)
+            if kwargs.get("continue_final_message") and conversation:
+                conversation[-1]["wo_eos"] = True
             if tools:
                 system = next((m for m in conversation if m["role"] == "system"), None)
                 if system is None:
@@ -110,6 +112,7 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 drop_thinking=kwargs.get("drop_thinking", True),
                 reasoning_effort=effort,
                 image_order=image_order,
+                add_generation_prompt=kwargs.get("add_generation_prompt", True),
             )
             if kwargs.get("tokenize", True):
                 tokenizer_kwargs = {

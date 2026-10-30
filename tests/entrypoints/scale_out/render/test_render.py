@@ -40,6 +40,7 @@ from vllm.sampling_params import SamplingParams
 
 MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
 GPT_OSS_MODEL_NAME = "openai/gpt-oss-20b"
+DEEPSEEK_V41_MODEL_NAME = "deepseek-ai/DeepSeek-V4.1-Flash"
 
 
 @pytest.mark.parametrize("multiple", [False, True])
@@ -1081,3 +1082,39 @@ async def test_tokenize_matches_chat_render_for_gpt_oss(gpt_oss_server):
 
     assert render.status_code == tokenize.status_code == 200
     assert tokenize.json()["tokens"] == render.json()["token_ids"]
+
+
+@pytest.fixture(scope="module")
+def deepseek_v41_server():
+    args = ["--tokenizer-mode", "deepseek_v41"]
+    with RemoteLaunchRenderServer(DEEPSEEK_V41_MODEL_NAME, args) as remote_server:
+        yield remote_server
+
+
+@pytest.mark.asyncio
+async def test_chat_render_leaves_final_turn_open_for_deepseek_v41(
+    deepseek_v41_server,
+):
+    """add_generation_prompt=false drops the `<｜Assistant｜><think>` header and
+    continue_final_message=true drops the final EOS."""
+    question = [{"role": "user", "content": "What is 2+2?"}]
+    prefill = [*question, {"role": "assistant", "content": "The answer is"}]
+
+    async with httpx.AsyncClient(
+        base_url=deepseek_v41_server.url_for(""), timeout=30.0
+    ) as client:
+
+        async def render(**body):
+            response = await client.post("/v1/chat/completions/render", json=body)
+            assert response.status_code == 200
+            return response.json()["token_ids"]
+
+        opened = await render(messages=question)
+        not_opened = await render(messages=question, add_generation_prompt=False)
+        closed = await render(messages=prefill, add_generation_prompt=False)
+        continued = await render(
+            messages=prefill, add_generation_prompt=False, continue_final_message=True
+        )
+
+    assert opened[:-2] == not_opened
+    assert closed[:-1] == continued

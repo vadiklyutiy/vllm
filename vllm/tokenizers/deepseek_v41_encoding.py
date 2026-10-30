@@ -8,6 +8,8 @@ Differences from the reference:
 - `developer` messages are supported and render as user turns.
 - Images arrive as placeholders; deepseek_v41.py flattens content first.
 - Tool namespaces (`ns::name`) are not supported.
+- `add_generation_prompt=False` omits the assistant header after the final
+  message, as the model's chat_template.jinja does; task tokens are kept.
 
 Message normalization and serving controls live in deepseek_v41.py.
 """
@@ -332,6 +334,7 @@ def render_message(
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
     image_order: Optional[List[int]] = None,
+    add_generation_prompt: bool = True,
 ) -> str:
     """
     Render a single message at the given index into its V4.1 encoded string form.
@@ -521,9 +524,10 @@ def render_message(
             )
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer"] or (
-        messages[index].get("role") == "system" and index > 0
-    ):
+    elif (
+        messages[index].get("role") in ["user", "developer"]
+        or (messages[index].get("role") == "system" and index > 0)
+    ) and (add_generation_prompt or index + 1 < len(messages)):
         # Normal generation: append Assistant + thinking token
         # (mid-conversation system messages also trigger the assistant header)
         prompt += ASSISTANT_SP_TOKEN
@@ -567,6 +571,7 @@ def encode_messages(
     add_default_bos_token: bool = True,
     reasoning_effort: Union[str, int, None] = None,
     image_order: Optional[List[int]] = None,
+    add_generation_prompt: bool = True,
 ) -> str:
     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
     context = context if context else []
@@ -603,6 +608,7 @@ def encode_messages(
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
             image_order=image_order,
+            add_generation_prompt=add_generation_prompt,
         )
 
     return prompt

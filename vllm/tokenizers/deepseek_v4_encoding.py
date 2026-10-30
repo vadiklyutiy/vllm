@@ -234,6 +234,7 @@ def render_message(
     drop_thinking: bool = True,
     reasoning_effort: Optional[str] = None,
     last_user_idx: Optional[int] = None,
+    add_generation_prompt: bool = True,
 ) -> str:
     """
     Render a single message at the given index into its encoded string form.
@@ -249,6 +250,8 @@ def render_message(
         reasoning_effort: Reasoning effort level, one of "low", "high", "max".
             None is treated as "low".
         last_user_idx: Cached index of the last user/developer message.
+        add_generation_prompt: Whether to open the assistant turn after the
+            last message.
 
     Returns:
         Encoded string for this message.
@@ -415,13 +418,16 @@ def render_message(
 
     # A trailing system message opens generation, while a system message
     # followed by assistant opens that assistant history turn.
-    elif role in ["user", "developer"] or (
-        role == "system"
-        and (
-            index == len(messages) - 1
-            or messages[index + 1].get("role") == "assistant"
+    elif (
+        role in ["user", "developer"]
+        or (
+            role == "system"
+            and (
+                index == len(messages) - 1
+                or messages[index + 1].get("role") == "assistant"
+            )
         )
-    ):
+    ) and (add_generation_prompt or index + 1 < len(messages)):
         # Normal generation: append Assistant + thinking token
         prompt += ASSISTANT_SP_TOKEN
         if not drop_thinking and thinking_mode == "thinking":
@@ -552,6 +558,7 @@ def encode_messages(
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: Optional[str] = None,
+    add_generation_prompt: bool = True,
 ) -> str:
     """
     Encode a list of messages into the DeepSeek-V4 prompt format.
@@ -571,6 +578,8 @@ def encode_messages(
         add_default_bos_token: Whether to prepend BOS token at conversation start.
         reasoning_effort: Reasoning effort level, one of "low", "high", "max".
             Only takes effect in thinking mode. None is treated as "low".
+        add_generation_prompt: Whether to open the assistant turn after the
+            last message.
 
     Returns:
         The encoded prompt string.
@@ -613,6 +622,7 @@ def encode_messages(
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
             last_user_idx=last_user_idx,
+            add_generation_prompt=add_generation_prompt,
         )
 
     return prompt

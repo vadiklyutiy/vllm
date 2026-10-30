@@ -34,6 +34,9 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
             conversation = kwargs.get("conversation", messages)
             messages = conversation.copy()
+            if kwargs.get("continue_final_message") and messages:
+                messages[-1] = copy.copy(messages[-1])
+                messages[-1]["wo_eos"] = True  # type: ignore[typeddict-unknown-key]
             if tools is not None and len(tools) > 0:
                 # Match the Rust renderer: request tools attach to the first
                 # system message; synthesize one only when none exists.
@@ -65,6 +68,7 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 thinking_mode=thinking_mode,
                 drop_thinking=kwargs.get("drop_thinking", True),
                 reasoning_effort=reasoning_effort,
+                add_generation_prompt=kwargs.get("add_generation_prompt", True),
             )
 
             prompt_str = encode_messages(messages, **encode_config)  # type: ignore

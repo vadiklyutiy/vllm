@@ -217,6 +217,43 @@ def test_top_level_effort_overrides_template_effort():
     assert "Reasoning Effort: 50 " in render(request.messages, **kwargs)
 
 
+def test_request_without_generation_prompt_ends_at_user_turn():
+    request = ChatCompletionRequest(
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        messages=[{"role": "user", "content": "question"}],
+        add_generation_prompt=False,
+    )
+    kwargs = request.build_chat_params(None, "auto").get_apply_chat_template_kwargs()
+    assert render(request.messages, **kwargs).endswith("<｜User｜>question")
+
+
+def test_continue_final_message_leaves_assistant_turn_open():
+    request = ChatCompletionRequest(
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "The answer is"},
+        ],
+        add_generation_prompt=False,
+        continue_final_message=True,
+    )
+    kwargs = request.build_chat_params(None, "auto").get_apply_chat_template_kwargs()
+    assert render(request.messages, **kwargs).endswith(
+        "<｜User｜>question<｜Assistant｜><think></think>The answer is"
+    )
+
+
+@pytest.mark.parametrize(
+    ("task", "suffix"),
+    [("query", "<｜query｜>"), ("action", "<｜Assistant｜><think><｜action｜>")],
+)
+def test_task_tokens_do_not_depend_on_generation_prompt(task, suffix):
+    messages = [{"role": "user", "content": "question", "task": task}]
+    assert render(messages, add_generation_prompt=False).endswith(
+        f"<｜User｜>question{suffix}"
+    )
+
+
 def test_encode_uses_one_bos_and_forwards_truncation():
     tokenizer = get_deepseek_v41_tokenizer(FakeHfTokenizer())
     tokenizer.apply_chat_template(
