@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 import vllm.envs as envs
 from vllm.entrypoints.generate.base.protocol import (
     MMPayload,
+    PerRequestMetrics,
     resolve_return_mm_kwargs_alias,
 )
 
@@ -400,6 +401,8 @@ class AnthropicStreamEvent(BaseModel):
     index: int | None = None
     error: AnthropicError | None = None
     usage: AnthropicUsage | None = None
+    # vLLM-specific: per-request metrics, set on the final message_delta
+    metrics: PerRequestMetrics | None = None
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -423,6 +426,7 @@ class AnthropicMessagesResponse(BaseModel):
     ec_transfer_params: dict[str, Any] | None = Field(
         default=None, description="ECTransfer parameters."
     )
+    metrics: PerRequestMetrics | None = None
 
     def model_post_init(self, __context):
         if not self.id:

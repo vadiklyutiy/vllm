@@ -189,6 +189,7 @@ async def init_generate_state(
             enable_log_outputs=args.enable_log_outputs,
             enable_log_deltas=args.enable_log_deltas,
             default_chat_template_kwargs=default_chat_template_kwargs,
+            enable_per_request_metrics=args.enable_per_request_metrics,
             disabled_thinking_effort=args.anthropic_disabled_thinking_effort,
         )
         if "generate" in supported_tasks

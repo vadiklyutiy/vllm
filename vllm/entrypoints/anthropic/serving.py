@@ -239,6 +239,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         enable_log_outputs: bool = False,
         enable_log_deltas: bool = True,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        enable_per_request_metrics: bool = False,
         disabled_thinking_effort: AnthropicDisabledThinkingEffortOption = "auto",
     ):
         super().__init__(
@@ -259,6 +260,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             enable_log_outputs=enable_log_outputs,
             enable_log_deltas=enable_log_deltas,
             default_chat_template_kwargs=default_chat_template_kwargs,
+            enable_per_request_metrics=enable_per_request_metrics,
         )
         self._merge_inline_system = self._should_merge_inline_system(online_renderer)
         self.disabled_thinking_effort_resolver = DisabledThinkingEffortResolver(
@@ -871,6 +873,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             usage=_build_anthropic_usage(generator.usage),
             kv_transfer_params=generator.kv_transfer_params,
             ec_transfer_params=generator.ec_transfer_params,
+            metrics=generator.metrics,
         )
         choice = generator.choices[0]
         result.stop_reason, result.stop_sequence = _to_anthropic_stop_reason(
@@ -1080,6 +1083,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                         delta=stop_delta,
                         usage=_build_anthropic_usage(origin_chunk.usage),
                     )
+                    if origin_chunk.metrics is not None:
+                        chunk.metrics = origin_chunk.metrics
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield wrap_data_with_event(data, "message_delta")
                     continue
