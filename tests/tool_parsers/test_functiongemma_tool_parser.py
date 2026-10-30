@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -119,6 +120,132 @@ class TestParseArguments:
     def test_argument_with_spaces(self, parser):
         result = parser._parse_arguments("message:<escape>Hello World<escape>")
         assert result == {"message": "Hello World"}
+
+
+JSON_LIKE_STRINGS = ["123", "true", "null", "[1,2]", '{"x":1}', '"quoted"']
+
+
+@pytest.fixture
+def lookup_request():
+    return ChatCompletionRequest(
+        model="functiongemma",
+        messages=[{"role": "user", "content": "Pass the value to lookup."}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string"},
+                            "count": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ],
+    )
+
+
+class TestSchemaTypes:
+    """`<escape>` values follow the tool schema, so JSON-looking text in a
+    string parameter is not turned into another type."""
+
+    @pytest.mark.parametrize("value", JSON_LIKE_STRINGS)
+    def test_string_parameter_kept_as_string(
+        self, mock_tokenizer, lookup_request, value
+    ):
+        parser = FunctionGemmaToolParser(mock_tokenizer, tools=lookup_request.tools)
+        model_output = (
+            "<start_function_call>call:lookup{value:<escape>"
+            + value
+            + "<escape>,count:<escape>42<escape>}<end_function_call>"
+        )
+        result = parser.extract_tool_calls(model_output, lookup_request)
+
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"value": value, "count": 42}
+
+    @pytest.mark.parametrize("value", JSON_LIKE_STRINGS)
+    @pytest.mark.parametrize("args_with_end", [False, True])
+    def test_string_parameter_kept_as_string_streaming(
+        self, mock_tokenizer, lookup_request, value, args_with_end
+    ):
+        parser = FunctionGemmaToolParser(mock_tokenizer, tools=lookup_request.tools)
+        chunks = [
+            "<start_function_call>",
+            "call:lookup{",
+            "value:<escape>",
+            value,
+            "<escape>",
+            "}",
+            "<end_function_call>",
+        ]
+        if args_with_end:
+            chunks = chunks[:2] + ["".join(chunks[2:])]
+        previous_text = ""
+        arguments = ""
+        for chunk in chunks:
+            current_text = previous_text + chunk
+            delta = parser.extract_tool_calls_streaming(
+                previous_text, current_text, chunk, [], [], [], lookup_request
+            )
+            if delta is not None and delta.tool_calls:
+                assert delta.tool_calls[0].function is not None
+                arguments += delta.tool_calls[0].function.arguments or ""
+            previous_text = current_text
+
+        assert json.loads(arguments) == {"value": value}
+
+    @pytest.mark.parametrize(
+        ("schema", "value", "expected"),
+        [
+            # No declared type: the JSON is decoded.
+            ({"$ref": "#/$defs/Point"}, '{"x":1}', {"x": 1}),
+            (
+                {"anyOf": [{"$ref": "#/$defs/Point"}, {"type": "null"}]},
+                '{"x":1}',
+                {"x": 1},
+            ),
+            ({"description": "any value"}, '{"x":1}', {"x": 1}),
+            # A declared string type: the text is kept.
+            ({"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Point"}]}, "123", "123"),
+            (
+                {"type": "string", "oneOf": [{"const": "123"}, {"const": "456"}]},
+                "123",
+                "123",
+            ),
+        ],
+    )
+    def test_parameter_type_from_schema(self, mock_tokenizer, schema, value, expected):
+        request = ChatCompletionRequest(
+            model="functiongemma",
+            messages=[{"role": "user", "content": "Plot the point."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "plot",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"point": schema},
+                            "$defs": {"Point": {"type": "object"}},
+                        },
+                    },
+                }
+            ],
+        )
+        parser = FunctionGemmaToolParser(mock_tokenizer, tools=request.tools)
+        model_output = (
+            "<start_function_call>call:plot{point:<escape>"
+            + value
+            + "<escape>}<end_function_call>"
+        )
+        result = parser.extract_tool_calls(model_output, request)
+
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"point": expected}
 
 
 class TestAdjustRequest:

@@ -1077,15 +1077,20 @@ def make_valid_python(text: str) -> tuple[str, str] | None:
     return candidate, added_text
 
 
-def extract_types_from_schema(schema: Any) -> list[str]:
+def extract_types_from_schema(
+    schema: Any, default: list[str] | None = None
+) -> list[str]:
     """Extract all possible type strings from a JSON Schema definition.
 
     Handles ``type`` (string or list), ``enum`` value inference, and
-    recursive ``anyOf``/``oneOf``/``allOf``.  Returns ``["string"]``
-    when no type information can be determined.
+    recursive ``anyOf``/``oneOf``/``allOf``.  Returns *default*
+    (``["string"]`` if not given) when no type information can be
+    determined.
     """
+    if default is None:
+        default = ["string"]
     if schema is None or not isinstance(schema, dict):
-        return ["string"]
+        return default
 
     types: set[str] = set()
 
@@ -1118,9 +1123,9 @@ def extract_types_from_schema(schema: Any) -> list[str]:
     for choice_field in ("anyOf", "oneOf", "allOf"):
         if choice_field in schema and isinstance(schema[choice_field], list):
             for choice in schema[choice_field]:
-                types.update(extract_types_from_schema(choice))
+                types.update(extract_types_from_schema(choice, default))
 
-    return list(types) if types else ["string"]
+    return list(types) if types else default
 
 
 _TYPE_ALIASES: dict[str, str] = {

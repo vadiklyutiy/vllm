@@ -22,6 +22,11 @@ from vllm.logger import init_logger
 from vllm.renderers.chat_utils import make_tool_call_id
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
+from vllm.tool_parsers.utils import (
+    coerce_to_schema_type,
+    extract_types_from_schema,
+    find_tool_properties,
+)
 
 logger = init_logger(__name__)
 
@@ -58,19 +63,17 @@ class FunctionGemmaToolParser(ToolParser):
         self.streamed_args_for_tool: list[str] = []
         self.buffered_delta_text = ""
 
-    def _parse_arguments(self, args_str: str) -> dict:
+    def _parse_arguments(self, args_str: str, func_name: str = "") -> dict:
         """Parse FunctionGemma argument string into a dictionary."""
         arguments: dict = {}
         if not args_str:
             return arguments
 
+        properties = find_tool_properties(self.tools, func_name)
         matches = self.arg_regex.findall(args_str)
         for key, value in matches:
-            try:
-                parsed_value = json.loads(value)
-                arguments[key] = parsed_value
-            except json.JSONDecodeError:
-                arguments[key] = value
+            types = extract_types_from_schema(properties.get(key), default=[])
+            arguments[key] = coerce_to_schema_type(value, types)
 
         return arguments
 
@@ -109,7 +112,7 @@ class FunctionGemmaToolParser(ToolParser):
                 if not func_name:
                     continue
 
-                arguments = self._parse_arguments(args_str)
+                arguments = self._parse_arguments(args_str, func_name)
 
                 tool_calls.append(
                     ToolCall(
@@ -235,7 +238,7 @@ class FunctionGemmaToolParser(ToolParser):
                             )
 
                         if self.current_tool_name_sent and args_part:
-                            current_args = self._parse_arguments(args_part)
+                            current_args = self._parse_arguments(args_part, func_name)
                             if current_args:
                                 current_args_json = json.dumps(
                                     current_args, ensure_ascii=False
@@ -277,7 +280,7 @@ class FunctionGemmaToolParser(ToolParser):
                         match = all_calls[self.current_tool_id]
                         if match[0]:
                             args_str = match[1]
-                            args = self._parse_arguments(args_str)
+                            args = self._parse_arguments(args_str, match[0])
                             self.prev_tool_call_arr[self.current_tool_id][
                                 "arguments"
                             ] = args
