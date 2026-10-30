@@ -3,6 +3,7 @@
 
 import json
 
+import numpy as np
 import openai
 import pytest
 import pytest_asyncio
@@ -230,6 +231,36 @@ async def test_request_media_io_kwargs_override_uses_fewer_video_frames(
     assert default_resp.usage is not None
     assert override_resp.usage is not None
     assert override_resp.usage.prompt_tokens < default_resp.usage.prompt_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_jpeg_frames_indices_beyond_num_frames(
+    client: openai.AsyncOpenAI, model_name: str
+):
+    """frames_indices has one entry per frame sent; frames beyond the server's
+    num_frames (32) are dropped together with their indices."""
+    frames = np.zeros((40, 64, 64, 3), dtype=np.uint8)
+
+    async def prompt_tokens(num_sent: int) -> int:
+        resp = await client.chat.completions.create(
+            model=model_name,
+            messages=dummy_messages_from_video_url(encode_video_url(frames[:num_sent])),
+            max_completion_tokens=1,
+            temperature=0.0,
+            extra_body={
+                "media_io_kwargs": {
+                    "video": {
+                        "frames_indices": list(range(0, num_sent * 10, 10)),
+                        "total_num_frames": 900,
+                    }
+                }
+            },
+        )
+        assert resp.usage is not None
+        return resp.usage.prompt_tokens
+
+    assert await prompt_tokens(40) == await prompt_tokens(32)
 
 
 @pytest.mark.asyncio
