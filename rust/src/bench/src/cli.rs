@@ -90,6 +90,16 @@ pub enum DatasetName {
     TimedTrace,
 }
 
+impl DatasetName {
+    /// Return true if the dataset generates its prompts and never reads `--dataset-path`.
+    pub fn is_synthetic(self) -> bool {
+        match self {
+            Self::Random | Self::RandomMm | Self::PrefixRepetition | Self::RandomRerank => true,
+            Self::ShareGpt | Self::SpeedBench | Self::Hf | Self::Custom | Self::TimedTrace => false,
+        }
+    }
+}
+
 /// Ramp-up strategy for request rate.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RampUpStrategy {

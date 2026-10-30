@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use clap::ValueEnum;
+
 use crate::cli::{
     BackendKind, BenchServeArgs, DatasetName, LoraAssignment, RampUpStrategy, SpeedBenchConfig,
 };
@@ -509,6 +511,21 @@ impl BenchConfig {
                 Some(out)
             }
         };
+
+        // Mirrors Python `vllm bench serve`.
+        if let Some(path) = args.dataset_path.as_deref()
+            && args.dataset_name.is_synthetic()
+        {
+            let name = args
+                .dataset_name
+                .to_possible_value()
+                .expect("DatasetName has no skipped values");
+            return Err(BenchError::Config(format!(
+                "Cannot use '{}' dataset with --dataset-path. Please specify the appropriate \
+                 --dataset-name (e.g., 'sharegpt', 'custom', 'hf') for your dataset file: {path}",
+                name.get_name()
+            )));
+        }
 
         // Random-MM validation and config parsing
         let (random_mm_limit, random_mm_buckets) = if args.dataset_name == DatasetName::RandomMm {
@@ -1326,6 +1343,66 @@ mod tests {
         let config = BenchConfig::from_args(&args).unwrap();
 
         assert_eq!(config.sharegpt_multi_turn_max_turns, Some(2));
+    }
+
+    /// Synthetic datasets never read the file, so accepting --dataset-path would
+    /// benchmark generated prompts instead of the given workload; the datasets
+    /// that read it must keep accepting it.
+    #[test]
+    fn test_dataset_path_rejected_only_by_synthetic_datasets() {
+        for (dataset, backend) in [
+            ("random", "openai"),
+            ("random-mm", "openai-chat"),
+            ("random-rerank", "vllm-rerank"),
+            ("prefix_repetition", "openai"),
+        ] {
+            let args = parse_args([
+                "vllm-bench",
+                "--model",
+                "test-model",
+                "--backend",
+                backend,
+                "--dataset-name",
+                dataset,
+                "--dataset-path",
+                "workload.jsonl",
+            ]);
+            let msg = BenchConfig::from_args(&args)
+                .expect_err("synthetic dataset should reject --dataset-path")
+                .to_string();
+            assert!(
+                msg.contains(&format!(
+                    "Cannot use '{dataset}' dataset with --dataset-path"
+                )),
+                "{dataset}: {msg}"
+            );
+        }
+
+        for dataset in ["sharegpt", "speed-bench", "hf", "custom", "timed_trace"] {
+            let args = parse_args([
+                "vllm-bench",
+                "--model",
+                "test-model",
+                "--dataset-name",
+                dataset,
+                "--dataset-path",
+                "workload.jsonl",
+            ]);
+            if let Err(e) = BenchConfig::from_args(&args) {
+                panic!("{dataset} reads --dataset-path and should accept it: {e}");
+            }
+        }
+
+        // Multi-turn mode with the default dataset (random).
+        let mut args = base_multi_turn_args();
+        args.extend(["--dataset-path", "workload.jsonl"]);
+        let msg = BenchConfig::from_args(&parse_args(args))
+            .expect_err("multi-turn random should reject --dataset-path")
+            .to_string();
+        assert!(
+            msg.contains("Cannot use 'random' dataset with --dataset-path"),
+            "{msg}"
+        );
     }
 
     #[test]
