@@ -62,6 +62,11 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
+from vllm.tool_parsers.utils import (
+    JSON_SCHEMA_TYPES,
+    decoded_if_allowed,
+    extract_types_from_schema,
+)
 
 logger = init_logger(__name__)
 
@@ -317,10 +322,10 @@ class MuseToolParser(ToolParser):
     @classmethod
     def _string_parameters(
         cls, request: ChatCompletionRequest | ResponsesRequest | None
-    ) -> dict[str, set[str]]:
+    ) -> dict[str, dict[str, list[str]]]:
         if not cls._preserve_string_parameters:
             return {}
-        strings: dict[str, set[str]] = {}
+        strings: dict[str, dict[str, list[str]]] = {}
         for tool in getattr(request, "tools", None) or []:
             function = getattr(tool, "function", None) or tool
             if isinstance(function, dict):
@@ -330,11 +335,11 @@ class MuseToolParser(ToolParser):
                 name = getattr(function, "name", None)
                 parameters = getattr(function, "parameters", None)
             if name and isinstance(parameters, dict):
-                strings[name] = {
-                    key
-                    for key, schema in parameters.get("properties", {}).items()
-                    if isinstance(schema, dict) and schema.get("type") == "string"
-                }
+                strings[name] = {}
+                for key, schema in parameters.get("properties", {}).items():
+                    types = extract_types_from_schema(schema, JSON_SCHEMA_TYPES)
+                    if "string" in types:
+                        strings[name][key] = types
         return strings
 
     @staticmethod
@@ -369,7 +374,7 @@ class MuseToolParser(ToolParser):
         cls,
         text: str,
         registered: set[str] | None = None,
-        strings: dict[str, set[str]] | None = None,
+        strings: dict[str, dict[str, list[str]]] | None = None,
     ) -> list[ToolCall]:
         registered = registered or set()
         scoped = cls._tool_channel_text(text)
@@ -379,11 +384,18 @@ class MuseToolParser(ToolParser):
             if not name_m:
                 continue
             name = cls._normalize_name(name_m.group(1), registered)
-            string_parameters = (strings or {}).get(name, set())
+            string_parameters = (strings or {}).get(name, {})
             args: dict = {}
             for pm in _PARAM_RE.finditer(invoke):
                 key, raw = pm.group("key"), pm.group("value")
-                args[key] = raw if key in string_parameters else _decode_value(raw)
+                types = string_parameters.get(key)
+                if types == ["string"]:
+                    value = raw
+                else:
+                    value = _decode_value(raw)
+                    if types:
+                        value = decoded_if_allowed(raw, value, types)
+                args[key] = value
             tool_calls.append(
                 ToolCall(
                     function=FunctionCall(

@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
 from openai.types.responses.tool_param import FunctionToolParam
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -234,6 +235,89 @@ def test_responses_extract_tool_calls_with_flat_tools() -> None:
     assert result.tools_called
     args = json.loads(result.tool_calls[0].function.arguments)
     assert args["content"] == content
+
+
+@pytest.mark.parametrize(
+    ("schema", "value", "expected"),
+    [
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "1.10", "1.10"),
+        ({"type": ["string", "null"]}, "1.10", "1.10"),
+        ({"enum": ["1.10", "2.0"]}, "1.10", "1.10"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "null", None),
+        ({"$ref": "#/$defs/Point"}, '{"x": 1}', {"x": 1}),
+        (
+            {"anyOf": [{"$ref": "#/$defs/Point"}, {"type": "null"}]},
+            '{"x": 1}',
+            {"x": 1},
+        ),
+        (
+            {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Point"}]},
+            '{"x": 1}',
+            {"x": 1},
+        ),
+        ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, "007", "007"),
+        (
+            {"type": "string", "oneOf": [{"const": "1.10"}, {"const": "2.0"}]},
+            "1.10",
+            "1.10",
+        ),
+        ({"allOf": [{"type": "string"}, {"maxLength": 10}]}, "1.10", "1.10"),
+        ({"oneOf": [{"const": "1.10"}, {"const": "2.0"}]}, "1.10", "1.10"),
+        (
+            {"anyOf": [{"type": "string"}, {"type": "array"}]},
+            "['a', 'b']",
+            ["a", "b"],
+        ),
+    ],
+)
+def test_string_union_schema_values(
+    schema: dict[str, Any], value: str, expected: Any
+) -> None:
+    """Schemas that allow a string keep 1.10 as text; other allowed types decode."""
+    parameters = {
+        "type": "object",
+        "properties": {
+            "version": schema,
+            "build": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        },
+        "$defs": {
+            "Point": {"type": "object", "properties": {"x": {"type": "integer"}}}
+        },
+    }
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "poolside-test",
+            "messages": [{"role": "user", "content": "set the version"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "set_version", "parameters": parameters},
+                }
+            ],
+        }
+    )
+    model_output = (
+        "<tool_call>set_version\n"
+        f"<arg_key>version</arg_key>\n<arg_value>{value}</arg_value>\n"
+        "<arg_key>build</arg_key>\n<arg_value>7</arg_value>\n"
+        "</tool_call>"
+    )
+    expected_args = {"version": expected, "build": 7}
+
+    result = _make_parser(request).extract_tool_calls(model_output, request)
+    assert json.loads(result.tool_calls[0].function.arguments) == expected_args
+
+    parser = _make_parser(request)
+    args = ""
+    prev = ""
+    for ch in model_output:
+        cur = prev + ch
+        delta = parser.extract_tool_calls_streaming(prev, cur, ch, [], [], [], request)
+        prev = cur
+        for tc in (delta.tool_calls if delta else None) or []:
+            if tc.function is not None and tc.function.arguments:
+                args += tc.function.arguments
+    assert json.loads(args) == expected_args
 
 
 def _weather_tool() -> dict[str, Any]:

@@ -7,9 +7,11 @@ import json
 import pytest
 
 from vllm.tool_parsers.utils import (
+    JSON_SCHEMA_TYPES,
     UnexpectedAstError,
     coerce_to_schema_type,
     contains_broken_string_literal,
+    decoded_if_allowed,
     escape_ctrl_chars_in_strings,
     escape_nested_quotes_in_strings,
     extract_types_from_schema,
@@ -299,6 +301,35 @@ class TestExtractTypesFromSchema:
         }
         result = set(extract_types_from_schema(schema))
         assert result == {"integer", "null", "string"}
+
+    def test_untyped_branch_gets_default(self):
+        schema = {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Point"}]}
+        result = set(extract_types_from_schema(schema, JSON_SCHEMA_TYPES))
+        assert result == set(JSON_SCHEMA_TYPES)
+
+    def test_untyped_branch_takes_parent_type(self):
+        schema = {"type": "string", "oneOf": [{"const": "a"}, {"format": "date"}]}
+        assert extract_types_from_schema(schema, JSON_SCHEMA_TYPES) == ["string"]
+
+    def test_allof_untyped_branch_adds_no_type(self):
+        schema = {"allOf": [{"type": "string"}, {"maxLength": 10}]}
+        assert extract_types_from_schema(schema, JSON_SCHEMA_TYPES) == ["string"]
+
+    def test_const_infers_type(self):
+        schema = {"oneOf": [{"const": "1.10"}, {"const": "2.0"}]}
+        assert extract_types_from_schema(schema, JSON_SCHEMA_TYPES) == ["string"]
+
+
+class TestDecodedIfAllowed:
+    def test_decoded_kept_only_for_allowed_non_string_type(self):
+        types = ["string", "null"]
+        assert decoded_if_allowed("1.10", 1.1, types) == "1.10"
+        assert decoded_if_allowed('"a"', "a", types) == '"a"'
+        assert decoded_if_allowed("null", None, types) is None
+        assert decoded_if_allowed("5", 5, ["string", "number"]) == 5
+
+    def test_every_type_allowed_keeps_decoded(self):
+        assert decoded_if_allowed('"a"', "a", list(JSON_SCHEMA_TYPES)) == "a"
 
 
 def _value_of(expr: str):

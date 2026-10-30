@@ -41,7 +41,12 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
-from vllm.tool_parsers.utils import safe_literal_eval
+from vllm.tool_parsers.utils import (
+    JSON_SCHEMA_TYPES,
+    decoded_if_allowed,
+    extract_types_from_schema,
+    safe_literal_eval,
+)
 
 logger = init_logger(__name__)
 
@@ -127,13 +132,13 @@ class PoolsideV1ToolParser(ToolParser):
         return json.dumps(s, ensure_ascii=False)[1:-1]
 
     @staticmethod
-    def _is_string_type(
+    def _arg_types(
         tool_name: str,
         arg_name: str,
         tools: list[Tool] | None,
-    ) -> bool:
+    ) -> list[str]:
         if tools is None:
-            return False
+            return []
         for tool in tools:
             # ChatCompletion tools nest under .function; Responses
             # FunctionTool is flat (.name/.parameters at the top level).
@@ -142,11 +147,13 @@ class PoolsideV1ToolParser(ToolParser):
                 continue
             params = getattr(fn, "parameters", None)
             if params is None:
-                return False
-            arg_type = params.get("properties", {}).get(arg_name, {}).get("type", None)
-            return arg_type == "string"
+                return []
+            arg_schema = params.get("properties", {}).get(arg_name)
+            if arg_schema is None:
+                return []
+            return extract_types_from_schema(arg_schema, JSON_SCHEMA_TYPES)
         logger.debug("No tool named '%s'.", tool_name)
-        return False
+        return []
 
     @staticmethod
     def _tools_enabled(request: ChatCompletionRequest) -> bool:
@@ -214,10 +221,13 @@ class PoolsideV1ToolParser(ToolParser):
                     arg_key = key.strip()
                     # Keep string values verbatim; whitespace is significant
                     # (e.g. code/file content). Only strip non-string types.
-                    if self._is_string_type(tc_name, arg_key, request.tools):
+                    arg_types = self._arg_types(tc_name, arg_key, request.tools)
+                    if arg_types == ["string"]:
                         arg_val = value
                     else:
                         arg_val = self._deserialize(value.strip())
+                        if "string" in arg_types:
+                            arg_val = decoded_if_allowed(value, arg_val, arg_types)
                     logger.debug("arg_key = %s, arg_val = %s", arg_key, arg_val)
                     arg_dct[arg_key] = arg_val
                 tool_calls.append(
@@ -365,11 +375,9 @@ class PoolsideV1ToolParser(ToolParser):
 
                 key = (self._pending_key or "").strip()
 
-                is_string = self._is_string_type(
-                    self._current_tool_name, key, request.tools
-                )
+                arg_types = self._arg_types(self._current_tool_name, key, request.tools)
 
-                if is_string:
+                if arg_types == ["string"]:
                     # String type: stream incrementally
                     self._buffer = self._buffer[len(self.arg_val_start) :]
 
@@ -391,16 +399,18 @@ class PoolsideV1ToolParser(ToolParser):
                     self._update_tool_args(pending_deltas, frag)
                     continue
 
-                # Non-string type: wait for complete value
+                # Not a plain string (e.g. Optional[str]): wait for complete value
                 val_end = self._buffer.find(self.arg_val_end)
                 if val_end == -1:
                     break
 
-                raw_val = self._buffer[len(self.arg_val_start) : val_end].strip()
+                raw_val = self._buffer[len(self.arg_val_start) : val_end]
                 self._buffer = self._buffer[val_end + len(self.arg_val_end) :]
                 self._pending_key = None
 
-                frag_or_none = self._append_arg_fragment(key=key, raw_val=raw_val)
+                frag_or_none = self._append_arg_fragment(
+                    key=key, raw_val=raw_val, arg_types=arg_types
+                )
                 if frag_or_none:
                     self._update_tool_args(pending_deltas, frag_or_none)
                 continue
@@ -573,6 +583,7 @@ class PoolsideV1ToolParser(ToolParser):
         *,
         key: str,
         raw_val: str,
+        arg_types: list[str],
     ) -> str | None:
         key = key.strip()
         if not key:
@@ -580,9 +591,9 @@ class PoolsideV1ToolParser(ToolParser):
         if key in self._seen_keys[self.current_tool_id]:
             return None
 
-        # This function is only called for non-string types (already checked
-        # by _is_string_type in the caller), so we always deserialize.
-        val_obj: Any = self._deserialize(raw_val)
+        val_obj: Any = self._deserialize(raw_val.strip())
+        if "string" in arg_types:
+            val_obj = decoded_if_allowed(raw_val, val_obj, arg_types)
 
         key_json = json.dumps(key, ensure_ascii=False)
         val_json = json.dumps(val_obj, ensure_ascii=False)

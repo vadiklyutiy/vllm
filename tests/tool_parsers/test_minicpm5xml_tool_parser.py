@@ -436,6 +436,101 @@ def test_non_string_types(parser: ToolParser) -> None:
     assert args["exact"] is True
 
 
+@pytest.mark.parametrize(
+    ("schema", "value", "expected"),
+    [
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "1.10", "1.10"),
+        ({"type": ["string", "null"]}, "1.10", "1.10"),
+        ({"enum": ["1.10", "2.0"]}, "1.10", "1.10"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "null", None),
+        ({"$ref": "#/$defs/Point"}, '{"x": 1}', {"x": 1}),
+        (
+            {"anyOf": [{"$ref": "#/$defs/Point"}, {"type": "null"}]},
+            '{"x": 1}',
+            {"x": 1},
+        ),
+        (
+            {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Point"}]},
+            '{"x": 1}',
+            {"x": 1},
+        ),
+        ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, "007", "007"),
+        (
+            {"type": "string", "oneOf": [{"const": "1.10"}, {"const": "2.0"}]},
+            "1.10",
+            "1.10",
+        ),
+        ({"allOf": [{"type": "string"}, {"maxLength": 10}]}, "1.10", "1.10"),
+        ({"oneOf": [{"const": "1.10"}, {"const": "2.0"}]}, "1.10", "1.10"),
+        (
+            {"anyOf": [{"type": "string"}, {"type": "array"}]},
+            "['a', 'b']",
+            ["a", "b"],
+        ),
+    ],
+)
+def test_string_union_schema_values(
+    parser: ToolParser, schema: dict, value: str, expected: object
+) -> None:
+    """Schemas that allow a string keep 1.10 as text; other allowed types decode."""
+    tool = _tool(
+        "set_version",
+        {
+            "type": "object",
+            "properties": {
+                "version": schema,
+                "build": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+            "$defs": {
+                "Point": {"type": "object", "properties": {"x": {"type": "integer"}}}
+            },
+        },
+    )
+    request = make_request([tool])
+    text = (
+        '<function name="set_version">'
+        f'<param name="version">{value}</param>'
+        '<param name="build">7</param>'
+        "</function>\n"
+    )
+    out = parser.extract_tool_calls(text, request)
+    assert len(out.tool_calls) == 1
+    args = json.loads(out.tool_calls[0].function.arguments)
+    assert args == {"version": expected, "build": 7}
+
+
+@pytest.mark.parametrize(
+    ("wrapped", "expected"),
+    [
+        ('{"version": "1.10", "build": 7}', "1.10"),
+        ('{"version": 1984, "build": 7}', "1984"),
+    ],
+)
+def test_wrapped_string_union_schema_values(
+    parser: ToolParser, wrapped: str, expected: str
+) -> None:
+    """Wrapped values for Optional[str] stay strings; Optional[int] still decodes."""
+    tool = _tool(
+        "set_version",
+        {
+            "type": "object",
+            "properties": {
+                "version": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "build": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+        },
+    )
+    text = (
+        '<function name="set_version">'
+        f'<param name="properties">{wrapped}</param>'
+        "</function>"
+    )
+    out = parser.extract_tool_calls(text, make_request([tool]))
+    assert len(out.tool_calls) == 1
+    args = json.loads(out.tool_calls[0].function.arguments)
+    assert args == {"version": expected, "build": 7}
+
+
 def test_multiple_calls_interleaved_text(parser: ToolParser) -> None:
     tools = make_tools_weather() + make_tools_sum()
     request = make_request(tools)

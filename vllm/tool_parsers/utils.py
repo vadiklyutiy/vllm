@@ -1077,15 +1077,50 @@ def make_valid_python(text: str) -> tuple[str, str] | None:
     return candidate, added_text
 
 
-def extract_types_from_schema(schema: Any) -> list[str]:
+JSON_SCHEMA_TYPES = (
+    "null",
+    "boolean",
+    "integer",
+    "number",
+    "string",
+    "array",
+    "object",
+)
+
+
+def _json_type_of(value: Any) -> str | None:
+    """Return the JSON Schema type of a Python value, or None if it has none."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return None
+
+
+def extract_types_from_schema(
+    schema: Any, default: tuple[str, ...] = ("string",)
+) -> list[str]:
     """Extract all possible type strings from a JSON Schema definition.
 
-    Handles ``type`` (string or list), ``enum`` value inference, and
-    recursive ``anyOf``/``oneOf``/``allOf``.  Returns ``["string"]``
-    when no type information can be determined.
+    Handles ``type`` (string or list), ``enum`` and ``const`` value
+    inference, and recursive ``anyOf``/``oneOf``/``allOf``.  Returns ``default`` when no
+    type information can be determined, e.g. for ``{}`` or an unresolved
+    ``$ref``.  A branch with no type information takes the parent's types,
+    or ``default`` if the parent declares none.  An untyped ``allOf`` branch
+    adds no type when a sibling declares one.
     """
     if schema is None or not isinstance(schema, dict):
-        return ["string"]
+        return list(default)
 
     types: set[str] = set()
 
@@ -1100,27 +1135,41 @@ def extract_types_from_schema(schema: Any) -> list[str]:
 
     if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
         for value in schema["enum"]:
-            if value is None:
-                types.add("null")
-            elif isinstance(value, bool):
-                types.add("boolean")
-            elif isinstance(value, int):
-                types.add("integer")
-            elif isinstance(value, float):
-                types.add("number")
-            elif isinstance(value, str):
-                types.add("string")
-            elif isinstance(value, list):
-                types.add("array")
-            elif isinstance(value, dict):
-                types.add("object")
+            if (value_type := _json_type_of(value)) is not None:
+                types.add(value_type)
 
+    if "const" in schema and (const_type := _json_type_of(schema["const"])):
+        types.add(const_type)
+
+    branch_default = tuple(types) or default
     for choice_field in ("anyOf", "oneOf", "allOf"):
         if choice_field in schema and isinstance(schema[choice_field], list):
-            for choice in schema[choice_field]:
-                types.update(extract_types_from_schema(choice))
+            choices = schema[choice_field]
+            if choice_field == "allOf":
+                # Every allOf branch must hold, so an untyped one adds no type.
+                typed = [c for c in choices if extract_types_from_schema(c, ())]
+                choices = typed or choices
+            for choice in choices:
+                types.update(extract_types_from_schema(choice, branch_default))
 
-    return list(types) if types else ["string"]
+    return list(types) if types else list(default)
+
+
+def decoded_if_allowed(raw: str, decoded: Any, types: list[str]) -> Any:
+    """Keep a parser's decoded value only if the schema allows its type.
+
+    For a parameter whose schema allows a string, return ``decoded`` when it
+    is a non-string value of one of ``types``, else the model's ``raw`` text.
+    When every type is allowed (no type information), return ``decoded``.
+    """
+    if set(JSON_SCHEMA_TYPES) <= set(types):
+        return decoded
+    if isinstance(decoded, str):
+        return raw
+    decoded_type = _json_type_of(decoded)
+    if decoded_type in types or (decoded_type == "integer" and "number" in types):
+        return decoded
+    return raw
 
 
 _TYPE_ALIASES: dict[str, str] = {

@@ -615,6 +615,64 @@ def test_string_parameter_schema_preserves_raw_text(value, request_kind, parser_
         assert json.loads(arguments) == expected
 
 
+@pytest.mark.parametrize(
+    ("schema", "value", "expected"),
+    [
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "1.10", "1.10"),
+        ({"type": ["string", "null"]}, "1.10", "1.10"),
+        ({"enum": ["1.10", "2.0"]}, "1.10", "1.10"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "null", None),
+        ({"$ref": "#/$defs/Point"}, '{"x": 1}', {"x": 1}),
+        (
+            {"anyOf": [{"$ref": "#/$defs/Point"}, {"type": "null"}]},
+            '{"x": 1}',
+            {"x": 1},
+        ),
+        (
+            {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Point"}]},
+            '{"x": 1}',
+            {"x": 1},
+        ),
+        ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, "007", "007"),
+        (
+            {"type": "string", "oneOf": [{"const": "1.10"}, {"const": "2.0"}]},
+            "1.10",
+            "1.10",
+        ),
+        ({"allOf": [{"type": "string"}, {"maxLength": 10}]}, "1.10", "1.10"),
+        ({"oneOf": [{"const": "1.10"}, {"const": "2.0"}]}, "1.10", "1.10"),
+    ],
+)
+def test_string_union_schema_values(schema, value, expected):
+    """Schemas that allow a string keep 1.10 as text; other allowed types decode."""
+    parameters = {
+        "type": "object",
+        "properties": {
+            "version": schema,
+            "build": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        },
+        "$defs": {
+            "Point": {"type": "object", "properties": {"x": {"type": "integer"}}}
+        },
+    }
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        tools=[
+            {"type": "function", "function": {"name": "f", "parameters": parameters}}
+        ],
+    )
+    raw = (
+        'to=f<|message|><atem:function_calls><atem:invoke name="f">'
+        f'<atem:parameter name="version">{value}</atem:parameter>'
+        '<atem:parameter name="build">7</atem:parameter>'
+        "</atem:invoke></atem:function_calls><|eot|>"
+    )
+    calls = MuseToolParser(object()).extract_tool_calls(raw, request).tool_calls
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"version": expected, "build": 7}
+
+
 # --------------------------------------------------- reasoning token counting
 
 _SPECIALS = ["<|message|>", "<|start|>", "<|eom|>", "<|eot|>"]

@@ -27,7 +27,13 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
-from vllm.tool_parsers.utils import partial_tag_overlap, safe_literal_eval
+from vllm.tool_parsers.utils import (
+    JSON_SCHEMA_TYPES,
+    decoded_if_allowed,
+    extract_types_from_schema,
+    partial_tag_overlap,
+    safe_literal_eval,
+)
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
@@ -121,18 +127,18 @@ def _parse_arguments(json_value: str) -> tuple[Any, bool]:
         return json_value, False
 
 
-def _get_argument_type(
+def _get_argument_types(
     func_name: str,
     arg_key: str,
     name_to_tool: dict[str, ChatCompletionToolsParam],
-) -> str | None:
+) -> list[str]:
     tool = name_to_tool.get(func_name)
     if tool is None or tool.function.parameters is None:
-        return None
+        return []
     props = tool.function.parameters.get("properties", {})
     if arg_key not in props:
-        return None
-    return props[arg_key].get("type")
+        return []
+    return extract_types_from_schema(props[arg_key], JSON_SCHEMA_TYPES)
 
 
 def _coerce_argument_value(
@@ -141,10 +147,16 @@ def _coerce_argument_value(
     value: Any,
     name_to_tool: dict[str, ChatCompletionToolsParam],
 ) -> Any:
-    arg_type = _get_argument_type(func_name, arg_key, name_to_tool)
-    if arg_type == "string":
+    arg_types = _get_argument_types(func_name, arg_key, name_to_tool)
+    if arg_types == ["string"]:
         return (
             value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        )
+    if "string" in arg_types:
+        if isinstance(value, str):
+            return decoded_if_allowed(value, _parse_arguments(value)[0], arg_types)
+        return decoded_if_allowed(
+            json.dumps(value, ensure_ascii=False), value, arg_types
         )
     if isinstance(value, str):
         parsed_val, _ = _parse_arguments(value)
