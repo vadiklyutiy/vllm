@@ -202,3 +202,19 @@ def test_silu_and_mul_matches_reference(m):
     ref = _silu_and_mul_ref(x)
     assert (out == ref).float().mean() > 0.999
     torch.testing.assert_close(out, ref, rtol=2**-7, atol=1e-6)
+
+
+@pytest.mark.parametrize("tp_size", [4, 8])
+@torch.inference_mode()
+def test_silu_and_mul_tp_sharded_width(tp_size):
+    """The dense MLP's per-rank width under TP (1536, 768) is neither a power
+    of two nor a multiple of 1024."""
+    from vllm.models.flint.ops import norm
+
+    gen = torch.Generator(device="cuda").manual_seed(tp_size)
+    d = 6144 // tp_size
+    x = (torch.randn(7, 2 * d, device="cuda", generator=gen) * 3).bfloat16()
+    out = norm.silu_and_mul(x)
+    ref = _silu_and_mul_ref(x)
+    assert (out == ref).float().mean() > 0.999
+    torch.testing.assert_close(out, ref, rtol=2**-7, atol=1e-6)

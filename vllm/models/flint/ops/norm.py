@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from vllm.triton_utils import tl, tldevice, triton
+from vllm.utils.math_utils import largest_power_of_2_divisor
 
 
 @triton.jit
@@ -105,8 +106,8 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     m, d2 = x.shape
     d = d2 // 2
     assert x.dtype == torch.bfloat16 and x.stride(-1) == 1
-    bd = min(d, 1024)
-    assert d % bd == 0
+    # The kernel has no mask, and tl.arange needs a power of two.
+    bd = min(largest_power_of_2_divisor(d), 1024)
     out = torch.empty(m, d, dtype=x.dtype, device=x.device)
     if m > 0:
         _silu_and_mul_kernel[(m, d // bd)](x, out, x.stride(0), D=d, BD=bd, num_warps=4)
