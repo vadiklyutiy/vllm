@@ -82,6 +82,8 @@ Both return `{"chunk": ..., "stream_state": ...}`. `chunk` is a `ChatCompletionS
 
 Oversized payloads are rejected with a `400` before any `tokenizer.decode()` or parser runs.
 
+`usage.prompt_tokens_details` is passed on from the generate usage, so `cached_tokens` needs `--enable-prompt-tokens-details` on the generate server. The render server doesn't read that flag. Non-streaming `/v1/completions/derender` leaves it out when it merges more than one generate response. With `--reasoning-parser` on the render server, chat derender also reports `usage.completion_tokens_details.reasoning_tokens`, as `/v1/chat/completions` does. A stream with `n > 1` leaves it out of the final usage chunk, because each choice has its own `stream_state`.
+
 ## Parser configuration
 
 The derenderer builds its tool and reasoning parsers from its own server flags plus the `chat_request` sent with each call. It can't see how the request was rendered or served anywhere else, so for its output to match a `vllm serve` server:

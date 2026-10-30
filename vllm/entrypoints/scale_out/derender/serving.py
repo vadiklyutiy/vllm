@@ -172,7 +172,10 @@ class ServingDerender(BaseServing):
             )
 
         try:
-            choices = await self.online_derenderer.derender_chat(
+            (
+                choices,
+                completion_tokens_details,
+            ) = await self.online_derenderer.derender_chat_with_usage(
                 request.generate_response,
                 request.chat_request,
                 request.prompt_token_ids,
@@ -189,6 +192,10 @@ class ServingDerender(BaseServing):
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=(
+                gen.usage.prompt_tokens_details if gen.usage is not None else None
+            ),
+            completion_tokens_details=completion_tokens_details,
         )
 
         model_name = request.model or self.models.model_name()
@@ -268,6 +275,12 @@ class ServingDerender(BaseServing):
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             total_tokens=total_prompt_tokens + total_completion_tokens,
+            # Like metrics, prompt details describe one prompt.
+            prompt_tokens_details=(
+                first.usage.prompt_tokens_details
+                if len(request.generate_responses) == 1 and first.usage is not None
+                else None
+            ),
         )
 
         model_name = request.model or self.models.model_name()

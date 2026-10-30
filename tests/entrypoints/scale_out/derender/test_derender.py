@@ -224,6 +224,45 @@ async def test_derender_chat_usage_default(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "stream"),
+    [
+        ("/v1/chat/completions/derender", False),
+        ("/v1/chat/completions/derender", True),
+        ("/v1/completions/derender", False),
+        ("/v1/completions/derender", True),
+    ],
+)
+async def test_derender_usage_keeps_prompt_tokens_details(client, path, stream):
+    """Only the generate server knows the cached prompt tokens, so derender
+    usage carries its `prompt_tokens_details`. Without a reasoning parser
+    there are no `completion_tokens_details`, as on the coupled endpoints."""
+    gen_req = await _render_chat(client)
+    generate = _make_generate_response(gen_req["token_ids"][:3])
+    generate["usage"] = {
+        "prompt_tokens": 10,
+        "completion_tokens": 3,
+        "total_tokens": 13,
+        "prompt_tokens_details": {"cached_tokens": 8},
+    }
+    body: dict = {"model": MODEL_NAME}
+    if stream:
+        body["stream"] = True
+        body["generate_chunk"] = generate
+    elif path == "/v1/completions/derender":
+        body["generate_responses"] = [generate]
+    else:
+        body["generate_response"] = generate
+
+    response = await client.post(path, json=body)
+
+    assert response.status_code == 200, response.text
+    usage = (response.json()["chunk"] if stream else response.json())["usage"]
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 8
+    assert usage["completion_tokens_details"] is None
+
+
+@pytest.mark.asyncio
 async def test_derender_chat_logprobs(client):
     """Integer token ids are decoded to real strings by derender."""
     gen_req = await _render_chat(client)
@@ -1164,6 +1203,169 @@ async def test_e2e_parsed_reasoning(parser_client, parser_tokenizer):
     assert reasoning_text in msg["reasoning"]
     assert answer_text in msg["content"]
     assert "<think>" not in msg["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_e2e_usage_details(parser_client, parser_tokenizer, stream):
+    """Usage reports `reasoning_tokens` and the generate server's
+    `prompt_tokens_details`, as `/v1/chat/completions` does."""
+    messages = [{"role": "user", "content": "What is 2+3?"}]
+    gen_req = await _e2e_render_chat(parser_client, PARSER_MODEL, messages)
+    prompt_ids = gen_req["token_ids"]
+    output_ids = _require_markers_survive(
+        parser_tokenizer,
+        "<think>2 plus 3 is 5.</think>The answer is 5.",
+        "<think>",
+        "</think>",
+    )
+    think_start = output_ids.index(parser_tokenizer.convert_tokens_to_ids("<think>"))
+    think_end = output_ids.index(parser_tokenizer.convert_tokens_to_ids("</think>"))
+    generate = _e2e_generate_response(output_ids)
+    generate["usage"] = {
+        "prompt_tokens": len(prompt_ids),
+        "completion_tokens": len(output_ids),
+        "total_tokens": len(prompt_ids) + len(output_ids),
+        "prompt_tokens_details": {"cached_tokens": 4},
+    }
+    body: dict = {
+        "model": PARSER_MODEL,
+        "prompt_token_ids": prompt_ids,
+        "chat_request": {"model": PARSER_MODEL, "messages": messages},
+    }
+    if stream:
+        body["stream"] = True
+        body["generate_chunk"] = generate
+    else:
+        body["generate_response"] = generate
+
+    resp = await parser_client.post("/v1/chat/completions/derender", json=body)
+
+    assert resp.status_code == 200, resp.text
+    usage = (resp.json()["chunk"] if stream else resp.json())["usage"]
+    assert usage["completion_tokens_details"] == {
+        "reasoning_tokens": think_end - think_start - 1
+    }
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n", [1, 2])
+async def test_e2e_stream_usage_only_chunk_reasoning_tokens(
+    parser_client, parser_tokenizer, n
+):
+    """The usage only chunk that ends a stream counts every choice, but
+    derender gets the `stream_state` of one. So it reports `reasoning_tokens`
+    for n == 1 and leaves them out for n > 1."""
+    messages = [{"role": "user", "content": "What is 2+3?"}]
+    gen_req = await _e2e_render_chat(parser_client, PARSER_MODEL, messages)
+    prompt_ids = gen_req["token_ids"]
+    output_ids = _require_markers_survive(
+        parser_tokenizer, "<think>2 plus 3 is 5.</think>5.", "<think>", "</think>"
+    )
+    think_start = output_ids.index(parser_tokenizer.convert_tokens_to_ids("<think>"))
+    think_end = output_ids.index(parser_tokenizer.convert_tokens_to_ids("</think>"))
+    body: dict = {
+        "model": PARSER_MODEL,
+        "stream": True,
+        "prompt_token_ids": prompt_ids,
+        "chat_request": {"model": PARSER_MODEL, "messages": messages, "n": n},
+        "generate_chunk": _e2e_generate_response(output_ids),
+    }
+    resp = await parser_client.post("/v1/chat/completions/derender", json=body)
+    assert resp.status_code == 200, resp.text
+
+    body["stream_state"] = resp.json()["stream_state"]
+    body["generate_chunk"] = {
+        "request_id": "chatcmpl-e2e-test",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": n * len(output_ids),
+            "total_tokens": len(prompt_ids) + n * len(output_ids),
+        },
+    }
+    resp = await parser_client.post("/v1/chat/completions/derender", json=body)
+
+    assert resp.status_code == 200, resp.text
+    expected = {"reasoning_tokens": think_end - think_start - 1} if n == 1 else None
+    assert resp.json()["chunk"]["usage"]["completion_tokens_details"] == expected
+
+
+ENGINE_PARSER_MODEL = "Qwen/Qwen3-0.6B"
+
+
+@pytest.fixture(scope="module")
+def engine_parser_server():
+    args = ["--reasoning-parser", "qwen3"]
+    with RemoteLaunchRenderServer(ENGINE_PARSER_MODEL, args) as remote_server:
+        yield remote_server
+
+
+@pytest_asyncio.fixture
+async def engine_parser_client(engine_parser_server):
+    async with httpx.AsyncClient(
+        base_url=engine_parser_server.url_for(""), timeout=60.0
+    ) as http_client:
+        yield http_client
+
+
+@pytest.mark.asyncio
+async def test_e2e_stream_usage_only_chunk_counts_held_back_tokens(
+    engine_parser_client,
+):
+    """Output cut off in reasoning can end in text the parser holds back as a
+    possible marker until the stream finishes. The usage only chunk comes
+    after the last choice chunk, so it counts those tokens, like batch."""
+    tokenizer = get_tokenizer(ENGINE_PARSER_MODEL)
+    messages = [{"role": "user", "content": "Hi"}]
+    gen_req = await _e2e_render_chat(
+        engine_parser_client, ENGINE_PARSER_MODEL, messages
+    )
+    prompt_ids = gen_req["token_ids"]
+    output_ids = _encode(tokenizer, "<think>\nI will call <tool")
+    choice = {"index": 0, "token_ids": output_ids, "finish_reason": "length"}
+    body: dict = {
+        "model": ENGINE_PARSER_MODEL,
+        "prompt_token_ids": prompt_ids,
+        "chat_request": {"model": ENGINE_PARSER_MODEL, "messages": messages},
+    }
+    batch = await engine_parser_client.post(
+        "/v1/chat/completions/derender",
+        json={**body, "generate_response": {"request_id": "r", "choices": [choice]}},
+    )
+    stream = await engine_parser_client.post(
+        "/v1/chat/completions/derender",
+        json={
+            **body,
+            "stream": True,
+            "generate_chunk": {"request_id": "r", "choices": [choice]},
+        },
+    )
+    assert stream.status_code == 200, stream.text
+    usage_only = await engine_parser_client.post(
+        "/v1/chat/completions/derender",
+        json={
+            **body,
+            "stream": True,
+            "stream_state": stream.json()["stream_state"],
+            "generate_chunk": {
+                "request_id": "r",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": len(output_ids),
+                    "total_tokens": len(prompt_ids) + len(output_ids),
+                },
+            },
+        },
+    )
+
+    assert batch.status_code == 200, batch.text
+    assert usage_only.status_code == 200, usage_only.text
+    expected = {"reasoning_tokens": len(output_ids) - 1}
+    assert batch.json()["usage"]["completion_tokens_details"] == expected
+    assert usage_only.json()["chunk"]["usage"]["completion_tokens_details"] == expected
 
 
 @pytest.mark.asyncio
