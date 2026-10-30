@@ -3,10 +3,32 @@
 
 from dataclasses import field
 
+import regex as re
+
 from vllm.config.model import ModelConfig
 from vllm.config.utils import config
 from vllm.reasoning import ReasoningParserManager
-from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
+from vllm.utils.mistral import is_mistral_tokenizer
+
+
+def _encode_reasoning_str(tokenizer: TokenizerLike, text: str) -> list[int]:
+    if not is_mistral_tokenizer(tokenizer):
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    # mistral-common encodes control tokens such as `[THINK]` as plain text,
+    # so split them out and map them to their ids.
+    special_token_ids = dict(
+        zip(tokenizer.all_special_tokens, tokenizer.all_special_ids)
+    )
+    pattern = "|".join(map(re.escape, special_token_ids))
+    token_ids: list[int] = []
+    for piece in re.split(f"({pattern})", text):
+        if piece in special_token_ids:
+            token_ids.append(special_token_ids[piece])
+        elif piece:
+            token_ids += tokenizer.encode(piece, add_special_tokens=False)
+    return token_ids
 
 
 @config
@@ -101,14 +123,14 @@ class ReasoningConfig:
             # If we don't have valid strings to tokenize,
             # we can't initialize the token IDs.
             return
-        self._reasoning_start_token_ids = tokenizer.encode(
-            reasoning_start_str, add_special_tokens=False
+        self._reasoning_start_token_ids = _encode_reasoning_str(
+            tokenizer, reasoning_start_str
         )
-        self._reasoning_end_token_ids = tokenizer.encode(
-            reasoning_end_str, add_special_tokens=False
+        self._reasoning_end_token_ids = _encode_reasoning_str(
+            tokenizer, reasoning_end_str
         )
-        self._natural_reasoning_end_token_ids = tokenizer.encode(
-            natural_reasoning_end_str, add_special_tokens=False
+        self._natural_reasoning_end_token_ids = _encode_reasoning_str(
+            tokenizer, natural_reasoning_end_str
         )
 
         if (
