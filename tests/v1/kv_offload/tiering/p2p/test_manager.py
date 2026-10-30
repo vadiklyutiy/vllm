@@ -780,6 +780,9 @@ class _FakeSession:
     def add_stored_blocks(self, kv_request_id, keys, block_ids, job_id):
         self.stores_added.append((kv_request_id, list(keys), block_ids, job_id))
 
+    def fail_queued_stores(self) -> list[int]:
+        return []
+
     def attach_connection(self, conn):
         self.attached.append(conn)
         self.connected = True
@@ -2665,5 +2668,184 @@ def test_held_promotions_answer_peer_lookups_with_miss(monkeypatch):
         tiering.on_reset_flushed()
         peer_lookup("req-released")
         assert [job.keys for job in promotions] == [[key]]
+    finally:
+        tiering.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Cache reset while stores still wait for a peer's fetch
+# ---------------------------------------------------------------------------
+
+
+def _producer_tiering(server: P2PSecondaryTierManager) -> TieringOffloadingManager:
+    return TieringOffloadingManager(
+        primary_tier=CPUPrimaryTierOffloadingManager(
+            num_chunks=4, mmap_region=_mock_mmap_region(4)
+        ),
+        secondary_tiers=[server],
+        tier_poll_interval_s=0,
+    )
+
+
+def _store(tiering: TieringOffloadingManager, key: OffloadKey, ctx: ReqContext):
+    tiering.on_new_request(ctx)
+    out = tiering.prepare_store([key], ctx)
+    assert out is not None
+    tiering.complete_store(out.keys_to_store, ctx)
+    tiering.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=[]))
+
+
+def test_reset_cache_fails_store_parked_for_decoder():
+    """drain_jobs() must settle a store parked for a decoder that has not
+    fetched yet, or reset_cache() fails its every-job-finished check. The
+    reset invalidates the parked blocks, so the late fetch fails at once."""
+    consumer, server = _build_paired_managers()
+    tiering = _producer_tiering(server)
+    step_end = ScheduleEndContext(new_req_ids=[], preempted_req_ids=[])
+    key = OffloadKey(b"parked")
+    try:
+        _store(
+            tiering,
+            key,
+            ReqContext(
+                req_id="prefill", kv_transfer_params=_remote_decoder_kv_params()
+            ),
+        )
+
+        tiering.reset_cache()
+
+        params = _remote_prefiller_kv_params("B", 2)
+        consumer.on_new_request(_req_context(params))
+        consumer.submit_load(_job_metadata(job_id=101, keys=[key], kv_params=params))
+        results: list[JobResult] = []
+        for _ in range(8):
+            results.extend(consumer.get_finished_jobs())
+            tiering.on_schedule_end(step_end)
+        assert JobResult(job_id=101, success=False) in results
+    finally:
+        tiering.shutdown()
+
+
+def test_reset_cache_fails_store_pinned_for_peer_lookup():
+    """drain_jobs() must also settle a store queued in a session: blocks a
+    peer's lookup pinned that the peer has not fetched yet. The peer's fetch
+    then fails instead of reading the reset primary slot."""
+    consumer, server = _build_paired_managers()
+    tiering = _producer_tiering(server)
+    step_end = ScheduleEndContext(new_req_ids=[], preempted_req_ids=[])
+    key = OffloadKey(b"pinned")
+    try:
+        _store(tiering, key, ReqContext(req_id="local"))
+        params = _remote_kv_source_kv_params("B", 2)
+        ctx = _req_context(params)
+        consumer.on_new_request(ctx)
+        for _ in range(3):
+            list(consumer.get_finished_jobs())
+            tiering.on_schedule_end(step_end)
+        assert consumer.lookup(key, ctx) is LookupResult.RETRY
+        consumer.on_schedule_end(step_end)
+        tiering.on_schedule_end(step_end)
+        list(consumer.get_finished_jobs())
+        assert consumer.lookup(key, ctx) is LookupResult.HIT
+
+        tiering.reset_cache()
+
+        consumer.submit_load(_job_metadata(job_id=101, keys=[key], kv_params=params))
+        results: list[JobResult] = []
+        for _ in range(4):
+            results.extend(consumer.get_finished_jobs())
+            tiering.on_schedule_end(step_end)
+        assert JobResult(job_id=101, success=False) in results
+    finally:
+        tiering.shutdown()
+
+
+def test_reset_cache_serves_fetch_already_received():
+    """A decoder's fetch that reached the producer before the reset, but was
+    not polled yet, is still served rather than failed with the parked store."""
+    consumer, server = _build_paired_managers()
+    tiering = _producer_tiering(server)
+    step_end = ScheduleEndContext(new_req_ids=[], preempted_req_ids=[])
+    key = OffloadKey(b"fetched")
+    try:
+        _store(
+            tiering,
+            key,
+            ReqContext(
+                req_id="prefill", kv_transfer_params=_remote_decoder_kv_params()
+            ),
+        )
+        params = _remote_prefiller_kv_params("B", 2)
+        consumer.on_new_request(_req_context(params))
+        for _ in range(3):
+            list(consumer.get_finished_jobs())
+            tiering.on_schedule_end(step_end)
+        consumer.submit_load(_job_metadata(job_id=101, keys=[key], kv_params=params))
+
+        tiering.reset_cache()
+
+        results: list[JobResult] = []
+        for _ in range(4):
+            results.extend(consumer.get_finished_jobs())
+            tiering.on_schedule_end(step_end)
+        assert JobResult(job_id=101, success=True) in results
+    finally:
+        tiering.shutdown()
+
+
+def test_reset_cache_serves_fetch_received_during_drain(monkeypatch):
+    """A decoder's fetch that reaches the producer while drain_jobs() waits
+    for another transfer is served, not failed with the parked store."""
+    consumer, server = _build_paired_managers()
+    tiering = _producer_tiering(server)
+    step_end = ScheduleEndContext(new_req_ids=[], preempted_req_ids=[])
+    keys = {kv_id: OffloadKey(kv_id.encode()) for kv_id in ("Y", "X")}
+    params = {kv_id: _remote_prefiller_kv_params("B", 2, kv_id) for kv_id in keys}
+    try:
+        for kv_id, key in keys.items():
+            _store(
+                tiering,
+                key,
+                ReqContext(
+                    req_id=kv_id, kv_transfer_params=_remote_decoder_kv_params(kv_id)
+                ),
+            )
+            consumer.on_new_request(_req_context(params[kv_id]))
+        for _ in range(3):
+            list(consumer.get_finished_jobs())
+            tiering.on_schedule_end(step_end)
+        consumer.submit_load(
+            _job_metadata(job_id=100, keys=[keys["Y"]], kv_params=params["Y"])
+        )
+        tiering.on_schedule_end(step_end)
+        # Y's transfer stays in flight until drain_jobs() first waits; the
+        # decoder's fetch for X arrives then.
+        data = server._data
+        assert isinstance(data, _FakeData)
+        held = list(data._inflight_done)
+        assert held
+        data._inflight_done.clear()
+
+        def fetch_x(_s):
+            if held:
+                consumer.submit_load(
+                    _job_metadata(job_id=101, keys=[keys["X"]], kv_params=params["X"])
+                )
+                data._inflight_done.extend(held)
+                held.clear()
+
+        monkeypatch.setattr(
+            manager_module,
+            "time",
+            SimpleNamespace(monotonic=time.monotonic, sleep=fetch_x),
+        )
+        tiering.reset_cache()
+
+        results: list[JobResult] = []
+        for _ in range(4):
+            results.extend(consumer.get_finished_jobs())
+            tiering.on_schedule_end(step_end)
+        assert JobResult(job_id=100, success=True) in results
+        assert JobResult(job_id=101, success=True) in results
     finally:
         tiering.shutdown()

@@ -386,7 +386,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # kv_request_id → list of batches submit_store'd before any peer
         # asked for that id. Drained into a session by _on_session_fetch
         # when the corresponding FetchMsg arrives, or surfaced as failures
-        # by _reap_unbound_stores after _unbound_store_timeout_s.
+        # by _reap_unbound_stores after _unbound_store_timeout_s or by
+        # drain_jobs.
         self._unbound_stores: dict[str, list[_UnboundStoreBatch]] = {}
         # kv_request_id → time its parked batches were reaped. Nothing under
         # one of these ids can be served any more, so a FetchMsg for it is
@@ -486,8 +487,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         because peer_id is no longer carried on store-time
         kv_transfer_params; if a session has bound the id, finish it. If
         no session has bound the id yet, this is a no-op: parked batches
-        in `_unbound_stores` are left in place and cleaned up only by
-        `_reap_unbound_stores` after `_unbound_store_timeout_s`.
+        in `_unbound_stores` are left in place and cleaned up by
+        `_reap_unbound_stores` after `_unbound_store_timeout_s`, or by
+        `drain_jobs`.
         """
         source = req_context.get_state(P2PSourceInfo)
         dest = req_context.get_state(P2PDestInfo)
@@ -675,6 +677,12 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         memoryview to be quiescent, not aborted. Results
         accumulate in ``_finished_jobs`` and are surfaced by the next
         ``get_finished_jobs()`` call.
+
+        Then fails the store jobs still waiting for a fetch — parked in
+        ``_unbound_stores`` or queued in a session but in no transfer yet: a
+        peer may never fetch them, and the caller resets the primary slots
+        they pin. Parked ids are reaped as by ``_reap_unbound_stores``, so a
+        late fetch for one is rejected at once.
         """
         start = time.monotonic()
         warned = False
@@ -684,7 +692,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 s.has_pending_work for s in self._sessions.values()
             )
             if not pending:
-                return
+                break
             if not warned and time.monotonic() - start > 5.0:
                 logger.warning(
                     "P2PSecondaryTierManager.drain_jobs: still draining "
@@ -692,6 +700,12 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 )
                 warned = True
             time.sleep(_DRAIN_SLEEP_S)
+        now = time.monotonic()
+        for kv_request_id in list(self._unbound_stores):
+            self._reap_unbound(kv_request_id, now)
+        for session in self._sessions.values():
+            for job_id in session.fail_queued_stores():
+                self._finished_jobs.append(JobResult(job_id=job_id, success=False))
 
     @override
     def serve_external_requests(self, parent: ParentManager) -> None:
@@ -1027,20 +1041,24 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         if expired is None:
             return
         for kid in expired:
-            batches = self._unbound_stores.pop(kid)
-            self._reaped_stores[kid] = now
-            for batch in batches:
-                self._finished_jobs.append(
-                    JobResult(job_id=batch.job_id, success=False)
-                )
+            num_failed = self._reap_unbound(kid, now)
             logger.warning(
                 "P2P %s: unbound store kv_request_id=%s timed out after %.0fs "
                 "without a fetch — failing %d job(s)",
                 self._local_id,
                 kid,
                 self._unbound_store_timeout_s,
-                len(batches),
+                num_failed,
             )
+
+    def _reap_unbound(self, kv_request_id: str, now: float) -> int:
+        """Fail the batches parked under *kv_request_id* and record the id
+        in `_reaped_stores`. Returns the number of failed batches."""
+        batches = self._unbound_stores.pop(kv_request_id)
+        self._reaped_stores[kv_request_id] = now
+        for batch in batches:
+            self._finished_jobs.append(JobResult(job_id=batch.job_id, success=False))
+        return len(batches)
 
     def _reap_idle_sessions(self) -> None:
         """Evict idle sessions when remaining peer slots are scarce.

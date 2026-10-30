@@ -899,6 +899,20 @@ class ServerRole:
         self._finished_lookup_ctxs.clear()
         return failed_stores, failed_serves, retained
 
+    def fail_queued_stores(self) -> list[int]:
+        """Fail every store job that no inflight transfer reads.
+
+        Returns the failed job_ids. Their blocks are withdrawn as for a
+        timed-out job; jobs an inflight transfer reads settle when it is
+        terminal.
+        """
+        reading = self._read_job_ids()
+        failed = [jid for jid in self._store_jobs if jid not in reading]
+        for jid in failed:
+            del self._store_jobs[jid]
+        self._withdraw_store_jobs(set(failed))
+        return failed
+
     @property
     def has_inflight_transfers(self) -> bool:
         """True if any outbound store transfer is still in flight."""
@@ -1285,17 +1299,22 @@ class ServerRole:
                 continue
             results.append(StoreResult(job_id=jid, success=False))
             logger.warning("P2PSession %s: store job %d timed out", self._peer_id, jid)
-        # A failed store job's primary slots are unpinned by the engine, so its
-        # blocks must no longer be offered to a fetch. A symmetric round then
-        # fails fast in on_fetch instead of reading a slot that may be reused.
-        expired = set(timed_out)
+        self._withdraw_store_jobs(set(timed_out))
+        return results
+
+    def _withdraw_store_jobs(self, job_ids: set[int]) -> None:
+        """Stop offering failed store jobs' blocks to a fetch.
+
+        A failed store job's primary slots are unpinned by the engine. A
+        symmetric round then fails fast in on_fetch instead of reading a
+        slot that may be reused.
+        """
         for st in self._requests.values():
             for rnd in st.outbound.values():
-                if rnd.pending_job_ids & expired:
-                    rnd.pending_job_ids -= expired
+                if rnd.pending_job_ids & job_ids:
+                    rnd.pending_job_ids -= job_ids
                     rnd.available = {
                         key: entry
                         for key, entry in rnd.available.items()
-                        if entry[0] not in expired
+                        if entry[0] not in job_ids
                     }
-        return results
