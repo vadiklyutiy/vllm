@@ -615,6 +615,42 @@ def test_string_parameter_schema_preserves_raw_text(value, request_kind, parser_
         assert json.loads(arguments) == expected
 
 
+_OPTIONAL_STR = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+
+
+@pytest.mark.parametrize(
+    ("schema", "value", "expected"),
+    [
+        ({"type": ["string", "null"]}, "10001", "10001"),
+        (_OPTIONAL_STR, "10001", "10001"),
+        (_OPTIONAL_STR, "null", None),
+        (_OPTIONAL_STR, "Null", "Null"),
+        ({"type": "string", "anyOf": [{"pattern": "^\\d{5}$"}]}, "10001", "10001"),
+        ({"oneOf": [{"type": "null"}, {"enum": ["1", "2"]}]}, "1", "1"),
+        ({}, "10001", 10001),
+        ({"anyOf": [{"$ref": "#/$defs/Zip"}, {"type": "null"}]}, '{"x":1}', {"x": 1}),
+        pytest.param({"type": "string"}, "[" * 20000, "[" * 20000, id="deep"),
+    ],
+)
+def test_string_schema_spellings_preserve_raw_text(schema, value, expected):
+    """Optional[str] keeps raw text like str; untyped schemas stay JSON-decoded."""
+    function = {
+        "name": "lookup",
+        "parameters": {"type": "object", "properties": {"zip": schema}},
+    }
+    request = ChatCompletionRequest(
+        model="test", messages=[], tools=[{"type": "function", "function": function}]
+    )
+    raw = (
+        'to=lookup.lookup<|message|><atem:function_calls><atem:invoke name="lookup">'
+        f'<atem:parameter name="zip">{value}</atem:parameter>'
+        "</atem:invoke></atem:function_calls><|eot|>"
+    )
+    calls = T.extract_tool_calls(raw, request).tool_calls
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"zip": expected}
+
+
 # --------------------------------------------------- reasoning token counting
 
 _SPECIALS = ["<|message|>", "<|start|>", "<|eom|>", "<|eot|>"]

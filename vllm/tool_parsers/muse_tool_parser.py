@@ -62,6 +62,7 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
+from vllm.tool_parsers.utils import extract_types_from_schema
 
 logger = init_logger(__name__)
 
@@ -203,6 +204,8 @@ class MuseToolParser(ToolParser):
         self._streamed_content_len: int = 0
         self._streamed_reasoning_len: int = 0
         self._emitted_tool_calls: int = 0
+        self._strings_request: object = None
+        self._strings: dict[str, dict[str, list[str]]] = {}
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -317,10 +320,10 @@ class MuseToolParser(ToolParser):
     @classmethod
     def _string_parameters(
         cls, request: ChatCompletionRequest | ResponsesRequest | None
-    ) -> dict[str, set[str]]:
+    ) -> dict[str, dict[str, list[str]]]:
         if not cls._preserve_string_parameters:
             return {}
-        strings: dict[str, set[str]] = {}
+        strings: dict[str, dict[str, list[str]]] = {}
         for tool in getattr(request, "tools", None) or []:
             function = getattr(tool, "function", None) or tool
             if isinstance(function, dict):
@@ -330,10 +333,21 @@ class MuseToolParser(ToolParser):
                 name = getattr(function, "name", None)
                 parameters = getattr(function, "parameters", None)
             if name and isinstance(parameters, dict):
-                strings[name] = {
-                    key
+                # A top-level type bounds its anyOf/oneOf/allOf branches. A
+                # schema without type information admits any value, so it
+                # keeps JSON decoding instead of counting as a string.
+                types = {
+                    key: extract_types_from_schema(
+                        {"type": schema["type"]} if "type" in schema else schema,
+                        untyped="any",
+                    )
                     for key, schema in parameters.get("properties", {}).items()
-                    if isinstance(schema, dict) and schema.get("type") == "string"
+                    if isinstance(schema, dict)
+                }
+                strings[name] = {
+                    key: key_types
+                    for key, key_types in types.items()
+                    if set(key_types) - {"null"} == {"string"}
                 }
         return strings
 
@@ -369,7 +383,7 @@ class MuseToolParser(ToolParser):
         cls,
         text: str,
         registered: set[str] | None = None,
-        strings: dict[str, set[str]] | None = None,
+        strings: dict[str, dict[str, list[str]]] | None = None,
     ) -> list[ToolCall]:
         registered = registered or set()
         scoped = cls._tool_channel_text(text)
@@ -379,11 +393,17 @@ class MuseToolParser(ToolParser):
             if not name_m:
                 continue
             name = cls._normalize_name(name_m.group(1), registered)
-            string_parameters = (strings or {}).get(name, set())
+            string_parameters = (strings or {}).get(name, {})
             args: dict = {}
             for pm in _PARAM_RE.finditer(invoke):
                 key, raw = pm.group("key"), pm.group("value")
-                args[key] = raw if key in string_parameters else _decode_value(raw)
+                types = string_parameters.get(key)
+                if types is None:
+                    args[key] = _decode_value(raw)
+                elif "null" in types and _decode_value(raw) is None:
+                    args[key] = None
+                else:
+                    args[key] = raw
             tool_calls.append(
                 ToolCall(
                     function=FunctionCall(
@@ -487,9 +507,10 @@ class MuseToolParser(ToolParser):
 
         try:
             registered = self._registered_names(request)
-            calls = self._parse_tool_calls(
-                current_text, registered, self._string_parameters(request)
-            )
+            if request is not self._strings_request:
+                self._strings_request = request
+                self._strings = self._string_parameters(request)
+            calls = self._parse_tool_calls(current_text, registered, self._strings)
             content, reasoning, content_open, reasoning_open = self._visible_channels(
                 current_text
             )
