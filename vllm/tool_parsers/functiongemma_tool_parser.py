@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import json
 from collections.abc import Sequence
+from typing import Any
 
 import regex as re
 
@@ -36,6 +38,7 @@ class FunctionGemmaToolParser(ToolParser):
     # FunctionGemma tokens
     tool_call_start_token: str = "<start_function_call>"
     tool_call_end_token: str = "<end_function_call>"
+    escape_token: str = "<escape>"
 
     # Regex patterns
     tool_call_regex: re.Pattern = re.compile(
@@ -43,10 +46,7 @@ class FunctionGemmaToolParser(ToolParser):
         r"|<start_function_call>call:(\w+)\{(.*)",
         re.DOTALL,
     )
-    arg_regex: re.Pattern = re.compile(
-        r"(\w+):<escape>(.*?)<escape>",
-        re.DOTALL,
-    )
+    bare_value_regex: re.Pattern = re.compile(r"[^,}\]]+")
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
@@ -58,20 +58,79 @@ class FunctionGemmaToolParser(ToolParser):
         self.streamed_args_for_tool: list[str] = []
         self.buffered_delta_text = ""
 
-    def _parse_arguments(self, args_str: str) -> dict:
-        """Parse FunctionGemma argument string into a dictionary."""
-        arguments: dict = {}
-        if not args_str:
-            return arguments
+    def _parse_value(
+        self, text: str, pos: int, partial: bool = False
+    ) -> tuple[Any, int] | None:
+        """Parse the value at ``pos`` as the chat template's ``format_argument``
+        writes it: strings in ``<escape>``, bare numbers, booleans and ``None``,
+        ``{key:value,...}`` objects and ``[value,...]`` arrays.
 
-        matches = self.arg_regex.findall(args_str)
-        for key, value in matches:
-            try:
-                parsed_value = json.loads(value)
-                arguments[key] = parsed_value
-            except json.JSONDecodeError:
-                arguments[key] = value
+        Returns the value and the position after it, or None if ``text`` ends
+        before the value does. With ``partial``, a bare value that reaches the
+        end of ``text`` may still grow, so it is not finished either.
+        """
+        if text.startswith(self.escape_token, pos):
+            start = pos + len(self.escape_token)
+            end = text.find(self.escape_token, start)
+            if end == -1:
+                return None
+            return text[start:end], end + len(self.escape_token)
 
+        if text.startswith("{", pos):
+            obj, pos = self._parse_fields(text, pos + 1)
+            if not text.startswith("}", pos):
+                return None
+            return obj, pos + 1
+
+        if text.startswith("[", pos):
+            items: list = []
+            pos += 1
+            while not text.startswith("]", pos):
+                parsed = self._parse_value(text, pos)
+                if parsed is None:
+                    return None
+                value, pos = parsed
+                items.append(value)
+                if text.startswith(",", pos):
+                    pos += 1
+            return items, pos + 1
+
+        match = self.bare_value_regex.match(text, pos)
+        if match is None or (partial and match.end() == len(text)):
+            return None
+        if match.group() == "None":
+            return None, match.end()
+        try:
+            return json.loads(match.group()), match.end()
+        except json.JSONDecodeError:
+            return match.group(), match.end()
+
+    def _parse_fields(
+        self, text: str, pos: int, partial: bool = False
+    ) -> tuple[dict, int]:
+        """Parse ``key:value,...`` from ``pos`` up to a ``}`` or a value that
+        is not finished. Returns the fields and the position where it stopped.
+        """
+        fields: dict = {}
+        while not text.startswith("}", pos) and (colon := text.find(":", pos)) != -1:
+            parsed = self._parse_value(text, colon + 1, partial)
+            if parsed is None:
+                break
+            value, end = parsed
+            fields[text[pos:colon].strip()] = value
+            pos = end + 1 if text.startswith(",", end) else end
+        return fields, pos
+
+    def _parse_arguments(self, args_str: str, partial: bool = False) -> dict:
+        """Parse FunctionGemma argument string into a dictionary.
+
+        With ``partial``, ``args_str`` is a streamed prefix.
+        """
+        arguments, _ = self._parse_fields(args_str, 0, partial)
+        for key, value in arguments.items():
+            if isinstance(value, str):
+                with contextlib.suppress(json.JSONDecodeError):
+                    arguments[key] = json.loads(value)
         return arguments
 
     def adjust_request(
@@ -235,7 +294,9 @@ class FunctionGemmaToolParser(ToolParser):
                             )
 
                         if self.current_tool_name_sent and args_part:
-                            current_args = self._parse_arguments(args_part)
+                            current_args = self._parse_arguments(
+                                args_part, partial=True
+                            )
                             if current_args:
                                 current_args_json = json.dumps(
                                     current_args, ensure_ascii=False

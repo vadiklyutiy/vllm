@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
+import regex as re
 
+from tests.tool_parsers.utils import run_tool_extraction_streaming
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.tool_parsers.functiongemma_tool_parser import FunctionGemmaToolParser
 
@@ -93,6 +96,75 @@ class TestExtractToolCalls:
         assert result.tool_calls[0].function.name == "get_weather"
         assert result.tool_calls[1].function.name == "get_time"
 
+    def test_non_string_arguments(self, parser, mock_request):
+        """The chat template wraps only strings in <escape>; numbers, booleans,
+        arrays and objects are written bare and must not be dropped."""
+        model_output = (
+            "<start_function_call>call:set_alarm{"
+            "days:[<escape>mon<escape>,<escape>tue<escape>],enabled:true,hour:7,"
+            "label:<escape>Wake up<escape>,snooze:{minutes:5}}"
+            "<end_function_call>"
+        )
+        result = parser.extract_tool_calls(model_output, mock_request)
+
+        assert result.tools_called is True
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "days": ["mon", "tue"],
+            "enabled": True,
+            "hour": 7,
+            "label": "Wake up",
+            "snooze": {"minutes": 5},
+        }
+
+
+def _char_deltas(model_output: str) -> list[str]:
+    """One character per delta, with special tokens whole."""
+    return [
+        piece
+        for part in re.split(r"(<[a-z_]+>)", model_output)
+        for piece in ([part] if part.startswith("<") else part)
+    ]
+
+
+class TestExtractToolCallsStreaming:
+    @pytest.mark.parametrize(
+        ("args_str", "expected"),
+        [
+            ("hour:72", {"hour": 72}),
+            ("enabled:true", {"enabled": True}),
+            (
+                "days:[<escape>mon<escape>,<escape>tue<escape>]",
+                {"days": ["mon", "tue"]},
+            ),
+            ("snooze:{minutes:5}", {"snooze": {"minutes": 5}}),
+        ],
+    )
+    def test_non_string_argument(self, parser, mock_request, args_str, expected):
+        """Bare values are streamed, and only once complete: ``72`` arrives
+        over two deltas and must not be sent as ``7``."""
+        model_output = (
+            f"<start_function_call>call:set_alarm{{{args_str}}}<end_function_call>"
+        )
+        reconstructor = run_tool_extraction_streaming(
+            parser, _char_deltas(model_output), mock_request
+        )
+
+        assert json.loads(reconstructor.tool_calls[0].function.arguments) == expected
+
+    def test_closed_value_sent_when_stream_stops(self, parser, mock_request):
+        """A closed string cannot grow, so it is sent without waiting for more
+        text, e.g. when the stream stops at ``max_tokens``."""
+        model_output = (
+            "<start_function_call>call:get_weather{location:<escape>London<escape>"
+        )
+        reconstructor = run_tool_extraction_streaming(
+            parser, _char_deltas(model_output), mock_request
+        )
+
+        assert json.loads(reconstructor.tool_calls[0].function.arguments) == {
+            "location": "London"
+        }
+
 
 class TestParseArguments:
     def test_empty_arguments(self, parser):
@@ -119,6 +191,16 @@ class TestParseArguments:
     def test_argument_with_spaces(self, parser):
         result = parser._parse_arguments("message:<escape>Hello World<escape>")
         assert result == {"message": "Hello World"}
+
+    def test_none_argument(self, parser):
+        """The chat template writes Python ``None`` as bare ``None``."""
+        result = parser._parse_arguments("x:None,y:[None,1]")
+        assert result == {"x": None, "y": [None, 1]}
+
+    def test_whitespace_before_key(self, parser):
+        args_str = "city:<escape>Tokyo<escape>,\nplace:{ country:<escape>Japan<escape>}"
+        result = parser._parse_arguments(args_str)
+        assert result == {"city": "Tokyo", "place": {"country": "Japan"}}
 
 
 class TestAdjustRequest:
