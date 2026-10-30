@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionMetadataBuilder,
     physical_to_logical_mapping,
 )
+from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, FullAttentionSpec
 
 from ..models.utils import check_embeddings_close, check_logprobs_close
 
@@ -243,6 +244,57 @@ def test_flex_attention_vs_default_backend(vllm_runner):
     not torch.cuda.is_available() or TORCH_VERSION < MINIMUM_TORCH_VERSION,
     reason="CUDA not available or PyTorch version < 2.7",
 )
+def test_flex_attention_kv_cache_groups_vs_default_backend(vllm_runner):
+    """FlexAttention matches the default backend with several KV cache groups.
+
+    Gemma 3's sliding and full layers form separate KV cache groups. With
+    flex_attn_kv_block_size != block_size every group builds its block mask
+    with create_block_mask, and one group's build must not break another's.
+    """
+    model_name = "google/gemma-3-1b-it"
+    max_tokens = 24
+    num_logprobs = 5
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+    ]
+
+    with vllm_runner(
+        model_name,
+        runner="generate",
+        max_model_len=256,
+        num_gpu_blocks_override=128,
+        enforce_eager=True,
+        attention_config={"backend": "FLEX_ATTENTION", "flex_attn_kv_block_size": 32},
+    ) as llm_flex:
+        output_flex = llm_flex.generate_greedy_logprobs(
+            prompts, max_tokens, num_logprobs
+        )
+
+    with vllm_runner(
+        model_name,
+        runner="generate",
+        max_model_len=256,
+        num_gpu_blocks_override=128,
+        enforce_eager=True,
+    ) as llm_default:
+        output_default = llm_default.generate_greedy_logprobs(
+            prompts, max_tokens, num_logprobs
+        )
+
+    check_logprobs_close(
+        outputs_0_lst=output_flex,
+        outputs_1_lst=output_default,
+        name_0="flex",
+        name_1="default",
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or TORCH_VERSION < MINIMUM_TORCH_VERSION,
+    reason="CUDA not available or PyTorch version < 2.7",
+)
 def test_encoder_flex_attention_vs_default_backend(vllm_runner):
     """Test that FlexAttention produces the same outputs as the default backend.
 
@@ -288,6 +340,51 @@ def test_encoder_flex_attention_vs_default_backend(vllm_runner):
         name_1="default",
         tol=1e-2,
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or TORCH_VERSION < MINIMUM_TORCH_VERSION,
+    reason="CUDA not available or PyTorch version < 2.7",
+)
+@pytest.mark.parametrize(
+    ("kv_cache_spec_cls", "flex_attn_kv_block_size"),
+    [(EncoderOnlyAttentionSpec, None), (FullAttentionSpec, 32)],
+)
+@torch.inference_mode()
+def test_block_mask_survives_other_group_build(
+    kv_cache_spec_cls, flex_attn_kv_block_size
+):
+    """A group's block mask stays valid after another group builds its own.
+
+    Layers with different head sizes (e.g. EmbeddingGemma 2 sliding and full
+    layers) get separate builders, and each group's block mask is used for the
+    whole forward pass. Both cases build masks with create_block_mask.
+    """
+    device = torch.device("cuda")
+    vllm_config = create_vllm_config(max_model_len=256)
+    vllm_config.attention_config.flex_attn_kv_block_size = flex_attn_kv_block_size
+    builders = [
+        FlexAttentionMetadataBuilder(
+            kv_cache_spec_cls(
+                block_size=16, num_kv_heads=1, head_size=head_size, dtype=torch.float32
+            ),
+            [],
+            vllm_config,
+            device,
+        )
+        for head_size in (64, 128)
+    ]
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 60], query_lens=[100, 60]), 16, device
+    )
+
+    first = builders[0].build(0, common_attn_metadata)
+    assert not first.direct_build
+    assert first.block_mask is not None
+    expected = first.block_mask.to_dense()
+    builders[1].build(0, common_attn_metadata)
+
+    assert torch.equal(first.block_mask.to_dense(), expected)
 
 
 @pytest.mark.skipif(

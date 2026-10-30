@@ -52,9 +52,9 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 torch._dynamo.config.recompile_limit = 16
-create_block_mask_compiled = torch.compile(
-    create_block_mask, fullgraph=True, mode="reduce-overhead"
-)
+# No "reduce-overhead": CUDA graph tree outputs die on the next call, but each
+# attention group keeps its BlockMask alive for the whole forward pass.
+create_block_mask_compiled = torch.compile(create_block_mask, fullgraph=True)
 flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
 
 
