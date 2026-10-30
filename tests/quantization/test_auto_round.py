@@ -553,6 +553,114 @@ def test_inc_config_parser_fused_module_requires_consistent_configs() -> None:
         config.config_parser.resolve(DummyLayer(), "layers.0.self_attn.qkv_proj")
 
 
+FP8_BLOCK_LAYER_CONFIG = {
+    "bits": 8,
+    "group_size": [128, 128],
+    "data_type": "fp",
+    "packing_format": "auto_round:fp8",
+}
+INT_LAYER_CONFIG_LIKE_FP8_BLOCK = {"bits": 8, "group_size": [128, 128]}
+
+
+def test_inc_config_parser_per_layer_overrides_scheme_fields() -> None:
+    """Mixed AutoRound checkpoints set data_type, packing_format and backend
+    per layer; they must override the model-wide values."""
+    config = make_config(
+        extra_config={
+            "layers.0.self_attn.q_proj": FP8_BLOCK_LAYER_CONFIG,
+            "layers.0.mlp.down_proj": {
+                "bits": 4,
+                "packing_format": "auto_round:auto_awq",
+                "backend": "awq:marlin",
+            },
+        }
+    )
+
+    fp8_config = config.config_parser.resolve(DummyLayer(), "layers.0.self_attn.q_proj")
+    awq_config = config.config_parser.resolve(DummyLayer(), "layers.0.mlp.down_proj")
+
+    assert fp8_config.is_fp8_block is True
+    assert isinstance(resolve_scheme(fp8_config), INCFp8Scheme)
+    assert awq_config.backend == "awq:marlin"
+    assert awq_config.is_awq is True
+    assert awq_config.is_gptq is False
+
+
+def test_inc_config_parser_regex_overrides_scheme_fields() -> None:
+    config = make_config(
+        extra_config={r"layers\.\d+\.self_attn\.q_proj": FP8_BLOCK_LAYER_CONFIG}
+    )
+
+    layer_config = config.config_parser.resolve(
+        DummyLayer(), "layers.3.self_attn.q_proj"
+    )
+
+    assert layer_config.is_fp8_block is True
+
+
+def test_inc_config_parser_fused_module_requires_consistent_data_type() -> None:
+    """Sub-layers that differ only in data_type/packing_format must not be
+    fused under one scheme."""
+    config = make_config(
+        extra_config={
+            "layers.0.self_attn.q_proj": FP8_BLOCK_LAYER_CONFIG,
+            "layers.0.self_attn.k_proj": FP8_BLOCK_LAYER_CONFIG,
+            "layers.0.self_attn.v_proj": INT_LAYER_CONFIG_LIKE_FP8_BLOCK,
+        }
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+    with pytest.raises(ValueError, match="requires consistent quant config"):
+        config.config_parser.resolve(DummyLayer(), "layers.0.self_attn.qkv_proj")
+
+
+def test_inc_config_parser_fused_moe_requires_consistent_data_type() -> None:
+    config = make_config(
+        extra_config={
+            "layers.0.block_sparse_moe.experts.0.w1": FP8_BLOCK_LAYER_CONFIG,
+            "layers.0.block_sparse_moe.experts.0.w2": INT_LAYER_CONFIG_LIKE_FP8_BLOCK,
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires consistent quant config"):
+        config.config_parser.resolve(DummyFusedMoE(), "layers.0.block_sparse_moe")
+
+
+def test_inc_config_parser_fused_module_ignores_unquantized_data_type() -> None:
+    """AutoRound labels unquantized layers "float", "fp" or not at all."""
+    config = make_config(
+        extra_config={
+            "layers.0.self_attn.q_proj": {"bits": 16, "data_type": "float"},
+            "layers.0.self_attn.k_proj": {"bits": 16, "data_type": "fp"},
+            "layers.0.self_attn.v_proj": {"bits": 16},
+        }
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+    layer_config = config.config_parser.resolve(
+        DummyLayer(), "layers.0.self_attn.qkv_proj"
+    )
+
+    assert layer_config.quantized is False
+
+
+def test_inc_config_parser_fused_module_accepts_mxfp_spellings() -> None:
+    """A per-layer "mx_fp4" and the model-wide "mx_fp" are one MXFP4 scheme."""
+    config = make_config(
+        group_size=32,
+        data_type="mx_fp",
+        packing_format="auto_round:llm_compressor",
+        extra_config={"layers.0.self_attn.q_proj": {"bits": 4, "data_type": "mx_fp4"}},
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+    layer_config = config.config_parser.resolve(
+        DummyLayer(), "layers.0.self_attn.qkv_proj"
+    )
+
+    assert layer_config.is_mxfp4 is True
+
+
 def test_inc_mxfp8() -> None:
     config = make_config(
         weight_bits=8,

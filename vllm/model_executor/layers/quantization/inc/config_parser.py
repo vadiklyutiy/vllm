@@ -61,27 +61,13 @@ class INCConfigParser:
     def __init__(self, config: "INCConfig") -> None:
         self._config = config
 
-    def resolve(self, layer: "torch.nn.Module", layer_name: str) -> INCLayerConfig:
-        bits, group_size, sym = self._resolve_raw(layer, layer_name)
-        return INCLayerConfig(
-            bits=bits,
-            group_size=group_size,
-            sym=sym,
-            packing_format=self._config.packing_format,
-            backend=self._config.backend,
-            data_type=self._config.data_type,
-            quantized=bits < 16,
-        )
-
     def get_layer_config(
         self, layer: "torch.nn.Module", layer_name: str
     ) -> tuple[int, int | tuple[int, int], bool]:
         layer_config = self.resolve(layer, layer_name)
         return layer_config.bits, layer_config.group_size, layer_config.sym
 
-    def _resolve_raw(
-        self, layer: "torch.nn.Module", layer_name: str
-    ) -> tuple[int, int | tuple[int, int], bool]:
+    def resolve(self, layer: "torch.nn.Module", layer_name: str) -> INCLayerConfig:
         REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
 
         def is_explicitly_configured(name: str) -> bool:
@@ -103,28 +89,36 @@ class INCConfigParser:
                     continue
             return False
 
-        def get_config(
-            name: str, quantized: bool = True
-        ) -> tuple[int, int | tuple[int, int], bool]:
+        def layer_config_from(cfg: dict, quantized: bool) -> INCLayerConfig:
+            bits = cfg.get("bits", self._config.weight_bits if quantized else 16)
+            # Unquantized layers are labelled "float", "fp" or not at all; keep
+            # the model-wide scheme fields so fused checks ignore the label.
+            scheme_cfg = cfg if bits < 16 else {}
+            data_type = self._config._normalize_data_type(
+                scheme_cfg.get("data_type", self._config.data_type)
+            )
+            return INCLayerConfig(
+                bits=bits,
+                group_size=self._normalize_group_size(
+                    cfg.get("group_size", self._config.group_size if quantized else -1)
+                ),
+                sym=cfg.get("sym", self._config.sym if quantized else True),
+                packing_format=scheme_cfg.get(
+                    "packing_format", self._config.packing_format
+                ),
+                backend=scheme_cfg.get("backend", self._config.backend),
+                # Schemes pick MXFP4 or MXFP8 by the "mx_fp" family and bits,
+                # so fused checks must not compare the spelling.
+                data_type="mx_fp" if "mx_fp" in data_type else data_type,
+                quantized=bits < 16,
+            )
+
+        def get_config(name: str, quantized: bool = True) -> INCLayerConfig:
             if not self._config.extra_config:
-                return (
-                    self._config.weight_bits if quantized else 16,
-                    self._config.group_size if quantized else -1,
-                    self._config.sym if quantized else True,
-                )
+                return layer_config_from({}, quantized)
 
             if name in self._config.extra_config:
-                cfg = self._config.extra_config[name]
-                return (
-                    cfg.get("bits", self._config.weight_bits if quantized else 16),
-                    self._normalize_group_size(
-                        cfg.get(
-                            "group_size",
-                            self._config.group_size if quantized else -1,
-                        )
-                    ),
-                    cfg.get("sym", self._config.sym if quantized else True),
-                )
+                return layer_config_from(self._config.extra_config[name], quantized)
 
             regex_special_chars = set(r"*+?^$()[]{}|\\")
             for pattern, cfg in self._config.extra_config.items():
@@ -135,27 +129,11 @@ class INCConfigParser:
 
                 try:
                     if re.search(re.compile(pattern), name) is not None:
-                        return (
-                            cfg.get(
-                                "bits",
-                                self._config.weight_bits if quantized else 16,
-                            ),
-                            self._normalize_group_size(
-                                cfg.get(
-                                    "group_size",
-                                    self._config.group_size if quantized else -1,
-                                )
-                            ),
-                            cfg.get("sym", self._config.sym if quantized else True),
-                        )
+                        return layer_config_from(cfg, quantized)
                 except re.error:
                     continue
 
-            return (
-                self._config.weight_bits if quantized else 16,
-                self._config.group_size if quantized else -1,
-                self._config.sym if quantized else True,
-            )
+            return layer_config_from({}, quantized)
 
         if self._config.extra_config and layer_name in self._config.extra_config:
             return get_config(layer_name)
