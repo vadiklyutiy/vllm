@@ -253,24 +253,38 @@ class KimiK3ToolParser(ToolParser):
         ``<|close|>response<|sep|>``. Handle both that consumed-prefix shape and a
         complete ``<|open|>response<|sep|>... <|close|>response<|sep|>`` wrapper.
         """
-        m_open = self._response_open_re.search(text)
-        if m_open is not None:
-            m_close = self._response_close_re.search(text, m_open.end())
-            if m_close is not None:
-                text = text[m_open.end() : m_close.start()]
-            else:
-                text = text[m_open.end() :]
-        else:
-            text = self._response_close_re.sub("", text)
-        text = self._message_close_re.sub("", text)
+        start, end = self._response_span(text)
+        text = self._message_close_re.sub("", text[start:end])
         return text or None
 
-    def _content(self, model_output: str, before: str) -> str | None:
-        # prefer the unwrapped response channel; else the text before the tools
+    def _content(self, model_output: str, head: str) -> str | None:
+        # prefer the unwrapped response channel; else the text up to the tools
         m = self._response_re.search(model_output)
         if m is not None:
             return m["c"] or None
-        return self._strip_response_content(before)
+        return self._strip_response_content(head)
+
+    def _response_span(self, text: str) -> tuple[int, int]:
+        """Return the ``(start, end)`` of the response text safe to emit."""
+        m_open = self._response_open_re.search(text)
+        # In the normal chat path, the response-open marker may be consumed as
+        # the generation prefix. Then generated text starts directly with the
+        # response body or with <|close|>response<|sep|> before a tools channel.
+        body_start = m_open.end() if m_open is not None else 0
+        m_tools = self._tools_open_re.search(text, body_start)
+        m_rclose = self._response_close_re.search(text, body_start)
+        tools_start = m_tools.start() if m_tools else -1
+        response_end = m_rclose.start() if m_rclose else -1
+
+        candidates = [i for i in (tools_start, response_end) if i != -1]
+        if candidates:
+            return body_start, min(candidates)
+        overlap = max(
+            _partial_tag_overlap(text, self.response_open),
+            _partial_tag_overlap(text, self.response_close),
+            _partial_tag_overlap(text, self.tools_open),
+        )
+        return body_start, len(text) - overlap
 
     def _extract_response_content(self, current_text: str) -> str | None:
         # Streaming response text is computed from the accumulated text. This is
@@ -280,27 +294,7 @@ class KimiK3ToolParser(ToolParser):
         #   Hi<|close|> / response / <|sep|>... -> emit "Hi", hold the close marker
         # Tool calls are even simpler: they are not emitted until a full
         # <|close|>call<|sep|> is present in current_text.
-        m_open = self._response_open_re.search(current_text)
-        # In the normal chat path, the response-open marker may be consumed as
-        # the generation prefix. Then generated text starts directly with the
-        # response body or with <|close|>response<|sep|> before a tools channel.
-        body_start = m_open.end() if m_open is not None else 0
-        m_tools = self._tools_open_re.search(current_text, body_start)
-        m_rclose = self._response_close_re.search(current_text, body_start)
-        tools_start = m_tools.start() if m_tools else -1
-        response_end = m_rclose.start() if m_rclose else -1
-
-        candidates = [i for i in (tools_start, response_end) if i != -1]
-        if candidates:
-            sendable_idx = min(candidates)
-        else:
-            overlap = max(
-                _partial_tag_overlap(current_text, self.response_open),
-                _partial_tag_overlap(current_text, self.response_close),
-                _partial_tag_overlap(current_text, self.tools_open),
-            )
-            sendable_idx = len(current_text) - overlap
-
+        body_start, sendable_idx = self._response_span(current_text)
         if sendable_idx <= body_start:
             return None
         if self._sent_content_idx < body_start:
@@ -324,8 +318,8 @@ class KimiK3ToolParser(ToolParser):
                 content=self._content(model_output, model_output),
             )
         try:
-            before = model_output[: m_open.start()]
             start = m_open.end()
+            head = model_output[:start]
             m_close = self._tools_close_re.search(model_output, start)
             section = (
                 model_output[start:]
@@ -342,12 +336,12 @@ class KimiK3ToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=False,
                     tool_calls=[],
-                    content=self._content(model_output, before),
+                    content=self._content(model_output, head),
                 )
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
-                content=self._content(model_output, before),
+                content=self._content(model_output, head),
             )
         except Exception:
             logger.exception("Error extracting K3 tool calls.")

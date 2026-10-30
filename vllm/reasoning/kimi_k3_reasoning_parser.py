@@ -101,9 +101,9 @@ class KimiK3ReasoningParser(ReasoningParser):
         self._think_close = "<|close|>think<|sep|>"
 
         # Content-channel markers that must be stripped from the final output.
-        # The tool parser handles these when active, but when tool_choice is
-        # "none" (the default for requests without tools) the tool parser is
-        # bypassed and the reasoning parser must strip them itself.
+        # The tool parser handles these when it runs (KimiK3Parser then sets
+        # keep_tool_channels); otherwise the reasoning parser must strip them.
+        self.keep_tool_channels = False
         self._response_open = "<|open|>response<|sep|>"
         self._response_close = "<|close|>response<|sep|>"
         self._message_close = "<|close|>message<|sep|>"
@@ -287,7 +287,7 @@ class KimiK3ReasoningParser(ReasoningParser):
         text: str,
         request: "ChatCompletionRequest | ResponsesRequest",
     ) -> str | None:
-        if self._should_preserve_tool_channels(request):
+        if self.keep_tool_channels or self._should_preserve_tool_channels(request):
             return text or None
         return self._strip_content_wrapper(text) or None
 

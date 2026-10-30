@@ -411,6 +411,50 @@ def test_streaming_consumed_response_prefix_no_call_keeps_content():
     assert all(CLOSE not in (message.content or "") for message in messages)
 
 
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("Just chatting.<", "Just chatting."),
+        (f"Just chatting.{CLOSE[:5]}", "Just chatting."),
+        (f"Just chatting.{CLOSE}response", "Just chatting."),
+        (f"Just chatting.{RESPONSE_CLOSE}{CLOSE}", "Just chatting."),
+        (f"Just chatting.{RESPONSE_CLOSE}{CLOSE}mes", "Just chatting."),
+        (f"a <{RESPONSE_CLOSE}{CLOSE}message{SEP}", "a <"),
+        ("a <" + _tools(_call("calc", 1)), "a <"),
+    ],
+)
+@pytest.mark.parametrize("with_tools", [True, False])
+def test_non_streaming_content_matches_streaming(output, expected, with_tools):
+    """Both paths return the same content, and a generation cut inside a
+    marker (``max_tokens``) leaks no marker text into it."""
+    update: dict = {"chat_template_kwargs": {"thinking": False}}
+    if not with_tools:
+        update |= {"tools": None, "tool_choice": "none"}
+    request = _request().model_copy(update=update)
+
+    parser = KimiK3DelegatingParser(
+        _dummy_tokenizer(), chat_template_kwargs={"thinking": False}
+    )
+    _, content, _ = parser.parse(output, request, enable_auto_tools=True)
+
+    parser = KimiK3DelegatingParser(
+        _dummy_tokenizer(), chat_template_kwargs={"thinking": False}
+    )
+    streamed = ""
+    for index, char in enumerate(output, start=1):
+        delta = parser.parse_delta(
+            delta_text=char,
+            delta_token_ids=[index],
+            request=request,
+            prompt_token_ids=[1],
+            finished=index == len(output),
+        )
+        if delta is not None:
+            streamed += delta.content or ""
+
+    assert content == streamed == expected
+
+
 def test_delegating_parser_tool_choice_none_strips_xtml_and_suppresses_calls():
     parser = KimiK3DelegatingParser(
         _dummy_tokenizer(), chat_template_kwargs={"thinking": False}
