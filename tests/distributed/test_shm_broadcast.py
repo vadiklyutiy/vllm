@@ -726,6 +726,112 @@ def test_acquire_read_releases_slot_when_reader_raises():
         reader.shutdown()
 
 
+def test_overflow_dequeue_timeout_keeps_message():
+    """A dequeue that times out waiting for an overflow payload must leave
+    that message to the next dequeue instead of skipping its ring slot."""
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=128,
+        max_chunks=4,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+
+        # The two halves of an overflow enqueue, with the payload sent late.
+        with writer.acquire_write(timeout=0.1) as buf:
+            buf[0] = 1
+        with pytest.raises(TimeoutError):
+            reader.dequeue(timeout=0.1)
+        writer.local_socket.send_multipart([pickle.dumps("first")])
+        writer.enqueue("second")
+
+        assert reader.dequeue(timeout=5) == "first"
+        assert reader.dequeue(timeout=5) == "second"
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+
+
+def _raise_timeout_on_unpickle():
+    raise TimeoutError("decode timed out")
+
+
+class _TimesOutOnUnpickle:
+    def __reduce__(self):
+        return (_raise_timeout_on_unpickle, ())
+
+
+@pytest.mark.parametrize(
+    "max_chunk_bytes",
+    [
+        pytest.param(1024 * 1024, id="inline"),
+        pytest.param(16, id="overflow"),
+    ],
+)
+def test_dequeue_releases_slot_when_decode_times_out(max_chunk_bytes):
+    """A TimeoutError from decoding a message that was fully received must not
+    keep its ring slot, or every later dequeue fails on the same message."""
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=max_chunk_bytes,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+
+        writer.enqueue(_TimesOutOnUnpickle())
+        with pytest.raises(TimeoutError, match="decode timed out"):
+            reader.dequeue(timeout=5)
+        writer.enqueue("next", timeout=1)
+        assert reader.dequeue(timeout=5) == "next"
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+
+
+@pytest.mark.parametrize("other_is_local", [True, False], ids=["local", "remote"])
+def test_other_queue_timeout_releases_slot(other_is_local):
+    """A timeout from reading another queue, raised while this queue's block
+    is read, must not keep this queue's block."""
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    other_writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=int(other_is_local),
+        max_chunk_bytes=128,
+        max_chunks=1,
+        connect_ip="127.0.0.1",
+    )
+    other_reader = MessageQueue.create_from_handle(other_writer.export_handle(), 0)
+    try:
+        for q in (writer, reader, other_writer, other_reader):
+            q.wait_until_ready()
+
+        writer.enqueue("first")
+        if other_is_local:
+            # An overflow message whose payload has not been sent.
+            with other_writer.acquire_write(timeout=0.1) as buf:
+                buf[0] = 1
+        with pytest.raises(TimeoutError), reader.acquire_read(timeout=0.1):
+            other_reader.dequeue(timeout=0.1)
+        writer.enqueue("next", timeout=1)
+        assert reader.dequeue(timeout=5) == "next"
+    finally:
+        for q in (writer, reader, other_writer, other_reader):
+            q.shutdown()
+
+
 def test_reader_in_reference_cycle_is_collected_without_blocking():
     writer = MessageQueue(
         n_reader=1,

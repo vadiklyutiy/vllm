@@ -486,6 +486,10 @@ class Handle:
     tensor_arena_handle: tuple[int, int, int, str] | None = None
 
 
+class _PayloadTimeoutError(TimeoutError):
+    """An overflow payload did not arrive before the read timed out."""
+
+
 def _close_zmq(context: zmq.Context, sockets: list[zmq.Socket]) -> None:
     for socket in sockets:
         socket.close(linger=0)
@@ -895,18 +899,27 @@ class MessageQueue:
                 # found a block that is not read by this reader
                 # let caller read from the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
+                    finished_reading = True
                     try:
                         yield buf
+                    except _PayloadTimeoutError:
+                        # Keep the block unread so that the next read returns it
+                        # again. Re-raise a plain TimeoutError so that an outer
+                        # read of another queue still releases its own block.
+                        finished_reading = False
+                        raise TimeoutError from None
                     finally:
-                        # caller has read from the buffer; set the read flag.
-                        metadata_buffer[self.local_reader_rank + 1] = 1
-                        # Memory fence ensures the read flag is visible to the writer.
-                        # Without this, writer may not see our read completion and
-                        # could wait indefinitely for all readers to finish.
-                        memory_fence()
-                        next_idx = self.current_idx + 1
-                        self.current_idx = next_idx % self.buffer.max_chunks
-                        self._spin_condition.record_read()
+                        if finished_reading:
+                            # caller has read from the buffer; set the read flag.
+                            metadata_buffer[self.local_reader_rank + 1] = 1
+                            # Memory fence ensures the read flag is visible to the
+                            # writer. Without this, writer may not see our read
+                            # completion and could wait indefinitely for all
+                            # readers to finish.
+                            memory_fence()
+                            next_idx = self.current_idx + 1
+                            self.current_idx = next_idx % self.buffer.max_chunks
+                            self._spin_condition.record_read()
                 break
 
     def enqueue(self, obj, timeout: float | None = None):
@@ -1001,8 +1014,15 @@ class MessageQueue:
                         # Out-of-band arrays may outlive this reusable ring slot.
                         all_buffers.append(buffer if i == 0 else bytearray(buffer))
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
-            if overflow:
-                obj = MessageQueue.recv(self.local_socket, timeout)
+                else:
+                    # Wait for the payload before the block is marked read, so
+                    # that a timeout leaves this message for the next dequeue.
+                    timeout_ms = (
+                        None if timeout is None else max(0, int(timeout * 1000))
+                    )
+                    if not self.local_socket.poll(timeout=timeout_ms):
+                        raise _PayloadTimeoutError
+                    obj = MessageQueue.recv(self.local_socket, timeout)
         elif self._is_remote_reader:
             obj = MessageQueue.recv(self.remote_socket, timeout)
         else:
