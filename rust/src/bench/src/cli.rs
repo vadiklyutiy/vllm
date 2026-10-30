@@ -99,6 +99,13 @@ pub enum RampUpStrategy {
     Exponential,
 }
 
+impl fmt::Display for RampUpStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = clap::ValueEnum::to_possible_value(self).expect("no variant is skipped");
+        f.write_str(value.get_name())
+    }
+}
+
 /// Strategy for assigning LoRA modules to requests.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoraAssignment {

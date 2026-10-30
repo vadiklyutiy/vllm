@@ -770,6 +770,8 @@ JSON output is compatible with the `vllm bench serve` Python schema. Result file
 {label}-{rate}qps-concurrency{max_concurrency}-{model}-{timestamp}.json
 ```
 
+With `--ramp-up-strategy`, `{rate}qps` becomes `ramp-up-{strategy}-{start_rps}qps-{end_rps}qps`, and the JSON adds `ramp_up_strategy`, `ramp_up_start_rps`, `ramp_up_end_rps` and `rps_change_events`, as in Python.
+
 Use `--append-result` to append multiple runs to the same file in JSONL format. `--save-detailed` adds per-request arrays (input/output lengths, ITLs, generated text).
 
 ## Architecture

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use chrono::{DateTime, Local, TimeDelta};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma};
+use serde::Serialize;
 
 use crate::cli::RampUpStrategy;
 use crate::config::RampUpConfig;
@@ -13,8 +15,51 @@ pub struct RequestSchedule {
     /// Cumulative absolute delay from start (seconds) for each request.
     pub delays: Vec<f64>,
     /// Instantaneous rate for each request (for ramp-up logging).
-    #[allow(dead_code)]
     pub rates: Vec<f64>,
+}
+
+/// A whole RPS value reached during ramp-up, as in Python's `rps_change_events`.
+#[derive(Debug, Serialize)]
+pub struct RpsChangeEvent {
+    pub rps: i64,
+    /// Local time in Python's `datetime.now().isoformat()` format.
+    pub timestamp: String,
+}
+
+/// Log each whole RPS value the ramp-up reaches, stamped with the scheduled
+/// send time of the first request at that rate.
+///
+/// Mirrors the `rps_change_events` bookkeeping in Python's `benchmark()`
+/// dispatch loop, which stamps the time `get_request()` yields the request
+/// after sleeping to the same scheduled offset.
+pub fn rps_change_events(
+    ramp_up: &RampUpConfig,
+    schedule: &RequestSchedule,
+    benchmark_start: DateTime<Local>,
+) -> Vec<RpsChangeEvent> {
+    let timestamp_at = |delay: f64| {
+        (benchmark_start + TimeDelta::microseconds((delay * 1e6) as i64))
+            .format("%Y-%m-%dT%H:%M:%S%.6f")
+            .to_string()
+    };
+
+    let mut last_rps = ramp_up.start_rps as i64;
+    let mut events = vec![RpsChangeEvent {
+        rps: last_rps,
+        timestamp: timestamp_at(0.0),
+    }];
+    for (&rate, &delay) in schedule.rates.iter().zip(&schedule.delays) {
+        let current_rps = rate as i64;
+        if current_rps > last_rps {
+            let timestamp = timestamp_at(delay);
+            events.extend((last_rps + 1..=current_rps).map(|rps| RpsChangeEvent {
+                rps,
+                timestamp: timestamp.clone(),
+            }));
+            last_rps = current_rps;
+        }
+    }
+    events
 }
 
 /// Compute the per-request rate, accounting for optional ramp-up.
@@ -119,6 +164,8 @@ pub fn trace_schedule(timestamps: impl ExactSizeIterator<Item = Option<f64>>) ->
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
 
     #[test]
@@ -187,5 +234,29 @@ mod tests {
         for i in 1..sched.rates.len() {
             assert!(sched.rates[i] >= sched.rates[i - 1]);
         }
+    }
+
+    /// Every whole RPS between start and end is logged once, at the send time
+    /// of the first request that reaches it, as Python's dispatch loop does.
+    #[test]
+    fn test_rps_change_events_log_each_whole_rps() {
+        let ramp = RampUpConfig {
+            strategy: RampUpStrategy::Linear,
+            start_rps: 1.0,
+            end_rps: 10.0,
+        };
+        // Rates 1.0, 5.5, 10.0 with gaps of 1/rate: sent at 1.0s, 1.1818s, 1.2818s.
+        let sched = compute_schedule(3, f64::INFINITY, f64::INFINITY, 42, Some(&ramp));
+        let start = Local.with_ymd_and_hms(2026, 10, 30, 5, 0, 0).unwrap();
+
+        let events = rps_change_events(&ramp, &sched, start);
+
+        let expected: Vec<(i64, &str)> = std::iter::once((1, "2026-10-30T05:00:00.000000"))
+            .chain((2..=5).map(|rps| (rps, "2026-10-30T05:00:01.181818")))
+            .chain((6..=10).map(|rps| (rps, "2026-10-30T05:00:01.281818")))
+            .collect();
+        let actual: Vec<(i64, &str)> =
+            events.iter().map(|e| (e.rps, e.timestamp.as_str())).collect();
+        assert_eq!(actual, expected);
     }
 }

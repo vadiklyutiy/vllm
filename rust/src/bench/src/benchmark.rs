@@ -17,7 +17,7 @@ use crate::metrics::calculator::{calculate_embedding_metrics, calculate_metrics}
 use crate::metrics::steady_state;
 use crate::output::console::print_results;
 use crate::output::json::{append_result, build_result_json, compute_result_filename, save_result};
-use crate::rate_control::{compute_schedule, trace_schedule};
+use crate::rate_control::{compute_schedule, rps_change_events, trace_schedule};
 use crate::ready_checker::{get_first_model, wait_for_endpoint};
 
 /// Past this first-arrival offset a self-timed run is almost certainly a
@@ -930,6 +930,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
     let semaphore = config.max_concurrency.map(|mc| Arc::new(Semaphore::new(mc)));
 
     let benchmark_start = Instant::now();
+    let benchmark_start_local = chrono::Local::now();
 
     // Arc-wrap shared data to avoid cloning per request
     let shared_api_url = Arc::new(config.api_url.clone());
@@ -1180,6 +1181,11 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
     // Build result JSON
     let date_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let dt_filename = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let rps_change_events = config
+        .ramp_up
+        .as_ref()
+        .map(|ramp_up| rps_change_events(ramp_up, &schedule, benchmark_start_local))
+        .unwrap_or_default();
     let result_json = build_result_json(
         config,
         &metrics,
@@ -1188,6 +1194,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         benchmark_duration,
         &date_iso,
         spec_decode_stats.as_ref(),
+        &rps_change_events,
     );
 
     // Save if requested

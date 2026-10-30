@@ -5,10 +5,11 @@ use serde_json::Value;
 
 use crate::backends::RequestFuncOutput;
 use crate::benchmark::SpecDecodeStats;
-use crate::config::BenchConfig;
+use crate::config::{BenchConfig, RampUpConfig};
 use crate::error::Result;
 use crate::metrics::{BenchmarkMetrics, MultiTurnMetrics};
 use crate::multi_turn::ConversationOutput;
+use crate::rate_control::RpsChangeEvent;
 
 fn insert_server_metrics(
     result: &mut serde_json::Map<String, Value>,
@@ -44,6 +45,7 @@ pub fn build_result_json(
     benchmark_duration: f64,
     current_dt: &str,
     spec_decode_stats: Option<&SpecDecodeStats>,
+    rps_change_events: &[RpsChangeEvent],
 ) -> serde_json::Value {
     let mut result = serde_json::Map::new();
 
@@ -100,6 +102,9 @@ pub fn build_result_json(
         "max_concurrency".into(),
         config.max_concurrency.map(|v| Value::Number(v.into())).unwrap_or(Value::Null),
     );
+    if let Some(ref ramp_up) = config.ramp_up {
+        insert_ramp_up(&mut result, ramp_up, rps_change_events);
+    }
 
     let is_pooling = config.backend.is_pooling();
 
@@ -581,6 +586,32 @@ fn collect_failed_turns(conversation_outputs: &[ConversationOutput]) -> Vec<Valu
     failed
 }
 
+fn insert_ramp_up(
+    result: &mut serde_json::Map<String, Value>,
+    ramp_up: &RampUpConfig,
+    rps_change_events: &[RpsChangeEvent],
+) {
+    // Python parses the ramp-up RPS as `int`; whole values stay integral so
+    // the JSON matches, while fractional RPS (Rust-only) keep their fraction.
+    let rps_value = |rps: f64| {
+        if rps.fract() == 0.0 {
+            serde_json::json!(rps as i64)
+        } else {
+            serde_json::json!(rps)
+        }
+    };
+    result.insert(
+        "ramp_up_strategy".into(),
+        Value::String(ramp_up.strategy.to_string()),
+    );
+    result.insert("ramp_up_start_rps".into(), rps_value(ramp_up.start_rps));
+    result.insert("ramp_up_end_rps".into(), rps_value(ramp_up.end_rps));
+    result.insert(
+        "rps_change_events".into(),
+        serde_json::json!(rps_change_events),
+    );
+}
+
 fn insert_spec_decode_stats(result: &mut serde_json::Map<String, Value>, stats: &SpecDecodeStats) {
     result.insert(
         "spec_decode_acceptance_rate".into(),
@@ -663,7 +694,12 @@ pub fn compute_result_filename(config: &BenchConfig, model_id: &str, current_dt:
         config.max_concurrency.map(|mc| format!("-concurrency{mc}")).unwrap_or_default();
     let label = config.label.as_deref().unwrap_or_else(|| config.backend.as_str());
 
-    let file_name = if config.request_rate.is_infinite() {
+    let file_name = if let Some(ref ramp_up) = config.ramp_up {
+        format!(
+            "{label}-ramp-up-{}-{}qps-{}qps{max_conc_str}-{base_model}-{current_dt}.json",
+            ramp_up.strategy, ramp_up.start_rps, ramp_up.end_rps
+        )
+    } else if config.request_rate.is_infinite() {
         format!("{label}-infqps{max_conc_str}-{base_model}-{current_dt}.json")
     } else {
         format!(
@@ -838,5 +874,87 @@ mod tests {
         let mut result = serde_json::Map::new();
         insert_server_metrics(&mut result, &[RequestFuncOutput::default()]);
         assert!(result.is_empty());
+    }
+
+    /// A ramp-up run is named after its ramp and records it, as Python does,
+    /// not as the unused default `--request-rate inf`.
+    #[test]
+    fn test_ramp_up_run_is_saved_as_ramp_up() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: crate::cli::BenchServeArgs,
+        }
+        let args = <TestCli as clap::Parser>::parse_from([
+            "vllm-bench",
+            "--model",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--backend",
+            "openai",
+            "--ramp-up-strategy",
+            "linear",
+            "--ramp-up-start-rps",
+            "2",
+            "--ramp-up-end-rps",
+            "10",
+        ])
+        .args;
+        let config = BenchConfig::from_args(&args).unwrap();
+        let (metrics, actual_output_lens) = crate::metrics::calculator::calculate_metrics(
+            &[],
+            1.0,
+            &[],
+            false,
+            &crate::config::GoodputConfig::default(),
+        );
+        let events = vec![RpsChangeEvent {
+            rps: 2,
+            timestamp: "2026-10-30T05:00:00.000000".into(),
+        }];
+
+        let result = build_result_json(
+            &config,
+            &metrics,
+            &actual_output_lens,
+            &[],
+            1.0,
+            "",
+            None,
+            &events,
+        );
+
+        assert_eq!(
+            compute_result_filename(&config, "Qwen/Qwen2.5-0.5B-Instruct", "20261030-000000"),
+            "openai-ramp-up-linear-2qps-10qps-Qwen2.5-0.5B-Instruct-20261030-000000.json"
+        );
+        assert_eq!(result["ramp_up_strategy"], "linear");
+        assert_eq!(result["ramp_up_start_rps"], serde_json::json!(2));
+        assert_eq!(result["ramp_up_end_rps"], serde_json::json!(10));
+        assert_eq!(
+            result["rps_change_events"],
+            serde_json::json!([{"rps": 2, "timestamp": "2026-10-30T05:00:00.000000"}])
+        );
+    }
+
+    /// The ramp-up fields serialize as Python writes them: whole RPS as integers.
+    #[test]
+    fn test_insert_ramp_up_matches_python_schema() {
+        let ramp_up = RampUpConfig {
+            strategy: crate::cli::RampUpStrategy::Linear,
+            start_rps: 2.0,
+            end_rps: 10.5,
+        };
+        let events = vec![RpsChangeEvent {
+            rps: 2,
+            timestamp: "2026-10-30T05:00:00.000000".into(),
+        }];
+        let mut result = serde_json::Map::new();
+
+        insert_ramp_up(&mut result, &ramp_up, &events);
+
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"ramp_up_strategy":"linear","ramp_up_start_rps":2,"ramp_up_end_rps":10.5,"rps_change_events":[{"rps":2,"timestamp":"2026-10-30T05:00:00.000000"}]}"#
+        );
     }
 }
