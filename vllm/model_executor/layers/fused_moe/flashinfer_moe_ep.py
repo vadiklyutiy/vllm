@@ -17,6 +17,8 @@ from vllm.config.kernel import (
     FLASHINFER_MOE_EP_DEEP_GEMM,
 )
 from vllm.distributed import get_ep_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -25,10 +27,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import _import_deep_gemm
+from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+logger = init_logger(__name__)
 
 FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm"]
 FlashInferMoeEpWeightFormat = Literal["nvfp4", "mxfp4"]
@@ -272,6 +277,21 @@ def _load_flashinfer_moe_ep_api() -> _FlashInferMoeEpApi:
     return _FlashInferMoeEpApi()
 
 
+def _decode_workspace_capacity(moe: FusedMoEConfig) -> int | None:
+    """Per-rank tokens of the largest decode step, if below the full capacity.
+
+    The CuTeDSL megakernel binds its tile and token-back knobs to the
+    workspace capacity, so a prefill-sized workspace runs decode steps on the
+    large-batch profile.
+    """
+    vllm_config = get_current_vllm_config()
+    num_tokens = vllm_config.scheduler_config.max_num_seqs
+    if vllm_config.speculative_config is not None:
+        num_tokens *= 1 + vllm_config.speculative_config.num_speculative_tokens
+    num_tokens = cdiv(num_tokens, moe.moe_parallel_config.sp_size)
+    return num_tokens if num_tokens < moe.max_num_tokens else None
+
+
 def _expose_deep_gemm_to_flashinfer() -> None:
     deep_gemm = _import_deep_gemm()
     if deep_gemm is None:
@@ -357,6 +377,21 @@ class FlashInferMoeEp:
         self._top_k = moe.experts_per_token
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
+        # Extra (capacity, workspace) profiles below the default one, ascending.
+        self._workspaces: list[tuple[int, Any]] = []
+        self._sp_size = 1
+        decode_capacity = (
+            _decode_workspace_capacity(moe) if spec.kernel == "cutedsl" else None
+        )
+        if decode_capacity is not None:
+            logger.info_once(
+                "FlashInfer MoE-EP: decode workspace for up to %d tokens per rank.",
+                decode_capacity,
+            )
+            self._sp_size = moe.moe_parallel_config.sp_size
+            self._workspaces.append(
+                (decode_capacity, self._mega_layer.create_workspace(decode_capacity))
+            )
 
     @property
     def can_overlap_shared_experts(self) -> bool:
@@ -379,6 +414,7 @@ class FlashInferMoeEp:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> Any:
         epilogue = cast(FlashInferMoeEpEpilogue, self._epilogue)
         return self._moe_ep_tensors_cls(
@@ -388,27 +424,54 @@ class FlashInferMoeEp:
             fc1_alpha=epilogue.fc1_alpha,
             fc2_alpha=epilogue.fc2_alpha,
             fc1_norm_const=epilogue.fc1_norm_const,
+            output=output,
         )
+
+    def _select_workspace(self, num_tokens: int) -> Any | None:
+        """Smallest workspace that fits the step; ``None`` is the default one."""
+        if not self._workspaces:
+            return None
+        # Dispatch is collective, so every EP rank must pick the same workspace.
+        if is_forward_context_available():
+            dp_metadata = get_forward_context().dp_metadata
+            if dp_metadata is not None:
+                max_dp_tokens = int(dp_metadata.num_tokens_across_dp_cpu.max())
+                num_tokens = max(num_tokens, cdiv(max_dp_tokens, self._sp_size))
+        for capacity, workspace in self._workspaces:
+            if num_tokens <= capacity:
+                return workspace
+        return None
 
     def __call__(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run the megakernel, writing into ``output`` when it is given."""
         if self._mega_layer is None:
             raise RuntimeError("FlashInfer MoE-EP layer was destroyed")
-        if hidden_states.shape[0] > self._max_num_tokens:
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > self._max_num_tokens:
             raise ValueError(
-                f"FlashInfer MoE-EP got {hidden_states.shape[0]} tokens, but "
+                f"FlashInfer MoE-EP got {num_tokens} tokens, but "
                 f"the workspace supports at most {self._max_num_tokens}"
             )
-        tensors = self._tensors(hidden_states, topk_ids, topk_weights)
+        workspace = self._select_workspace(num_tokens)
         if self._return_workspace_view and getattr(
             self._mega_layer, "supports_output_view", False
         ):
-            return self._mega_layer.forward(tensors, return_workspace_view=True)
-        return self._mega_layer(tensors)
+            view = self._mega_layer.forward(
+                self._tensors(hidden_states, topk_ids, topk_weights),
+                workspace=workspace,
+                return_workspace_view=True,
+            )
+            return view if output is None else output.copy_(view)
+        return self._mega_layer.forward(
+            self._tensors(hidden_states, topk_ids, topk_weights, output),
+            workspace=workspace,
+        )
 
     @torch.inference_mode()
     def warmup(self) -> None:
@@ -431,7 +494,10 @@ class FlashInferMoeEp:
             dtype=torch.float32,
             device=self._device,
         )
-        self._mega_layer.warmup(self._tensors(hidden_states, topk_ids, topk_weights))
+        tensors = self._tensors(hidden_states, topk_ids, topk_weights)
+        self._mega_layer.warmup(tensors)
+        for _, workspace in self._workspaces:
+            self._mega_layer.warmup(tensors, workspace=workspace)
 
     def kernel_weights(
         self,
@@ -463,6 +529,7 @@ class FlashInferMoeEp:
             return
         mega_layer.destroy()
         self._mega_layer = None
+        self._workspaces = []
         self._epilogue = None
 
     def __del__(self) -> None:

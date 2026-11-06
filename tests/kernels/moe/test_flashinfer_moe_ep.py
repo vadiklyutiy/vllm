@@ -313,6 +313,66 @@ def test_init_warmup_forward_is_exact_on_grid_inputs(
     distributed_run(_init_warmup_forward, world_size, geometry, backend)
 
 
+def _decode_workspace_forward(env: dict[str, str], world_size: int) -> None:
+    set_env_vars_and_device(env)
+    geometry = Geometry("qwen3.8-flash-next", 2560, 640, 512, 10)
+    backend = FLASHINFER_MOE_EP_CUTEDSL
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config.data_parallel_size = world_size
+    vllm_config.parallel_config.enable_expert_parallel = True
+    vllm_config.kernel_config.moe_backend = backend
+    decode_tokens = NUM_TOKENS_PER_RANK // 2
+    vllm_config.scheduler_config.max_num_seqs = decode_tokens
+
+    with set_current_vllm_config(vllm_config):
+        ensure_model_parallel_initialized(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        rank = torch.distributed.get_rank()
+        device = torch.device(f"cuda:{rank}")
+        moe = _moe_config(vllm_config, geometry, world_size, device, backend)
+        adapter = FlashInferMoeEp(
+            moe,
+            _local_expert_weights(geometry, rank, moe.num_local_experts, device),
+            apply_topk_in_fc1=apply_topk_in_fc1(moe),
+        )
+        try:
+            adapter.warmup()
+            topk_ids, topk_weights = _routing(geometry, rank, device)
+            hidden_states = _hidden_states(geometry, device)
+            expected = _expected_output(geometry, topk_ids, topk_weights)
+            # Fewer tokens than max_num_seqs take the decode workspace.
+            for num_tokens in (NUM_TOKENS_PER_RANK, decode_tokens):
+                output = torch.empty_like(expected[:num_tokens])
+                adapter(
+                    hidden_states[:num_tokens],
+                    topk_ids[:num_tokens],
+                    topk_weights[:num_tokens],
+                    output,
+                )
+                torch.accelerator.synchronize()
+                assert torch.equal(output, expected[:num_tokens]), (
+                    f"rank {rank}, {num_tokens} tokens: max abs diff "
+                    f"{(output.float() - expected[:num_tokens].float()).abs().max()}"
+                )
+        finally:
+            adapter.destroy()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="The FlashInfer MoE-EP megakernels require SM100",
+)
+def test_decode_workspace_matches_full_workspace():
+    """Decode-sized steps run on a separate small-batch workspace profile."""
+    pytest.importorskip("flashinfer.moe_ep")
+    world_size = 2
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Need at least {world_size} GPUs")
+    distributed_run(_decode_workspace_forward, world_size)
+
+
+@pytest.mark.usefixtures("default_vllm_config")
 @pytest.mark.parametrize("backend", BACKENDS, ids=("cutedsl", "deep_gemm"))
 def test_adapter_kwargs_match_installed_flashinfer(
     monkeypatch: pytest.MonkeyPatch, backend: str
@@ -352,6 +412,7 @@ def test_adapter_kwargs_match_installed_flashinfer(
         max_num_tokens=MAX_TOKENS_PER_RANK,
         swiglu_limit=10.0,
         routing_method=_routing_method(backend),
+        moe_parallel_config=SimpleNamespace(sp_size=1),
     )
     weight = torch.zeros(1, dtype=torch.bfloat16)
     FlashInferMoeEp(

@@ -36,7 +36,13 @@ class _SpeculativeConfig:
     draft_model_config: object = None
     draft_load_config: object = None
 
+    _draft_moe_backend = SpeculativeConfig._draft_moe_backend
     apply_draft_overrides = SpeculativeConfig.apply_draft_overrides
+
+
+@dataclass
+class _ParallelConfig:
+    all2all_backend: str = "allgather_reducescatter"
 
 
 @dataclass
@@ -45,14 +51,28 @@ class _VllmConfig:
     cache_config: _CacheConfig
     speculative_config: _SpeculativeConfig
     load_config: LoadConfig = field(default_factory=LoadConfig)
+    parallel_config: _ParallelConfig = field(default_factory=_ParallelConfig)
 
 
-def _config(target_moe: str, draft_moe: str | None) -> _VllmConfig:
+def _config(
+    target_moe: str, draft_moe: str | None, draft_arch: str = "Qwen4ExpMTP"
+) -> _VllmConfig:
     return _VllmConfig(
         kernel_config=_KernelConfig(moe_backend=target_moe),
         cache_config=_CacheConfig(),
-        speculative_config=_SpeculativeConfig(moe_backend=draft_moe),
+        speculative_config=_SpeculativeConfig(
+            moe_backend=draft_moe,
+            draft_model_config=SimpleNamespace(architectures=[draft_arch]),
+        ),
     )
+
+
+def _self_dispatching_config(
+    draft_moe: str | None, draft_arch: str = "Qwen4ExpMTP"
+) -> _VllmConfig:
+    cfg = _config("flashinfer_moe_ep_cutedsl", draft_moe, draft_arch)
+    cfg.parallel_config.all2all_backend = "passthrough"
+    return cfg
 
 
 class _Captured(Exception):
@@ -95,3 +115,21 @@ def test_override_does_not_mutate_the_target_config():
     cfg = _config("flashinfer_b12x", "flashinfer_cutlass")
     _capture_draft_config(cfg)
     assert cfg.kernel_config.moe_backend == "flashinfer_b12x"
+
+
+@pytest.mark.parametrize("draft_moe", [None, "flashinfer_trtllm"])
+def test_draft_leaves_self_dispatching_target_backend(draft_moe):
+    """A draft not validated with the target's self-dispatching backend (e.g.
+    an FP8 MTP head of an NVFP4 target) needs a regular backend and all2all."""
+    cfg = _self_dispatching_config(draft_moe)
+    used = _capture_draft_config(cfg)
+    assert used.kernel_config.moe_backend == (draft_moe or "auto")
+    assert used.parallel_config.all2all_backend == "allgather_reducescatter"
+    assert cfg.kernel_config.moe_backend == "flashinfer_moe_ep_cutedsl"
+    assert cfg.parallel_config.all2all_backend == "passthrough"
+
+
+def test_validated_draft_inherits_self_dispatching_target_backend():
+    used = _capture_draft_config(_self_dispatching_config(None, "DeepSeekV4MTPModel"))
+    assert used.kernel_config.moe_backend == "flashinfer_moe_ep_cutedsl"
+    assert used.parallel_config.all2all_backend == "passthrough"

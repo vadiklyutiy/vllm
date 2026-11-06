@@ -872,7 +872,9 @@ class ParallelConfig:
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size > 1
+            # A self-dispatching MoE kernel would dispatch each replicated
+            # token once per TP rank, so it needs sharded tokens even at DP=1.
+            and (self.data_parallel_size > 1 or self.all2all_backend == "passthrough")
         )
 
     @property

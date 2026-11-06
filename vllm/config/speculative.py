@@ -12,7 +12,12 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 
 from vllm.config import LoadConfig
 from vllm.config.cache import CacheDType
-from vllm.config.kernel import MoEBackend
+from vllm.config.kernel import (
+    FLASHINFER_MOE_EP_ARCHITECTURES,
+    FLASHINFER_MOE_EP_BACKENDS,
+    PASSTHROUGH_ALL2ALL_BACKEND,
+    MoEBackend,
+)
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config, replace
@@ -1614,17 +1619,53 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    def _draft_moe_backend(self, target_moe_backend: str) -> MoEBackend | None:
+        """The draft's MoE backend override, ``None`` to inherit the target's.
+
+        A self-dispatching target backend is inherited only by drafts of the
+        architectures it is validated with; other drafts (e.g. an FP8 MTP head
+        of an NVFP4 target) select their own backend.
+        """
+        if (
+            self.moe_backend is not None
+            or target_moe_backend not in FLASHINFER_MOE_EP_BACKENDS
+        ):
+            return self.moe_backend
+        architectures = set(
+            getattr(self.draft_model_config, "architectures", None) or ()
+        )
+        if architectures and architectures <= FLASHINFER_MOE_EP_ARCHITECTURES:
+            return None
+        return "auto"
+
     def apply_draft_overrides(self, vllm_config: VllmConfig) -> VllmConfig:
         """Overlay this config's kernel overrides onto a target VllmConfig.
 
         Only non-None fields override, so an unset field keeps whatever the
-        target resolved.
+        target resolved. A draft that leaves the target's self-dispatching MoE
+        backend gets the regular all-gather/reduce-scatter communication.
         """
+        target_moe_backend = vllm_config.kernel_config.moe_backend
+        moe_backend = self._draft_moe_backend(target_moe_backend)
+        overrides: dict[str, Any] = {}
         for src, config_name, dst in _DRAFT_VLLM_CONFIG_OVERRIDES:
-            if (value := getattr(self, src)) is not None:
-                sub_config = replace(getattr(vllm_config, config_name), **{dst: value})
-                vllm_config = replace(vllm_config, **{config_name: sub_config})
-        return vllm_config
+            value = moe_backend if src == "moe_backend" else getattr(self, src)
+            if value is not None:
+                overrides[config_name] = replace(
+                    getattr(vllm_config, config_name), **{dst: value}
+                )
+        if (
+            moe_backend is not None
+            and moe_backend not in FLASHINFER_MOE_EP_BACKENDS
+            and target_moe_backend in FLASHINFER_MOE_EP_BACKENDS
+            and vllm_config.parallel_config.all2all_backend
+            == PASSTHROUGH_ALL2ALL_BACKEND
+        ):
+            # A copy, as replace() would rerun DP port selection.
+            parallel_config = copy.copy(vllm_config.parallel_config)
+            parallel_config.all2all_backend = "allgather_reducescatter"
+            overrides["parallel_config"] = parallel_config
+        return replace(vllm_config, **overrides) if overrides else vllm_config
 
     @field_validator("method")
     @classmethod
