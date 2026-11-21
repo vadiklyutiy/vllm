@@ -328,3 +328,76 @@ def test_amd_replay_forward_trims_to_the_window(monkeypatch):
     assert aux.shape[0] == FULL
     assert torch.equal(aux[ROWS, 0], window_ids)
     assert aux[: FULL - WINDOW].eq(0).all()
+
+
+def test_amd_stage_entry_replay_writes_kv_of_forwards_attention_input():
+    """A stage that starts at the last KV source replays from its first layer:
+    `write_kv` gets the stage's hc streams and no residual, and runs the seam
+    `forward` runs there, so it writes the KV of the same attention input."""
+    import vllm.models.deepseek_v41.amd.model as amd
+
+    class StopAtAttention(Exception):
+        pass
+
+    hidden = torch.randn(2, HC, HIDDEN)
+    pre_mix = torch.randn(2, HC)
+    positions = torch.arange(2)
+    seam_calls: list[tuple] = []
+    attn_inputs: list[torch.Tensor] = []
+
+    def mhc_pre(
+        residual,
+        *args,
+        pre_mix=None,
+        sublayer_out=None,
+        post_layer_mix=None,
+        comb_res_mix=None,
+        **kwargs,
+    ):
+        seam_calls.append((residual, pre_mix, sublayer_out, post_layer_mix))
+        layer_input = (residual * pre_mix[..., None]).sum(dim=1)
+        return residual, None, None, layer_input, None
+
+    class Attention:
+        def __call__(self, positions, x, _):
+            attn_inputs.append(x)
+            raise StopAtAttention
+
+        def forward_kv(self, positions, x):
+            attn_inputs.append(x)
+
+    layer = SimpleNamespace(
+        mono=None,
+        mhc_overlap=None,
+        engram=None,
+        use_sequence_parallel=False,
+        fuse_seam_norm=True,
+        attn_seam_mxfp8=False,
+        ffn_seam_mxfp8=False,
+        mhc_seam=None,
+        mhc_pre_delayed=mhc_pre,
+        hc_attn_fn=None,
+        hc_attn_fn_packed=None,
+        hc_attn_scale=None,
+        hc_attn_base=None,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+        hc_post_alpha=1.0,
+        hc_sinkhorn_iters=1,
+        attn_norm=SimpleNamespace(weight=None, variance_epsilon=1e-6),
+        attn=Attention(),
+    )
+    layer_cls = amd.DeepseekV4DecoderLayer
+
+    with pytest.raises(StopAtAttention):
+        layer_cls.forward(layer, hidden, positions, None, pre_mix=pre_mix)
+    layer_cls.write_kv(layer, hidden, positions, None, pre_mix, None, None, None)
+
+    assert len(seam_calls) == 2
+    for residual, seam_pre_mix, sublayer_out, post_layer_mix in seam_calls:
+        assert residual is hidden and seam_pre_mix is pre_mix
+        assert sublayer_out is None and post_layer_mix is None
+    expected = (hidden * pre_mix[..., None]).sum(dim=1)
+    assert len(attn_inputs) == 2
+    torch.testing.assert_close(attn_inputs[0], expected)
+    torch.testing.assert_close(attn_inputs[1], expected)

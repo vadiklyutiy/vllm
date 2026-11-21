@@ -589,14 +589,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> None:
         """Write the KV `forward` would for the replay layers' inputs, skipping
         the rest of the layer; the replay batch then reruns its rows."""
         # The replay batch rules out Engram and sequence parallel here.
         assert self.engram is None and not self.use_sequence_parallel
+        sublayer_out: torch.Tensor | None = x
+        if residual is None:
+            # The stage's first layer: `x` is the stage's input hc streams.
+            residual, sublayer_out = x, None
         fuse_attn_norm = self.fuse_seam_norm
         pre_fn = (
             partial(mhc_pre_delayed_mxfp8, self.mhc_pre_delayed)
@@ -614,7 +618,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
             pre_mix=pre_mix,
-            sublayer_out=x,
+            sublayer_out=sublayer_out,
             post_layer_mix=post_mix,
             comb_res_mix=res_mix,
             norm_weight=self.attn_norm.weight if fuse_attn_norm else None,
@@ -1081,9 +1085,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         """Layers past the last KV source, on the rows they are given.
 

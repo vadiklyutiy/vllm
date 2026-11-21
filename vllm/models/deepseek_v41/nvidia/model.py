@@ -782,33 +782,55 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> None:
         """Write the KV `forward` would for the replay layers' inputs, skipping
         the rest of the layer; the replay batch then reruns its rows."""
         # The replay batch rules out Engram and sequence parallel here.
         assert self.engram is None and not self.use_sequence_parallel
-        *_, x, _, _ = mhc_shifted_post_pre(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            pre_mix=pre_mix,
-            norm_weight=self.attn_norm.weight,
-            norm_eps=self.attn_norm.variance_epsilon,
-            reduce_results=self.fuse_mhc_all_reduce,
-            boundary_weight=self.hc_attn_boundary_weight,
-        )
+        if residual is None:
+            # The stage's first layer: `x` is the stage's input hc streams.
+            assert isinstance(x, torch.Tensor)
+            mhc_pre: Callable[
+                ..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+            ] = mhc_pre_delayed_ampere if self.ampere_mhc else mhc_pre_delayed_tilelang
+            _, _, x, _ = mhc_pre(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
+        else:
+            assert post_mix is not None and res_mix is not None
+            *_, x, _, _ = mhc_shifted_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+                reduce_results=self.fuse_mhc_all_reduce,
+                boundary_weight=self.hc_attn_boundary_weight,
+            )
         self.attn.forward_kv(positions, x)
 
 
@@ -1440,10 +1462,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
     ) -> tuple[
-        torch.Tensor | MoEOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        torch.Tensor | MoEOutput,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
     ]:
         # Every layer's post runs inside the next layer's fused pre, so aux
-        # hidden states are read back from there instead of recomputed.
+        # hidden states are read back from there instead of recomputed. A stage
+        # whose replay starts at its first layer runs none here and passes its
+        # input on.
         full_num_tokens = positions.shape[0]
         mega_gate_metadata = self._mega_gate_metadata(input_ids)
         for idx in layer_ids:
@@ -1467,21 +1495,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if self.use_sequence_parallel:
                     previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
                 aux_hidden_by_layer[idx] = previous_aux
-        assert residual is not None and post_mix is not None
-        assert res_mix is not None and pre_mix is not None
+        assert pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
 
     def _collapse(
         self,
         hidden_states: torch.Tensor | MoEOutput,
-        residual: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
+        residual: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
         aux_hidden_by_layer: dict[int, torch.Tensor],
         full_num_tokens: int,
     ) -> torch.Tensor:
         # Without a successor boundary, the last layer finalized its own MoE.
         assert isinstance(hidden_states, torch.Tensor)
+        assert residual is not None and post_mix is not None
+        assert res_mix is not None
         # The last layer has no successor to fold its post into.
         if self.fuse_mhc_all_reduce:
             hidden_states = boundary_all_reduce(hidden_states)
@@ -1499,9 +1528,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         """Layers `decoder_replay_start`.. on the given rows; returns their output,
         the last FFN's pre-mix and the aux hidden states they capture."""

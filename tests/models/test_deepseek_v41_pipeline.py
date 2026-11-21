@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -141,3 +142,114 @@ def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
     mhc_residual, mhc_pre_mix = mhc_pre_calls[0]
     torch.testing.assert_close(mhc_residual, hidden + 10)
     assert mhc_pre_mix is pre_mix
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "ampere_mhc,mhc_pre_name",
+    [(False, "mhc_pre_delayed_tilelang"), (True, "mhc_pre_delayed_ampere")],
+)
+def test_stage_entry_replay_writes_kv_of_forwards_attention_input(
+    monkeypatch, ampere_mhc, mhc_pre_name
+):
+    """PP2 splits the 40 layers at 20, the last KV source, so the second stage
+    replays from its first layer: `write_kv` gets the stage's hc streams and no
+    residual, and writes the KV from the attention input `forward` computes."""
+    model_module = import_module("vllm.models.deepseek_v41.nvidia.model")
+
+    class StopAtAttention(Exception):
+        pass
+
+    hidden = torch.randn(2, 4, 3)
+    pre_mix = torch.randn(2, 4)
+    positions = torch.arange(2)
+    attn_inputs: list[torch.Tensor] = []
+
+    def mhc_pre(residual, *args, pre_mix=None, **kwargs):
+        return None, None, (residual * pre_mix[..., None]).sum(dim=1), None
+
+    class Attention:
+        def __call__(self, positions, x, _):
+            attn_inputs.append(x)
+            raise StopAtAttention
+
+        def forward_kv(self, positions, x):
+            attn_inputs.append(x)
+
+    layer = SimpleNamespace(
+        mhc_stream=None,
+        ampere_mhc=ampere_mhc,
+        engram=None,
+        use_sequence_parallel=False,
+        fuse_mhc_all_reduce=False,
+        hc_attn_fn=None,
+        hc_attn_scale=None,
+        hc_attn_base=None,
+        hc_attn_boundary_weight=None,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+        hc_post_alpha=1.0,
+        hc_sinkhorn_iters=1,
+        attn_norm=SimpleNamespace(weight=torch.ones(3), variance_epsilon=1e-6),
+        attn=Attention(),
+    )
+    monkeypatch.setattr(model_module, mhc_pre_name, mhc_pre)
+    layer_cls = model_module.DeepseekV4DecoderLayer
+
+    with pytest.raises(StopAtAttention):
+        layer_cls.forward(layer, hidden, positions, None, pre_mix=pre_mix)
+    layer_cls.write_kv(layer, hidden, positions, None, pre_mix, None, None, None)
+
+    expected = (hidden * pre_mix[..., None]).sum(dim=1)
+    assert len(attn_inputs) == 2
+    torch.testing.assert_close(attn_inputs[0], expected)
+    torch.testing.assert_close(attn_inputs[1], expected)
+
+
+def _replays_from_first_layer(worker) -> bool:
+    model = worker.model_runner.model
+    core = next(m for m in model.modules() if type(m).__name__ == "DeepseekV4Model")
+    return (
+        core.decoder_replay_layers is not None
+        and core.decoder_replay_start == core.start_layer
+    )
+
+
+@pytest.mark.distributed(num_gpus=2)
+def test_stage_starting_at_last_kv_source_serves_replay_prefill(
+    vllm_runner, monkeypatch
+):
+    """The second stage starts at layer 3, the last KV source, so it replays from
+    its first layer: it warms up and serves a prompt longer than the window."""
+    if torch.accelerator.device_count() < 2:
+        pytest.skip("needs two GPUs")
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,2")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    with vllm_runner(
+        os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-V4.1-Flash"),
+        pipeline_parallel_size=2,
+        distributed_executor_backend="mp",
+        load_format="dummy",
+        hf_overrides={
+            "num_hidden_layers": 5,
+            "compress_ratios": [0, 2, 2, 1, 1, 0, 0, 0],
+            "kv_source_layer_ids": [1, 3],
+            "index_source_layer_ids": [1, 3, 4],
+            "candidate_source_layer_id": 3,
+            "engram_layer_ids": [],
+        },
+        language_model_only=True,
+        max_model_len=4096,
+        max_num_batched_tokens=4096,
+        block_size=None,
+    ) as runner:
+        replays = runner.llm.collective_rpc(_replays_from_first_layer)
+        (output,) = runner.llm.generate(
+            TokensPrompt(prompt_token_ids=list(range(1000, 1951))),
+            SamplingParams(temperature=0, max_tokens=4),
+        )
+    assert replays == [False, True]
+    assert len(output.outputs[0].token_ids) == 4
