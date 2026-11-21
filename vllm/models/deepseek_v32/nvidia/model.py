@@ -339,7 +339,16 @@ class DeepseekV32Model(torch.nn.Module):
             )
 
         if use_sequence_parallel:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states, residual = self.norm(hidden_states, residual)
+        else:
+            hidden_states, residual = fused_allreduce_rms_norm(
+                hidden_states, residual, self.norm
+            )
+        # Aux state `end_layer` is the residual stream the final norm returns;
+        # outside SP the last layer's output alone is still un-reduced.
+        if self.end_layer in self.aux_hidden_state_layers:
+            aux_hidden_states.append(residual)
+        if use_sequence_parallel:
             if aux_hidden_states:
                 hidden_size = hidden_states.shape[-1]
                 packed_hidden_states = torch.cat(
@@ -352,10 +361,6 @@ class DeepseekV32Model(torch.nn.Module):
                 )
             else:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-        else:
-            hidden_states, _ = fused_allreduce_rms_norm(
-                hidden_states, residual, self.norm
-            )
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

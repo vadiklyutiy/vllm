@@ -4,9 +4,11 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 from torch import nn
 
+from vllm.models.deepseek_v32.amd import model as deepseek_v32_amd_model
 from vllm.models.deepseek_v32.nvidia import model as deepseek_v32_model
 from vllm.models.deepseek_v32.nvidia import mtp as deepseek_v32_mtp
 from vllm.sequence import IntermediateTensors
@@ -197,3 +199,58 @@ def test_pp_stage_sends_tp_reduced_residual_stream(monkeypatch):
     assert set(output.tensors) == {"hidden_states"}
     # residual (5 + 1) + partial (1) all-reduced over 2 TP ranks.
     torch.testing.assert_close(output["hidden_states"], torch.full((3, 2), 8.0))
+
+
+class _ResidualAddNorm(nn.Module):
+    """Returns `(normed, hidden_states + residual)` like RMSNorm; the normed
+    output is zero so it cannot pass for the residual stream."""
+
+    def forward(self, hidden_states, residual):
+        return torch.zeros_like(hidden_states), hidden_states + residual
+
+
+@pytest.mark.parametrize(
+    ("model_module", "use_sequence_parallel", "expected"),
+    [
+        # residual (5 + 1) + partial (1) all-reduced over 2 TP ranks.
+        (deepseek_v32_model, False, 8.0),
+        # A sequence-parallel layer output is already reduced for its shard.
+        (deepseek_v32_model, True, 7.0),
+        (deepseek_v32_amd_model, False, 8.0),
+    ],
+    ids=["nvidia", "nvidia-sp", "amd"],
+)
+def test_last_pp_stage_returns_final_layer_aux_hidden_state(
+    monkeypatch, model_module, use_sequence_parallel, expected
+):
+    """Aux layer id `end_layer` is the TP-reduced residual stream after the
+    last layer, before the final norm."""
+    model = object.__new__(model_module.DeepseekV32Model)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([_PartialSumLayer()])
+    model.start_layer, model.end_layer = 0, 1
+    model.use_sequence_parallel = use_sequence_parallel
+    model.shardq_sequence_parallel = False
+    model.aux_hidden_state_layers = (1,)
+    model.pp_buffers = {}
+    model.norm = _ResidualAddNorm()
+
+    pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
+    monkeypatch.setattr(model_module, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(
+        model_module,
+        "fused_allreduce_rms_norm",
+        lambda hidden_states, residual, norm: norm(hidden_states * 2, residual),
+    )
+    if use_sequence_parallel:
+        _mock_sequence_parallel_collectives(monkeypatch, model_module)
+
+    received = torch.full((3, 2), 5.0)
+    output = model(
+        None, torch.arange(3), IntermediateTensors({"hidden_states": received})
+    )
+
+    assert isinstance(output, tuple)
+    _, aux_hidden_states = output
+    assert len(aux_hidden_states) == 1
+    torch.testing.assert_close(aux_hidden_states[0], torch.full((3, 2), expected))

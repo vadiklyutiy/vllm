@@ -242,7 +242,13 @@ class DeepseekV32Model(torch.nn.Module):
                 }
             )
 
-        hidden_states, _ = fused_allreduce_rms_norm(hidden_states, residual, self.norm)
+        hidden_states, residual = fused_allreduce_rms_norm(
+            hidden_states, residual, self.norm
+        )
+        # Aux state `end_layer` is the residual stream the final norm returns;
+        # the last layer's output alone is still un-reduced.
+        if self.end_layer in self.aux_hidden_state_layers:
+            aux_hidden_states.append(residual)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

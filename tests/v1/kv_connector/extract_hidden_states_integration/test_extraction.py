@@ -305,6 +305,46 @@ def test_extract_hidden_states_qwen35_hybrid_smoke(tmp_path):
         )
 
 
+@create_new_process_for_each_test()
+def test_extract_hidden_states_final_layer_deepseek_v32(tmp_path, monkeypatch):
+    """Layer id `num_hidden_layers` (the last layer's output) is returned by the
+    DeepSeek-V3.2 backbone, which GLM-5.x uses."""
+    monkeypatch.setenv("VLLM_DEEP_GEMM_WARMUP", "skip")
+    num_layers = 2
+    layer_ids = [1, num_layers]
+    llm = LLM(
+        model="zai-org/GLM-5.2-FP8",
+        hf_overrides={
+            "num_hidden_layers": num_layers,
+            "layer_types": ["indexed_attention"] * num_layers,
+            "indexer_types": ["full"] * num_layers,
+            "mlp_layer_types": ["dense"] * num_layers,
+        },
+        speculative_config={
+            "method": "extract_hidden_states",
+            "num_speculative_tokens": 1,
+            "draft_model_config": {
+                "hf_config": {"eagle_aux_hidden_state_layer_ids": layer_ids}
+            },
+        },
+        kv_transfer_config={
+            "kv_connector": "ExampleHiddenStatesConnector",
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {"shared_storage_path": str(tmp_path)},
+        },
+        max_model_len=256,
+        enforce_eager=True,
+        # The ~150k-token embedding and LM head need more than 0.4 of 18 GB.
+        gpu_memory_utilization=0.8,
+        load_format="dummy",
+    )
+    hidden_size = llm.llm_engine.model_config.get_hidden_size()
+    sampling_params = SamplingParams(max_tokens=1, temperature=0.0)
+    output = llm.generate(["Hello world"], sampling_params)[0]
+    expected_shape = (len(output.prompt_token_ids), len(layer_ids), hidden_size)
+    get_and_check_output(output, expected_shape)
+
+
 @pytest.mark.timeout(
     240 if current_platform.is_rocm() or current_platform.is_xpu() else 120
 )
